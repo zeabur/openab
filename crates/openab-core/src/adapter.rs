@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
+use crate::acp::connection::ACP_NOTIFICATION_CAPACITY;
 use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
@@ -753,7 +754,14 @@ impl AdapterRouter {
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
-        self.pool
+        // The prompt receiver below owns delivery while the request is active.
+        // At prompt_done it is atomically replaced with this idle receiver, so
+        // agent-initiated turns are not dropped between client prompts.
+        let (idle_tx, mut idle_rx) =
+            tokio::sync::mpsc::channel(ACP_NOTIFICATION_CAPACITY);
+        let idle_adapter = adapter.clone();
+        let idle_channel = thread_channel.clone();
+        let result = self.pool
             .with_connection(thread_key, |conn| {
                 let content_blocks = content_blocks.clone();
                 Box::pin(async move {
@@ -1128,7 +1136,7 @@ impl AdapterRouter {
                         }
                     }
 
-                    conn.prompt_done().await;
+                    conn.prompt_done(platform_is_acp.then_some(idle_tx)).await;
                     // Stop the cosmetic edit loop before the finalize write path
                     // issues its authoritative edit. Dropping buf_tx closes the watch
                     // channel so the loop breaks on its next check, but it may be
@@ -1442,7 +1450,33 @@ impl AdapterRouter {
                     }
                 })
             })
-            .await
+            .await;
+
+        if platform_is_acp {
+            // A later session/prompt replaces the idle sender atomically; that
+            // closes this receiver and ends the task. Forward the original ACP
+            // update payload unchanged so origin/usage metadata survives.
+            tokio::spawn(async move {
+                while let Some(notification) = idle_rx.recv().await {
+                    let Some(update) = notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("update"))
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = idle_adapter
+                        .forward_agent_update(&idle_channel, update.clone())
+                        .await
+                    {
+                        tracing::debug!(?error, "failed to forward autonomous ACP session update");
+                        break;
+                    }
+                }
+            });
+        }
+
+        result
     }
 }
 
