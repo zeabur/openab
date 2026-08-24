@@ -463,8 +463,12 @@ pub enum ReplyChunk {
 /// against `turn_id` drops it instead of mis-delivering into the new prompt's stream.
 pub struct ReplySink {
     /// Originating `GatewayEvent.event_id` (`evt_<uuid>`), round-tripped as `reply_to`.
-    pub turn_id: String,
-    pub tx: mpsc::UnboundedSender<ReplyChunk>,
+    pub turn_id: Option<String>,
+    pub tx: Option<mpsc::UnboundedSender<ReplyChunk>>,
+    /// Outer ACP session id used for session-level updates while no prompt is active.
+    pub session_id: String,
+    /// Connection-lifetime output path. Unlike `tx`, this remains valid between prompts.
+    pub out_tx: mpsc::UnboundedSender<String>,
     /// The `acp_conn_*` id of the WebSocket connection that installed this sink.
     ///
     /// Teardown removes only what it owns. "Remove the keys for my sessions" is not enough: a
@@ -578,6 +582,35 @@ fn install_reply_sink(registry: &AcpReplyRegistry, channel_id: &str, sink: Reply
     }
 }
 
+fn activate_reply_sink(
+    registry: &AcpReplyRegistry,
+    channel_id: &str,
+    session_id: &str,
+    out_tx: &mpsc::UnboundedSender<String>,
+    turn_id: String,
+    tx: mpsc::UnboundedSender<ReplyChunk>,
+    owner: &str,
+    generation: u64,
+) -> bool {
+    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let sink = reg.entry(channel_id.to_string()).or_insert_with(|| ReplySink {
+        turn_id: None,
+        tx: None,
+        session_id: session_id.to_string(),
+        out_tx: out_tx.clone(),
+        owner: owner.to_string(),
+        generation,
+    });
+    if sink.generation > generation {
+        return false;
+    }
+    sink.turn_id = Some(turn_id);
+    sink.tx = Some(tx);
+    sink.owner = owner.to_string();
+    sink.generation = generation;
+    true
+}
+
 /// Remove the reply sink for `channel_id` only if `turn_id` still owns it.
 ///
 /// A turn's completion must not remove a sink a successor turn (a reconnect, or a concurrent
@@ -586,8 +619,12 @@ fn install_reply_sink(registry: &AcpReplyRegistry, channel_id: &str, sink: Reply
 /// was the F5-of-round-3 residual: either completion dropped whichever sink was there.
 fn remove_reply_sink_if_owner(registry: &AcpReplyRegistry, channel_id: &str, turn_id: &str) {
     let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if reg.get(channel_id).is_some_and(|s| s.turn_id == turn_id) {
-        reg.remove(channel_id);
+    if let Some(sink) = reg
+        .get_mut(channel_id)
+        .filter(|sink| sink.turn_id.as_deref() == Some(turn_id))
+    {
+        sink.turn_id = None;
+        sink.tx = None;
     }
 }
 
@@ -1644,6 +1681,21 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let (resp, channel_id) =
                     handle_session_new(&sessions, id.clone(), http_mcp_servers, session_meta)
                         .await;
+                if let Some(ref registry) = state.acp_reply_registry {
+                    let session_id = channel_id.replacen("acp_", "sess_", 1);
+                    install_reply_sink(
+                        registry,
+                        &channel_id,
+                        ReplySink {
+                            turn_id: None,
+                            tx: None,
+                            session_id,
+                            out_tx: out_tx.clone(),
+                            owner: connection_id.clone(),
+                            generation: connection_generation,
+                        },
+                    );
+                }
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // If the client declared "type":"acp" MCP servers, open + register a tunnel to
@@ -1694,6 +1746,23 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let (resp, resumed_channel) =
                     handle_session_resume(&sessions, id.clone(), req.params.as_ref(), mcp_enabled)
                         .await;
+                if let (Some(registry), Some(channel_id)) =
+                    (state.acp_reply_registry.as_ref(), resumed_channel.as_ref())
+                {
+                    let session_id = channel_id.replacen("acp_", "sess_", 1);
+                    install_reply_sink(
+                        registry,
+                        channel_id,
+                        ReplySink {
+                            turn_id: None,
+                            tx: None,
+                            session_id,
+                            out_tx: out_tx.clone(),
+                            owner: connection_id.clone(),
+                            generation: connection_generation,
+                        },
+                    );
+                }
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // Retire tunnels for declarations this resume withdrew.
@@ -2424,16 +2493,21 @@ async fn handle_session_prompt(
     // turn's event id so `handle_reply` can drop a stale reply after timeout/cancel reuse.
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<ReplyChunk>();
     if let Some(ref registry) = state.acp_reply_registry {
-        install_reply_sink(
+        if !activate_reply_sink(
             registry,
             &channel_id,
-            ReplySink {
-                turn_id: turn_id.clone(),
-                tx: reply_tx,
-                owner: connection_id.to_string(),
-                generation: connection_generation,
-            },
-        );
+            &session_id,
+            out_tx,
+            turn_id.clone(),
+            reply_tx,
+            connection_id,
+            connection_generation,
+        ) {
+            let resp = JsonRpcResponse::error(id, -32603, "ACP session output sink is unavailable");
+            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            release_prompt(sessions, &session_id).await;
+            return;
+        }
     }
 
     // Send event through the broadcast channel
@@ -2647,7 +2721,15 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
         return;
     }
 
-    let tx = {
+    enum Destination {
+        Turn(mpsc::UnboundedSender<ReplyChunk>),
+        Session {
+            session_id: String,
+            out_tx: mpsc::UnboundedSender<String>,
+        },
+    }
+
+    let destination = {
         let map = registry.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(key) {
             // Fence stale replies: after a timeout/cancel the channel_id is reused by the
@@ -2657,18 +2739,45 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             // the streaming edit loop's placeholder MessageRef id (ACP shows no
             // placeholder message), so mid-turn `edit_message` snapshots carry it —
             // fail open for it too or streaming deltas are all dropped as stale.
-            Some(sink)
-                if reply.reply_to.is_empty()
+            Some(sink) if sink.turn_id.is_some() => {
+                if !(reply.reply_to.is_empty()
                     || reply.reply_to == "draft"
-                    || reply.reply_to == sink.turn_id =>
-            {
-                sink.tx.clone()
+                    || sink.turn_id.as_deref() == Some(reply.reply_to.as_str()))
+                {
+                    debug!(channel = key, "ACP dropping stale reply from a superseded turn");
+                    return;
+                }
+                let Some(tx) = sink.tx.clone() else {
+                    return;
+                };
+                Destination::Turn(tx)
+            }
+            Some(sink) if reply.command.as_deref() == Some("agent_update") => {
+                Destination::Session {
+                    session_id: sink.session_id.clone(),
+                    out_tx: sink.out_tx.clone(),
+                }
             }
             Some(_) => {
                 debug!(channel = key, "ACP dropping stale reply from a superseded turn");
                 return;
             }
             None => return,
+        }
+    };
+
+    let tx = match destination {
+        Destination::Turn(tx) => tx,
+        Destination::Session { session_id, out_tx } => {
+            if let Ok(update) = serde_json::from_str::<serde_json::Value>(&full_text) {
+                let notification = JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update".into(),
+                    params: json!({ "sessionId": session_id, "update": update }),
+                };
+                let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+            }
+            return;
         }
     };
 
@@ -4241,7 +4350,14 @@ mod acp_review_fixes {
             .unwrap()
             .insert(
                 "acp_chan".into(),
-                ReplySink { turn_id: "evt_current".into(), tx, owner: "conn-test".into(), generation: 0 },
+                ReplySink {
+                    turn_id: Some("evt_current".into()),
+                    tx: Some(tx),
+                    session_id: "sess_chan".into(),
+                    out_tx: mpsc::unbounded_channel().0,
+                    owner: "conn-test".into(),
+                    generation: 0,
+                },
             );
 
         // Stale reply (previous turn's event id) → dropped.
@@ -4258,6 +4374,39 @@ mod acp_review_fixes {
         }
     }
 
+    #[tokio::test]
+    async fn handle_reply_forwards_agent_update_between_prompts() {
+        let registry = new_reply_registry();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: "sess_chan".into(),
+                out_tx,
+                owner: "conn-test".into(),
+                generation: 0,
+            },
+        );
+        let update = json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "timer fired"}
+        });
+
+        handle_reply(
+            &reply("acp_chan", "evt_previous", &update.to_string(), Some("agent_update")),
+            &registry,
+        )
+        .await;
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&out_rx.try_recv().expect("session update")).unwrap();
+        assert_eq!(frame["method"], json!("session/update"));
+        assert_eq!(frame["params"]["sessionId"], json!("sess_chan"));
+        assert_eq!(frame["params"]["update"], update);
+    }
+
     // F4 — two connections on one session race on the process-wide reply registry (session busy is
     // per-connection). Generation orders them: a newer connection takes over, an older one arriving
     // late cannot clobber it, and neither turn's completion removes the other's live sink.
@@ -4266,9 +4415,16 @@ mod acp_review_fixes {
         let registry = new_reply_registry();
         let sink = |turn: &str, owner: &str, generation: u64| {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
-            super::ReplySink { turn_id: turn.into(), tx, owner: owner.into(), generation }
+            super::ReplySink {
+                turn_id: Some(turn.into()),
+                tx: Some(tx),
+                session_id: "sess_x".into(),
+                out_tx: mpsc::unbounded_channel().0,
+                owner: owner.into(),
+                generation,
+            }
         };
-        let current_turn = || registry.lock().unwrap().get("acp_x").map(|s| s.turn_id.clone());
+        let current_turn = || registry.lock().unwrap().get("acp_x").and_then(|s| s.turn_id.clone());
 
         // Connection A (gen 1) installs its sink.
         assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_a", "conn-A", 1)));
@@ -4289,7 +4445,7 @@ mod acp_review_fixes {
 
         // B's own completion removes B's sink.
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_b");
-        assert!(current_turn().is_none(), "the owner's completion removes its own sink");
+        assert!(current_turn().is_none(), "the owner's completion deactivates its own sink");
     }
 
     // F4 — the SAME connection starting its next turn replaces its own sink; the stale prior turn's
@@ -4299,14 +4455,21 @@ mod acp_review_fixes {
         let registry = new_reply_registry();
         let sink = |turn: &str| {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
-            super::ReplySink { turn_id: turn.into(), tx, owner: "conn-A".into(), generation: 5 }
+            super::ReplySink {
+                turn_id: Some(turn.into()),
+                tx: Some(tx),
+                session_id: "sess_x".into(),
+                out_tx: mpsc::unbounded_channel().0,
+                owner: "conn-A".into(),
+                generation: 5,
+            }
         };
         assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_1")));
         assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_2")));
         // Stale turn 1's completion must not remove turn 2's sink.
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_1");
         assert_eq!(
-            registry.lock().unwrap().get("acp_x").map(|s| s.turn_id.clone()).as_deref(),
+            registry.lock().unwrap().get("acp_x").and_then(|s| s.turn_id.clone()).as_deref(),
             Some("evt_2"),
             "the stale turn must not remove the same connection's newer sink"
         );
@@ -4619,7 +4782,7 @@ mod acp_review_fixes {
         // Wait for the handler to register its reply sink, then feed one final reply.
         let mut turn_id = None;
         for _ in 0..10_000 {
-            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).and_then(|s| s.turn_id.clone()) {
                 turn_id = Some(t);
                 break;
             }
@@ -4680,7 +4843,7 @@ mod acp_review_fixes {
 
         let mut turn_id = None;
         for _ in 0..10_000 {
-            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).and_then(|s| s.turn_id.clone()) {
                 turn_id = Some(t);
                 break;
             }
@@ -6963,7 +7126,14 @@ mod acp_teardown_ownership {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
             reg.lock().unwrap().insert(
                 "acp_x".into(),
-                ReplySink { turn_id: "evt_new".into(), tx, owner: "conn-B".into(), generation: 0 },
+                ReplySink {
+                    turn_id: Some("evt_new".into()),
+                    tx: Some(tx),
+                    session_id: "sess_x".into(),
+                    out_tx: mpsc::unbounded_channel().0,
+                    owner: "conn-B".into(),
+                    generation: 0,
+                },
             );
         }
         {
@@ -6973,7 +7143,7 @@ mod acp_teardown_ownership {
         }
         let r = reg.lock().unwrap();
         assert_eq!(
-            r.get("acp_x").map(|s| s.turn_id.as_str()),
+            r.get("acp_x").and_then(|s| s.turn_id.as_deref()),
             Some("evt_new"),
             "conn-A's cleanup must leave conn-B's sink in place, or the live session goes mute"
         );

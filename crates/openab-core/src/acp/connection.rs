@@ -13,6 +13,19 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
 
+/// Bounds both prompt-scoped and idle ACP notification buffering. When full,
+/// the reader applies backpressure to the agent stdout pipe instead of growing
+/// process memory without limit.
+pub const ACP_NOTIFICATION_CAPACITY: usize = 1024;
+
+type NotificationSender = Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>>;
+
+async fn current_notification_sender(
+    notify_tx: &NotificationSender,
+) -> Option<mpsc::Sender<JsonRpcMessage>> {
+    notify_tx.lock().await.clone()
+}
+
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
     let mut fallback: Option<&Value> = None;
@@ -177,7 +190,7 @@ pub struct AcpConnection {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
-    notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    notify_tx: NotificationSender,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
@@ -234,7 +247,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     reader: R,
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
-    notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    notify_tx: NotificationSender,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -285,16 +298,17 @@ pub(crate) async fn run_reader_loop<R, W>(
             let mut map = pending.lock().await;
             if let Some(tx) = map.remove(&id) {
                 // Forward to subscriber so they see the completion
-                let sub = notify_tx.lock().await;
-                if let Some(ntx) = sub.as_ref() {
+                if let Some(ntx) = current_notification_sender(&notify_tx).await {
                     // Clone the essential fields for the subscriber
-                    let _ = ntx.send(JsonRpcMessage {
-                        id: Some(id),
-                        method: None,
-                        result: msg.result.clone(),
-                        error: msg.error.clone(),
-                        params: None,
-                    });
+                    let _ = ntx
+                        .send(JsonRpcMessage {
+                            id: Some(id),
+                            method: None,
+                            result: msg.result.clone(),
+                            error: msg.error.clone(),
+                            params: None,
+                        })
+                        .await;
                 }
                 let _ = tx.send(msg);
                 continue;
@@ -306,9 +320,8 @@ pub(crate) async fn run_reader_loop<R, W>(
         }
 
         // Notification → forward to subscriber
-        let sub = notify_tx.lock().await;
-        if let Some(tx) = sub.as_ref() {
-            let _ = tx.send(msg);
+        if let Some(tx) = current_notification_sender(&notify_tx).await {
+            let _ = tx.send(msg).await;
         }
     }
 
@@ -465,7 +478,7 @@ impl AcpConnection {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+        let notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
         let reader_handle = tokio::spawn(run_reader_loop(
@@ -718,7 +731,7 @@ impl AcpConnection {
     pub async fn session_prompt(
         &mut self,
         content_blocks: Vec<ContentBlock>,
-    ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
+    ) -> Result<(mpsc::Receiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.activity.touch();
         self.activity.set_in_flight(true);
@@ -728,7 +741,7 @@ impl AcpConnection {
             .as_ref()
             .ok_or_else(|| anyhow!("no session"))?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
         *self.notify_tx.lock().await = Some(tx);
 
         let id = self.next_id();
@@ -753,9 +766,15 @@ impl AcpConnection {
         Ok((rx, id))
     }
 
-    /// Call after prompt streaming is done to clean up subscriber.
-    pub async fn prompt_done(&mut self) {
-        *self.notify_tx.lock().await = None;
+    /// Call after prompt streaming is done. ACP agents may emit session updates
+    /// while no client prompt is in flight (for example Claude Code scheduled
+    /// wakeups), so callers can atomically replace the turn subscriber with a
+    /// session-idle subscriber instead of leaving a delivery gap.
+    pub async fn prompt_done(
+        &mut self,
+        idle_subscriber: Option<mpsc::Sender<JsonRpcMessage>>,
+    ) {
+        *self.notify_tx.lock().await = idle_subscriber;
         self.activity.touch();
         self.activity.set_in_flight(false);
         self.last_active = Instant::now();
@@ -1094,6 +1113,71 @@ mod reader_loop_tests {
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Mutex};
 
+    #[tokio::test]
+    async fn notification_channel_backpressures_at_capacity() {
+        let (tx, mut rx) = mpsc::channel::<JsonRpcMessage>(ACP_NOTIFICATION_CAPACITY);
+        let message = || JsonRpcMessage {
+            id: None,
+            method: Some("session/update".into()),
+            result: None,
+            error: None,
+            params: None,
+        };
+
+        for _ in 0..ACP_NOTIFICATION_CAPACITY {
+            tx.send(message()).await.unwrap();
+        }
+        let mut blocked = Box::pin(tx.send(message()));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut blocked)
+                .await
+                .is_err(),
+            "a full subscriber channel must apply backpressure"
+        );
+        rx.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+            .await
+            .expect("send should resume after capacity is released")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_notification_send_does_not_hold_subscriber_lock() {
+        let (tx, _rx) = mpsc::channel::<JsonRpcMessage>(1);
+        tx.send(JsonRpcMessage {
+            id: None,
+            method: Some("session/update".into()),
+            result: None,
+            error: None,
+            params: None,
+        })
+        .await
+        .unwrap();
+        let notify_tx: NotificationSender = Arc::new(Mutex::new(Some(tx)));
+        let sender = current_notification_sender(&notify_tx).await.unwrap();
+        let blocked = tokio::spawn(async move {
+            sender
+                .send(JsonRpcMessage {
+                    id: None,
+                    method: Some("session/update".into()),
+                    result: None,
+                    error: None,
+                    params: None,
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        let _guard = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            notify_tx.lock(),
+        )
+            .await
+            .expect("subscriber replacement must not wait for channel capacity");
+        blocked.abort();
+    }
+
     /// #732 stale-id path: when a response arrives for an id the broker has
     /// already abandoned, the reader must (a) not crash, (b) leave `pending`
     /// untouched, and (c) still forward the message to whoever is currently
@@ -1106,10 +1190,10 @@ mod reader_loop_tests {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+        let notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
-        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let (sub_tx, mut sub_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
         *notify_tx.lock().await = Some(sub_tx);
 
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
@@ -1146,13 +1230,13 @@ mod reader_loop_tests {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+        let notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
         let (resp_tx, resp_rx) = oneshot::channel();
         pending.lock().await.insert(7, resp_tx);
 
-        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let (sub_tx, mut sub_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
         *notify_tx.lock().await = Some(sub_tx);
 
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
