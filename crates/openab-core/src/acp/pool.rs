@@ -2,7 +2,11 @@ use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -13,6 +17,116 @@ use tracing::{info, warn};
 /// transient failure worth preserving the session ID for retry, as opposed to
 /// a permanent agent-side rejection.
 const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"];
+const MAX_WORKSPACE_FILES: usize = 512;
+const MAX_WORKSPACE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WORKSPACE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Materialize trusted client-provided files before the inner ACP session is
+/// created, then remove OpenAB's private metadata before forwarding `_meta` to
+/// the agent. Nuphos uses this to install its merged skill tree under the
+/// workspace's native `.claude/skills` directory.
+fn materialize_workspace_files(workdir: &str, meta: &mut serde_json::Value) -> Result<()> {
+    let Some(openab) = meta
+        .as_object_mut()
+        .and_then(|object| object.remove("openab"))
+    else {
+        return Ok(());
+    };
+    let Some(files) = openab
+        .get("workspaceFiles")
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(());
+    };
+    if files.len() > MAX_WORKSPACE_FILES {
+        return Err(anyhow!("too many OpenAB workspace files"));
+    }
+
+    let root = fs::canonicalize(workdir)?;
+    let claude_dir = root.join(".claude");
+    if let Ok(metadata) = fs::symlink_metadata(&claude_dir) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(anyhow!("workspace .claude path is not a safe directory"));
+        }
+    } else {
+        fs::create_dir(&claude_dir)?;
+    }
+    let target_root = claude_dir.join("skills");
+    let staging_root = claude_dir.join(format!(".openab-skills-staging-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging_root)?;
+
+    let prefix = Path::new(".claude/skills");
+    let mut total = 0usize;
+    for file in files {
+        let object = file
+            .as_object()
+            .ok_or_else(|| anyhow!("OpenAB workspace file must be an object"))?;
+        let raw_path = object
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("OpenAB workspace file path is required"))?;
+        let relative = Path::new(raw_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || !relative.starts_with(prefix)
+        {
+            return Err(anyhow!(
+                "OpenAB workspace file path is outside .claude/skills"
+            ));
+        }
+        let skill_path = relative.strip_prefix(prefix)?;
+        if skill_path.as_os_str().is_empty() {
+            return Err(anyhow!("OpenAB workspace file path must name a file"));
+        }
+        let encoded = object
+            .get("contentBase64")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("OpenAB workspace file contentBase64 is required"))?;
+        let content = BASE64.decode(encoded)?;
+        if content.len() > MAX_WORKSPACE_FILE_BYTES {
+            return Err(anyhow!("OpenAB workspace file is too large"));
+        }
+        total = total.saturating_add(content.len());
+        if total > MAX_WORKSPACE_TOTAL_BYTES {
+            return Err(anyhow!(
+                "OpenAB workspace files exceed the total size limit"
+            ));
+        }
+
+        let destination = staging_root.join(skill_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&destination, content)?;
+        #[cfg(unix)]
+        if object
+            .get("executable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+
+    remove_path_without_following(&target_root)?;
+    fs::rename(staging_root, target_root)?;
+    Ok(())
+}
+
+fn remove_path_without_following(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)?;
+    } else {
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
 
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
@@ -496,7 +610,7 @@ impl SessionPool {
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
-        let (stored_workdir, session_mcp_servers, session_meta) = {
+        let (stored_workdir, session_mcp_servers, mut session_meta) = {
             let state = self.state.read().await;
             (
                 state.session_workdirs.get(thread_id).cloned(),
@@ -516,6 +630,10 @@ impl SessionPool {
         } else {
             self.config.working_dir.clone()
         };
+
+        if let Some(meta) = session_meta.as_mut() {
+            materialize_workspace_files(&effective_workdir, meta)?;
+        }
 
         // Browser capabilities for an `acp:` session come from the OAB MCP Facade and nowhere
         // else: mint a per-session token (it rides the agent spawn below as OPENAB_SESSION_TOKEN)
@@ -1072,7 +1190,7 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        materialize_workspace_files, remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1460,5 +1578,51 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    #[test]
+    fn materializes_native_skill_files_and_strips_private_meta() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut meta = serde_json::json!({
+            "systemPrompt": {"append": "hello"},
+            "openab": {
+                "workspaceFiles": [{
+                    "path": ".claude/skills/nuphos-plan/SKILL.md",
+                    "contentBase64": "IyBOdXBob3MgUGxhbg=="
+                }]
+            }
+        });
+
+        materialize_workspace_files(workspace.path().to_str().unwrap(), &mut meta)
+            .expect("materialize");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".claude/skills/nuphos-plan/SKILL.md"))
+                .unwrap(),
+            "# Nuphos Plan"
+        );
+        assert!(meta.get("openab").is_none());
+        assert_eq!(meta["systemPrompt"]["append"], "hello");
+    }
+
+    #[test]
+    fn rejects_workspace_files_outside_native_skills_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut meta = serde_json::json!({
+            "openab": {
+                "workspaceFiles": [{
+                    "path": ".claude/skills/../../CLAUDE.md",
+                    "contentBase64": "YmFk"
+                }]
+            }
+        });
+
+        assert!(
+            materialize_workspace_files(workspace.path().to_str().unwrap(), &mut meta)
+                .unwrap_err()
+                .to_string()
+                .contains("outside .claude/skills")
+        );
+        assert!(!workspace.path().join("CLAUDE.md").exists());
     }
 }
