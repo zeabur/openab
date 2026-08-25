@@ -4,7 +4,10 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::connection::ACP_NOTIFICATION_CAPACITY;
+use crate::acp::connection::{
+    build_permission_response, PermissionResponder, ACP_NOTIFICATION_CAPACITY,
+};
+use crate::acp::protocol::JsonRpcMessage;
 use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
@@ -427,6 +430,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Decide an agent-initiated ACP tool permission request. Existing chat
+    /// surfaces retain the historical auto-approve behavior; ACP-backed hosts
+    /// may override this to relay the request to their own authorization UI.
+    async fn request_agent_permission(
+        &self,
+        _channel: &ChannelRef,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Ok(build_permission_response(Some(&params)))
+    }
+
     /// Whether this platform renders Markdown tables natively. When `true`, the
     /// router skips the `convert_tables` pre-pass (which rewrites tables into
     /// code blocks / bullet lists for platforms that cannot render them) and
@@ -455,6 +469,38 @@ pub trait ChatAdapter: Send + Sync + 'static {
     fn show_streaming_placeholder(&self) -> bool {
         true
     }
+}
+
+async fn handle_permission_request(
+    adapter: &Arc<dyn ChatAdapter>,
+    channel: &ChannelRef,
+    responder: &PermissionResponder,
+    message: &JsonRpcMessage,
+) -> bool {
+    if message.method.as_deref() != Some("session/request_permission") {
+        return false;
+    }
+
+    let Some(request_id) = message.id else {
+        warn!("agent emitted session/request_permission without an id; ignoring invalid request");
+        return true;
+    };
+    let params = message
+        .params
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let outcome = match adapter.request_agent_permission(channel, params).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(?error, "agent permission relay failed; cancelling tool use");
+            serde_json::json!({"outcome": {"outcome": "cancelled"}})
+        }
+    };
+
+    if let Err(error) = responder.respond(request_id, outcome).await {
+        warn!(?error, "failed to return permission decision to agent");
+    }
+    true
 }
 
 // --- AdapterRouter ---
@@ -767,6 +813,7 @@ impl AdapterRouter {
                 Box::pin(async move {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
+                    let permission_responder = conn.permission_responder();
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
@@ -954,6 +1001,16 @@ impl AdapterRouter {
                                 continue;
                             }
                         };
+                        if handle_permission_request(
+                            &adapter,
+                            &thread_channel,
+                            &permission_responder,
+                            &notification,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         if let Some(notification_id) = notification.id {
                             if notification_id != request_id {
                                 // Stale response from a previously-abandoned prompt.
@@ -1137,6 +1194,40 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done(platform_is_acp.then_some(idle_tx)).await;
+                    if platform_is_acp {
+                        let idle_permission_responder = permission_responder.clone();
+                        tokio::spawn(async move {
+                            while let Some(notification) = idle_rx.recv().await {
+                                if handle_permission_request(
+                                    &idle_adapter,
+                                    &idle_channel,
+                                    &idle_permission_responder,
+                                    &notification,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                                let Some(update) = notification
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("update"))
+                                else {
+                                    continue;
+                                };
+                                if let Err(error) = idle_adapter
+                                    .forward_agent_update(&idle_channel, update.clone())
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        ?error,
+                                        "failed to forward autonomous ACP session update"
+                                    );
+                                    break;
+                                }
+                            }
+                        });
+                    }
                     // Stop the cosmetic edit loop before the finalize write path
                     // issues its authoritative edit. Dropping buf_tx closes the watch
                     // channel so the loop breaks on its next check, but it may be
@@ -1451,30 +1542,6 @@ impl AdapterRouter {
                 })
             })
             .await;
-
-        if platform_is_acp {
-            // A later session/prompt replaces the idle sender atomically; that
-            // closes this receiver and ends the task. Forward the original ACP
-            // update payload unchanged so origin/usage metadata survives.
-            tokio::spawn(async move {
-                while let Some(notification) = idle_rx.recv().await {
-                    let Some(update) = notification
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("update"))
-                    else {
-                        continue;
-                    };
-                    if let Err(error) = idle_adapter
-                        .forward_agent_update(&idle_channel, update.clone())
-                        .await
-                    {
-                        tracing::debug!(?error, "failed to forward autonomous ACP session update");
-                        break;
-                    }
-                }
-            });
-        }
 
         result
     }

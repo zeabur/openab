@@ -554,14 +554,23 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
 > identity is the facade's broker-minted `SessionTokens` rather than a per-session port plus a
 > self-written `mcp.json` entry. They are kept because they explain *why* the shipped design looked
 > the way it did. Neither `proxy` nor `bridge` is selectable any more — both were removed on
-> 2026-07-28. D1, D4 and D6 carry over.
+> 2026-07-28. D1 was superseded by the opt-in relay described below; D4 and D6 carry over.
 
-- **D1 — permission model.** Auto-approve **all** browser tool permissions for now: core keeps
-  auto-replying `session/request_permission` with OK. Fine-grained consent is deferred. Consequence:
-  a dedicated `request_permission`-relay task is **dropped**, but the server→client request machinery
-  is still required for the upstream MCP tunnel. (That direction was not green-field: `openab-core`'s
-  ACP connection already received `session/request_permission` from the agent and auto-replied it, so
-  the work was *relaying* those upstream rather than inventing the path.)
+- **D1 — permission model (superseded 2026-08-26).** Existing clients keep the historical
+  auto-approve behavior unless a session explicitly sets
+  `_meta["dev.openab/permissionPolicy"] = "relay"` on `session/new` or `session/resume`. An opted-in
+  session forwards the inner agent's `session/request_permission` to the outer ACP client through
+  the existing server→client request correlation path, then returns that client's decision to the
+  inner agent. Relay errors and timeouts cancel the tool request rather than falling back to
+  approval. `initialize` advertises `_meta["dev.openab/permissionRelay"] = true` so a client can
+  detect support before opting in. This changes only backends that emit ACP permission requests;
+  OpenCode currently does not, so its backend-native permission behavior is outside this change.
+  Prior art supports the same relay boundary: OpenClaw maps gateway exec approvals into ACP
+  `request_permission` options and maps the selected outcome back to its gateway decision
+  ([source](https://github.com/openclaw/openclaw/blob/main/src/acp/permission-relay.ts)); Hermes
+  adapts dangerous-command approvals into ACP permission requests and denies on bridge failure
+  ([source](https://github.com/NousResearch/hermes-agent/blob/main/acp_adapter/permissions.py)).
+  OpenAB differs by making relay opt-in so existing non-interactive clients remain compatible.
 - **D2 — how the agent receives the tools (injection).** The ACP `session/new` `mcpServers` parameter
   is **not** reliable: Cursor's CLI ignores ACP-passed MCP servers and only loads MCP from its **own
   config** (`.cursor/mcp.json`) — see [zed#50924](https://github.com/zed-industries/zed/issues/50924).
@@ -615,7 +624,11 @@ Transports    --ACP-->  downstream ACP over stdio (chat / permission)
 Precondition: session open, extension WS attached, tools already discovered
 --------------------------------------------------------------------------------
  1  A --ACP-->  C   session/request_permission {toolCall:"click #submit"}    id=acp#1
- 2  A <--ACP--  C   result: allow               <- core auto-approves (D1)   id=acp#1
+ 2a A <--ACP--  C   result: allow               <- legacy default (D1)       id=acp#1
+    OR, when the outer session opted into relay:
+ 2b C ==WS===>  E   session/request_permission (outer sessionId)        id=acp#55
+ 2c C <==WS==  E    user-selected outcome                              id=acp#55
+ 2d A <--ACP--  C   same outcome returned to the inner agent            id=acp#1
  ..............................................................................
  3  A --HTTP--> C   tools/call name=katashiro.click args={selector:"#submit"}  id=mcp#7
  4  C --(in-pod handoff)--> G   wrap upstream: mcp/message  connId=conn-1

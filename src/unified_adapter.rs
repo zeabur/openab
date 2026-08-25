@@ -209,6 +209,34 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    async fn request_agent_permission(
+        &self,
+        channel: &ChannelRef,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if channel.platform == "acp" {
+            let registry = self
+                .gw_state
+                .acp_reply_registry
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("ACP permission relay registry is unavailable"))?;
+            if let Some(outcome) = openab_gateway::adapters::acp_server::request_permission(
+                registry,
+                &channel.channel_id,
+                params.clone(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?
+            {
+                return Ok(outcome);
+            }
+        }
+
+        Ok(openab_core::acp::connection::build_permission_response(
+            Some(&params),
+        ))
+    }
+
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
         let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
         // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)
