@@ -2722,7 +2722,10 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
     }
 
     enum Destination {
-        Turn(mpsc::UnboundedSender<ReplyChunk>),
+        Turn {
+            tx: mpsc::UnboundedSender<ReplyChunk>,
+            turn_id: String,
+        },
         Session {
             session_id: String,
             out_tx: mpsc::UnboundedSender<String>,
@@ -2750,7 +2753,10 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                 let Some(tx) = sink.tx.clone() else {
                     return;
                 };
-                Destination::Turn(tx)
+                Destination::Turn {
+                    tx,
+                    turn_id: sink.turn_id.clone().expect("checked above"),
+                }
             }
             Some(sink) if reply.command.as_deref() == Some("agent_update") => {
                 Destination::Session {
@@ -2767,7 +2773,21 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
     };
 
     let tx = match destination {
-        Destination::Turn(tx) => tx,
+        Destination::Turn { tx, turn_id } => {
+            match reply.command.as_deref() {
+                None | Some("send_message") => {
+                    let _ = tx.send(ReplyChunk::Text(full_text));
+                    let _ = tx.send(ReplyChunk::Done);
+                    // End only this turn's sink. The registry entry also owns
+                    // the connection-lifetime output path used by autonomous
+                    // session updates, so removing the whole entry here drops
+                    // every update emitted between prompts.
+                    remove_reply_sink_if_owner(registry, key, &turn_id);
+                    return;
+                }
+                _ => tx,
+            }
+        }
         Destination::Session { session_id, out_tx } => {
             if let Ok(update) = serde_json::from_str::<serde_json::Value>(&full_text) {
                 let notification = JsonRpcNotification {
@@ -2795,12 +2815,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                 let _ = tx.send(ReplyChunk::Update(update));
             }
         }
-        None | Some("send_message") => {
-            // Final message
-            let _ = tx.send(ReplyChunk::Text(full_text));
-            let _ = tx.send(ReplyChunk::Done);
-            registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
-        }
+        None | Some("send_message") => unreachable!("terminal replies return above"),
         Some("add_reaction") | Some("remove_reaction") => {
             // Reactions are agent state indicators — could map to notifications later
         }
@@ -4402,6 +4417,62 @@ mod acp_review_fixes {
 
         let frame: serde_json::Value =
             serde_json::from_str(&out_rx.try_recv().expect("session update")).unwrap();
+        assert_eq!(frame["method"], json!("session/update"));
+        assert_eq!(frame["params"]["sessionId"], json!("sess_chan"));
+        assert_eq!(frame["params"]["update"], update);
+    }
+
+    #[tokio::test]
+    async fn terminal_reply_preserves_the_session_sink_for_idle_updates() {
+        let registry = new_reply_registry();
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink {
+                turn_id: Some("evt_current".into()),
+                tx: Some(turn_tx),
+                session_id: "sess_chan".into(),
+                out_tx,
+                owner: "conn-test".into(),
+                generation: 0,
+            },
+        );
+
+        handle_reply(
+            &reply("acp_chan", "evt_current", "done", Some("send_message")),
+            &registry,
+        )
+        .await;
+
+        assert!(matches!(turn_rx.try_recv(), Ok(ReplyChunk::Text(text)) if text == "done"));
+        assert!(matches!(turn_rx.try_recv(), Ok(ReplyChunk::Done)));
+        {
+            let map = registry.lock().unwrap();
+            let sink = map
+                .get("acp_chan")
+                .expect("terminal reply must preserve the connection-level sink");
+            assert!(sink.turn_id.is_none());
+            assert!(sink.tx.is_none());
+        }
+
+        let update = json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "timer fired"}
+        });
+        handle_reply(
+            &reply(
+                "acp_chan",
+                "evt_current",
+                &update.to_string(),
+                Some("agent_update"),
+            ),
+            &registry,
+        )
+        .await;
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&out_rx.try_recv().expect("idle session update")).unwrap();
         assert_eq!(frame["method"], json!("session/update"));
         assert_eq!(frame["params"]["sessionId"], json!("sess_chan"));
         assert_eq!(frame["params"]["update"], update);
