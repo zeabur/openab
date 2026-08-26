@@ -437,6 +437,17 @@ fn parse_session_meta(params: Option<&Value>) -> Option<serde_json::Value> {
     Some(meta.clone())
 }
 
+const PERMISSION_POLICY_META_KEY: &str = "dev.openab/permissionPolicy";
+const PERMISSION_RELAY_TIMEOUT_SECS: u64 = 900;
+
+fn permission_relay_requested(params: Option<&Value>) -> bool {
+    params
+        .and_then(|p| p.get("_meta"))
+        .and_then(|meta| meta.get(PERMISSION_POLICY_META_KEY))
+        .and_then(Value::as_str)
+        == Some("relay")
+}
+
 /// Env gate for the ACP passthrough (`OPENAB_ACP_MCP_SERVERS=true|1`): http
 /// mcpServers entries and the session `_meta` object. Read once per connection;
 /// handlers take the value as a parameter so tests never mutate process env.
@@ -485,6 +496,14 @@ pub struct ReplySink {
     /// must not clobber the newer's sink. Paired with turn-scoped removal, this stops either turn
     /// from deleting or overwriting the other's live sink (F4, was the F5-of-round-3 residual).
     pub generation: u64,
+    permission_relay: Option<ClientRequestHandle>,
+}
+
+#[derive(Clone)]
+struct ClientRequestHandle {
+    out_tx: mpsc::UnboundedSender<String>,
+    pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: Arc<AtomicU64>,
 }
 
 /// Resolve a client-declared server NAME to the registry key of its tunnel, for one channel.
@@ -600,6 +619,7 @@ fn activate_reply_sink(
         out_tx: out_tx.clone(),
         owner: owner.to_string(),
         generation,
+        permission_relay: None,
     });
     if sink.generation > generation {
         return false;
@@ -868,6 +888,27 @@ async fn send_request(
     params: Value,
     timeout_secs: u64,
 ) -> Result<Value, String> {
+    send_request_with_cancel(
+        out_tx,
+        pending,
+        next_id,
+        method,
+        params,
+        timeout_secs,
+        "mcp/cancel",
+    )
+    .await
+}
+
+async fn send_request_with_cancel(
+    out_tx: &mpsc::UnboundedSender<String>,
+    pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    next_id: &AtomicU64,
+    method: impl Into<String>,
+    params: Value,
+    timeout_secs: u64,
+    cancel_method: &str,
+) -> Result<Value, String> {
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     pending.lock().await.insert(id, tx);
@@ -893,13 +934,91 @@ async fn send_request(
             // and a peer that has already gone away simply never reads it.
             let cancel = JsonRpcNotification {
                 jsonrpc: "2.0",
-                method: "mcp/cancel".to_string(),
+                method: cancel_method.to_string(),
                 params: json!({ "requestId": id }),
             };
             let _ = out_tx.send(serde_json::to_string(&cancel).unwrap());
             Err("request timed out".into())
         }
     }
+}
+
+/// Relay an inner agent's ACP permission request to the outer ACP WebSocket
+/// client when that session opted in with
+/// `_meta["dev.openab/permissionPolicy"] = "relay"`.
+///
+/// `Ok(None)` preserves the historical auto-approve policy. `Err` means relay
+/// was requested but no usable client path or decision remained, so callers
+/// must fail closed rather than falling back to approval.
+pub fn permission_relay_required(
+    registry: &AcpReplyRegistry,
+    channel_id: &str,
+) -> Result<bool, String> {
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let sink = reg
+        .get(channel_id)
+        .ok_or_else(|| "ACP session output sink is unavailable".to_string())?;
+    Ok(sink.permission_relay.is_some())
+}
+
+pub async fn request_permission(
+    registry: &AcpReplyRegistry,
+    channel_id: &str,
+    relay_required: bool,
+    mut params: Value,
+) -> Result<Option<Value>, String> {
+    if !relay_required {
+        return Ok(None);
+    }
+    let (session_id, handle) = {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let sink = reg
+            .get(channel_id)
+            .ok_or_else(|| "ACP session output sink is unavailable".to_string())?;
+        (sink.session_id.clone(), sink.permission_relay.clone())
+    };
+    let handle = handle.ok_or_else(|| {
+        "ACP permission relay required at turn start but is no longer available".to_string()
+    })?;
+
+    let Some(object) = params.as_object_mut() else {
+        return Err("session/request_permission params must be an object".into());
+    };
+    object.insert("sessionId".into(), Value::String(session_id));
+    let allowed_options: std::collections::HashSet<String> = object
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option.get("optionId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let frame = send_request_with_cancel(
+        &handle.out_tx,
+        &handle.pending,
+        &handle.next_id,
+        "session/request_permission",
+        params,
+        PERMISSION_RELAY_TIMEOUT_SECS,
+        "$/cancel_request",
+    )
+    .await?;
+    let result = frame_result(frame)?;
+    serde_json::from_value::<crate::adapters::acp_schema::RequestPermissionResponse>(result.clone())
+        .map_err(|error| format!("malformed session/request_permission response: {error}"))?;
+    if let Some(option_id) = result
+        .get("outcome")
+        .filter(|outcome| outcome.get("outcome").and_then(Value::as_str) == Some("selected"))
+        .and_then(|outcome| outcome.get("optionId"))
+        .and_then(Value::as_str)
+    {
+        if !allowed_options.contains(option_id) {
+            return Err(format!(
+                "session/request_permission selected unknown option {option_id}"
+            ));
+        }
+    }
+    Ok(Some(result))
 }
 
 /// Extract the `result` from a JSON-RPC response frame, mapping an `error` member to `Err`.
@@ -1670,6 +1789,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         continue;
                     }
                 };
+                let permission_relay = permission_relay_requested(req.params.as_ref());
                 let (http_mcp_servers, session_meta) = if mcp_enabled {
                     (
                         parse_http_mcp_servers(req.params.as_ref()),
@@ -1693,6 +1813,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                             out_tx: out_tx.clone(),
                             owner: connection_id.clone(),
                             generation: connection_generation,
+                            permission_relay: permission_relay.then(|| ClientRequestHandle {
+                                out_tx: out_tx.clone(),
+                                pending: pending_requests.clone(),
+                                next_id: next_req_id.clone(),
+                            }),
                         },
                     );
                 }
@@ -1743,6 +1868,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                             continue;
                         }
                     };
+                let permission_relay = permission_relay_requested(req.params.as_ref());
                 let (resp, resumed_channel) =
                     handle_session_resume(&sessions, id.clone(), req.params.as_ref(), mcp_enabled)
                         .await;
@@ -1760,6 +1886,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                             out_tx: out_tx.clone(),
                             owner: connection_id.clone(),
                             generation: connection_generation,
+                            permission_relay: permission_relay.then(|| ClientRequestHandle {
+                                out_tx: out_tx.clone(),
+                                pending: pending_requests.clone(),
+                                next_id: next_req_id.clone(),
+                            }),
                         },
                     );
                 }
@@ -2085,6 +2216,9 @@ fn handle_initialize(req: &JsonRpcRequest, mcp_http: bool) -> JsonRpcResponse {
             "protocolVersion": negotiated,
             "agentCapabilities": {
                 "loadSession": false,
+                "_meta": {
+                    "dev.openab/permissionRelay": true
+                },
                 // Advertised because the serde default is {http:false, sse:false}, so saying
                 // NOTHING already claims "no MCP transport support" — while this gateway ships
                 // MCP-over-ACP. Silence was not neutral (R4).
@@ -3189,7 +3323,10 @@ mod acp_streaming {
 mod acp_requests {
     //! T1 — the agent→client REQUEST direction: server-initiated `send_request` (mints an
     //! id, awaits the correlated response) and inbound `route_client_response`.
-    use super::{mcp_connect, mcp_message_request, route_client_response, send_request};
+    use super::{
+        mcp_connect, mcp_message_request, new_reply_registry, request_permission,
+        route_client_response, send_request, ClientRequestHandle, ReplySink,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3341,6 +3478,157 @@ mod acp_requests {
         )
         .await;
         assert!(consumed, "an unmatched response is still consumed (logged, no panic)");
+    }
+
+    #[tokio::test]
+    async fn permission_request_is_relayed_with_the_outer_session_id() {
+        let registry = new_reply_registry();
+        let pending = new_pending();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
+            ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: "sess_outer".into(),
+                out_tx: out_tx.clone(),
+                owner: "conn-test".into(),
+                generation: 0,
+                permission_relay: Some(ClientRequestHandle {
+                    out_tx,
+                    pending: pending.clone(),
+                    next_id,
+                }),
+            },
+        ));
+
+        let registry2 = registry.clone();
+        let relay = tokio::spawn(async move {
+            request_permission(
+                &registry2,
+                "acp_channel",
+                true,
+                json!({
+                    "sessionId": "sess_inner",
+                    "toolCall": {"toolCallId": "tool-1", "title": "Run command"},
+                    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+                }),
+            )
+            .await
+        });
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&out_rx.recv().await.expect("permission request frame")).unwrap();
+        assert_eq!(frame["method"], json!("session/request_permission"));
+        assert_eq!(frame["params"]["sessionId"], json!("sess_outer"));
+        assert_eq!(frame["params"]["toolCall"]["toolCallId"], json!("tool-1"));
+        assert_eq!(frame["params"]["options"][0]["optionId"], json!("allow"));
+
+        route_client_response(
+            &pending,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": frame["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            relay.await.unwrap().unwrap(),
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "allow"}}))
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_request_keeps_legacy_auto_approve_without_opt_in() {
+        let registry = new_reply_registry();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
+            ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: "sess_outer".into(),
+                out_tx,
+                owner: "conn-test".into(),
+                generation: 0,
+                permission_relay: None,
+            },
+        ));
+
+        assert_eq!(
+            request_permission(
+                &registry,
+                "acp_channel",
+                false,
+                json!({"sessionId": "sess_inner", "options": []}),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert!(out_rx.try_recv().is_err(), "default policy must not emit a client request");
+    }
+
+    #[tokio::test]
+    async fn permission_request_never_downgrades_after_a_relay_turn_is_replaced() {
+        let registry = new_reply_registry();
+        let pending = new_pending();
+        let (relay_tx, _relay_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
+            ReplySink {
+                turn_id: Some("evt_old".into()),
+                tx: None,
+                session_id: "sess_outer".into(),
+                out_tx: relay_tx.clone(),
+                owner: "conn-old".into(),
+                generation: 1,
+                permission_relay: Some(ClientRequestHandle {
+                    out_tx: relay_tx,
+                    pending,
+                    next_id: Arc::new(AtomicU64::new(1)),
+                }),
+            },
+        ));
+        let relay_was_required =
+            super::permission_relay_required(&registry, "acp_channel").unwrap();
+
+        let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
+            ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: "sess_outer".into(),
+                out_tx: replacement_tx,
+                owner: "conn-new".into(),
+                generation: 2,
+                permission_relay: None,
+            },
+        ));
+
+        assert!(relay_was_required, "the old turn opted into relay");
+        assert!(
+            request_permission(
+                &registry,
+                "acp_channel",
+                relay_was_required,
+                json!({"sessionId": "sess_inner", "options": []}),
+            )
+            .await
+            .is_err(),
+            "a relay-enabled turn must fail closed after reconnect, never return the legacy fallback"
+        );
+        assert!(
+            replacement_rx.try_recv().is_err(),
+            "a replacement without relay metadata has no permission request path"
+        );
     }
 
     #[tokio::test]
@@ -3812,8 +4100,8 @@ mod acp_requests {
 mod acp_handlers {
     use super::{
         handle_initialize, handle_session_new, handle_session_resume, parse_acp_mcp_servers,
-        parse_http_mcp_servers, parse_session_meta, AcpMcpServer, AcpSession, JsonRpcRequest,
-        MAX_ACP_SERVERS_PER_SESSION, MAX_SESSION_META_BYTES,
+        parse_http_mcp_servers, parse_session_meta, permission_relay_requested, AcpMcpServer,
+        AcpSession, JsonRpcRequest, MAX_ACP_SERVERS_PER_SESSION, MAX_SESSION_META_BYTES,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -3858,6 +4146,22 @@ mod acp_handlers {
             "the bare `_meta.acp` key is gone — the informal convention the framework supersedes"
         );
         assert!(mcp.get("acp").is_none(), "no core mcpCapabilities.acp field (would fork the schema)");
+        assert_eq!(
+            result["agentCapabilities"]["_meta"]["dev.openab/permissionRelay"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn permission_relay_requires_an_explicit_session_opt_in() {
+        assert!(!permission_relay_requested(None));
+        assert!(!permission_relay_requested(Some(&json!({"_meta": {}}))));
+        assert!(!permission_relay_requested(Some(
+            &json!({"_meta": {"dev.openab/permissionPolicy": "auto"}}),
+        )));
+        assert!(permission_relay_requested(Some(
+            &json!({"_meta": {"dev.openab/permissionPolicy": "relay"}}),
+        )));
     }
 
     #[test]
@@ -4372,6 +4676,7 @@ mod acp_review_fixes {
                     out_tx: mpsc::unbounded_channel().0,
                     owner: "conn-test".into(),
                     generation: 0,
+                    permission_relay: None,
                 },
             );
 
@@ -4402,6 +4707,7 @@ mod acp_review_fixes {
                 out_tx,
                 owner: "conn-test".into(),
                 generation: 0,
+                permission_relay: None,
             },
         );
         let update = json!({
@@ -4436,6 +4742,7 @@ mod acp_review_fixes {
                 out_tx,
                 owner: "conn-test".into(),
                 generation: 0,
+                permission_relay: None,
             },
         );
 
@@ -4493,6 +4800,7 @@ mod acp_review_fixes {
                 out_tx: mpsc::unbounded_channel().0,
                 owner: owner.into(),
                 generation,
+                permission_relay: None,
             }
         };
         let current_turn = || registry.lock().unwrap().get("acp_x").and_then(|s| s.turn_id.clone());
@@ -4533,6 +4841,7 @@ mod acp_review_fixes {
                 out_tx: mpsc::unbounded_channel().0,
                 owner: "conn-A".into(),
                 generation: 5,
+                permission_relay: None,
             }
         };
         assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_1")));
@@ -7204,6 +7513,7 @@ mod acp_teardown_ownership {
                     out_tx: mpsc::unbounded_channel().0,
                     owner: "conn-B".into(),
                     generation: 0,
+                    permission_relay: None,
                 },
             );
         }

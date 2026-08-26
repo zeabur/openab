@@ -48,16 +48,16 @@ Directions use the ACP roles: the **Agent** answers prompts (here, OpenAB); the
 |---|---|---|---|
 | `session/cancel` | Client → Agent | Cancel in-flight work (one-way, no response) | ⚠️ partial — the one-way notification is accepted and the gateway waiter ends with `stopReason:"cancelled"`, but cancellation is **not propagated to the backend** agent/model, which keeps running. Backend-propagating cancel is a tracked follow-up (review F3). |
 | `session/update` | Agent → Client | Stream session events | ✅ `agent_message_chunk` (text). Other variants (`agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, …) are Phase 2 / not forwarded |
-| `$/cancel_request` | Bidirectional | Cancel an in-flight JSON-RPC request | ⛔ |
+| `$/cancel_request` | Bidirectional | Cancel an in-flight JSON-RPC request | ⚠️ sent by the permission relay when its client request times out; general inbound cancellation is not implemented |
 
 ## Client methods (Agent → Client, request/response)
 
-The agent runs server-side with its own fs/terminal, so OpenAB does not call any of
-these in the base.
+The agent runs server-side with its own fs/terminal, so OpenAB does not call the
+client fs/terminal methods. Permission relay is the explicit opt-in exception.
 
 | Method | Purpose | OpenAB base |
 |---|---|---|
-| `session/request_permission` | Ask the client to approve a tool call | ⛔ (Phase 2) |
+| `session/request_permission` | Ask the client to approve a tool call | ✅ opt-in per session with `_meta["dev.openab/permissionPolicy"]:"relay"`; omitted policy preserves legacy auto-approve |
 | `fs/read_text_file` / `fs/write_text_file` | Read/write a text file on the client | ⛔ |
 | `terminal/create` / `output` / `wait_for_exit` / `kill` / `release` | Drive a client terminal | ⛔ |
 
@@ -77,7 +77,7 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 - **`session/load`** — needs an upstream conversation transcript OpenAB does not keep
   (history lives in the downstream agent CLI). Advertised as `loadSession:false`.
 - **`authenticate`/`logout`, ContentBlock non-text, tool-call updates,
-  `request_permission`, fs/terminal, session admin (`list`/`delete`/config/mode)** —
+  fs/terminal, session admin (`list`/`delete`/config/mode)** —
   deferred to later phases per the roadmap.
 
 ### Live verification status

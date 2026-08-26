@@ -19,8 +19,9 @@ ships and that future work should follow.
 Scope: a standard-ACP **1:1 chat** endpoint for real ACP clients (browser,
 desktop, IDE, CLI) over WebSocket. Phase-1 returns each reply as a single terminal
 `agent_message_chunk` (backend `streaming=false`); progressive multi-chunk streaming is
-Phase-2 (§6). Not in the base: tool calls / permissions, client fs/terminal methods,
-multi-agent fan-out, Streamable HTTP.
+Phase-2 (§6). Client fs/terminal methods, multi-agent fan-out, and Streamable HTTP
+remain outside the base; tool permission relay was added later as the opt-in extension
+recorded in §6 and the reverse-MCP ADR.
 
 Design goal (per decision on 2026-07-17): **follow the official ACP guide** so
 third-party ACP clients (Zed, JetBrains, …) interoperate — no custom method names.
@@ -228,7 +229,8 @@ North star: the agent's LLM autonomously operating the user's real browser (gene
 - **agent→client REQUEST direction** — the base does only client→agent + agent→client
   *notifications*; browser/tool use needs the agent to send *requests* to the client and
   await a result. The WS is already bidirectional; the dispatch loop must add this path.
-- **`session/request_permission`** — tool-use approval.
+- **`session/request_permission`** — tool-use approval. Shipped as an explicit per-session opt-in:
+  `_meta["dev.openab/permissionPolicy"] = "relay"`; the legacy default remains auto-approve.
 - **MCP-over-ACP tunnel + OpenAB core as MCP proxy** — the extension exposes browser
   tools (MCP server role over its outbound WS); core proxies them to the in-pod agent.
 - **Generated typed wire types (v1)** — decided for the base: adopt offline codegen

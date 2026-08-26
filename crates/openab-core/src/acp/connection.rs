@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
@@ -58,7 +58,7 @@ fn pick_best_option(options: &[Value]) -> Option<String> {
 }
 
 /// Build a spec-compliant permission response with backward-compatible fallback.
-fn build_permission_response(params: Option<&Value>) -> Value {
+pub fn build_permission_response(params: Option<&Value>) -> Value {
     match params
         .and_then(|p| p.get("options"))
         .and_then(|options| options.as_array())
@@ -183,6 +183,22 @@ impl SessionActivity {
     }
 }
 
+#[derive(Clone)]
+pub struct PermissionResponder {
+    stdin: Arc<Mutex<ChildStdin>>,
+}
+
+impl PermissionResponder {
+    pub async fn respond(&self, request_id: u64, outcome: Value) -> Result<()> {
+        let reply = JsonRpcResponse::new(request_id, outcome);
+        let data = serde_json::to_string(&reply)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(format!("{data}\n").as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
@@ -238,19 +254,17 @@ fn build_agent_env(
     (result, inherited)
 }
 
-/// Reader loop body: reads JSON-RPC messages from `reader`, auto-replies
-/// `session/request_permission` via `writer`, resolves pending responses,
-/// and forwards notifications + stale id-bearing messages to the active
-/// subscriber. Extracted as a free generic function so unit tests can drive
-/// it with `tokio::io::duplex()` halves instead of a real child process.
-pub(crate) async fn run_reader_loop<R, W>(
+/// Reader loop body: reads JSON-RPC messages from `reader`, resolves pending
+/// responses, and forwards agent-initiated requests, notifications, and stale
+/// id-bearing messages to the active subscriber. The subscriber owns policy:
+/// legacy chat surfaces auto-approve permissions, while opted-in ACP clients
+/// can relay the request to their user before responding.
+pub(crate) async fn run_reader_loop<R>(
     reader: R,
-    writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: NotificationSender,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -269,29 +283,6 @@ pub(crate) async fn run_reader_loop<R, W>(
             Err(_) => continue,
         };
         debug!(line = line.trim(), "acp_recv");
-
-        // Auto-reply session/request_permission
-        if msg.method.as_deref() == Some("session/request_permission") {
-            if let Some(id) = msg.id {
-                let title = msg
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("toolCall"))
-                    .and_then(|t| t.get("title"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("?");
-
-                let outcome = build_permission_response(msg.params.as_ref());
-                info!(title, %outcome, "auto-respond permission");
-                let reply = JsonRpcResponse::new(id, outcome);
-                if let Ok(data) = serde_json::to_string(&reply) {
-                    let mut w = writer.lock().await;
-                    let _ = w.write_all(format!("{data}\n").as_bytes()).await;
-                    let _ = w.flush().await;
-                }
-            }
-            continue;
-        }
 
         // Response (has id) → resolve pending AND forward to subscriber
         if let Some(id) = msg.id {
@@ -483,7 +474,6 @@ impl AcpConnection {
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
-            stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
         ));
@@ -805,6 +795,12 @@ impl AcpConnection {
         Arc::clone(&self.stdin)
     }
 
+    pub fn permission_responder(&self) -> PermissionResponder {
+        PermissionResponder {
+            stdin: Arc::clone(&self.stdin),
+        }
+    }
+
     pub fn activity_handle(&self) -> Arc<SessionActivity> {
         Arc::clone(&self.activity)
     }
@@ -1114,6 +1110,38 @@ mod reader_loop_tests {
     use tokio::sync::{mpsc, oneshot, Mutex};
 
     #[tokio::test]
+    async fn permission_request_is_forwarded_to_the_active_subscriber() {
+        let (agent_side, broker_side) = duplex(4096);
+        let (broker_reader, _broker_writer) = tokio::io::split(broker_side);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (notify_tx, mut notify_rx) = mpsc::channel(1);
+        let subscriber: NotificationSender = Arc::new(Mutex::new(Some(notify_tx)));
+
+        let reader = tokio::spawn(run_reader_loop(broker_reader, pending, subscriber));
+        let (_agent_reader, mut agent_writer) = tokio::io::split(agent_side);
+        agent_writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"sessionId":"inner","toolCall":{"title":"kubectl patch"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"reject","kind":"reject_once"}]}}"#,
+            )
+            .await
+            .unwrap();
+        agent_writer.write_all(b"\n").await.unwrap();
+
+        let forwarded =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notify_rx.recv())
+                .await
+                .expect("permission request must not be consumed by the broker")
+                .expect("subscriber must remain connected");
+        assert_eq!(forwarded.id, Some(41));
+        assert_eq!(
+            forwarded.method.as_deref(),
+            Some("session/request_permission")
+        );
+
+        reader.abort();
+    }
+
+    #[tokio::test]
     async fn notification_channel_backpressures_at_capacity() {
         let (tx, mut rx) = mpsc::channel::<JsonRpcMessage>(ACP_NOTIFICATION_CAPACITY);
         let message = || JsonRpcMessage {
@@ -1186,8 +1214,6 @@ mod reader_loop_tests {
     #[tokio::test]
     async fn stale_id_response_is_forwarded_without_pending_entry() {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
-        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
-
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
@@ -1196,10 +1222,8 @@ mod reader_loop_tests {
         let (sub_tx, mut sub_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
         *notify_tx.lock().await = Some(sub_tx);
 
-        let writer = Arc::new(Mutex::new(agent_stdin_writer));
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
-            writer,
             pending.clone(),
             notify_tx.clone(),
         ));
@@ -1226,8 +1250,6 @@ mod reader_loop_tests {
     #[tokio::test]
     async fn matched_id_response_resolves_pending_and_forwards() {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
-        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
-
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
@@ -1239,10 +1261,8 @@ mod reader_loop_tests {
         let (sub_tx, mut sub_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
         *notify_tx.lock().await = Some(sub_tx);
 
-        let writer = Arc::new(Mutex::new(agent_stdin_writer));
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
-            writer,
             pending.clone(),
             notify_tx.clone(),
         ));
