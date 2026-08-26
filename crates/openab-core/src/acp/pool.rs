@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -19,6 +19,9 @@ const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"
 struct PoolState {
     /// Active connections: thread_key → AcpConnection handle.
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
+    /// Pool-wide capacity permits held by active sessions. A permit is acquired
+    /// before spawning, then transferred here only after initialization succeeds.
+    admission_permits: HashMap<String, OwnedSemaphorePermit>,
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
@@ -62,6 +65,9 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Bounds active plus initializing sessions. Per-thread `creating` gates
+    /// prevent duplicate work for one key; this semaphore covers different keys.
+    admission: Arc<Semaphore>,
     /// Force-evict sessions stuck in-flight longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
@@ -181,6 +187,7 @@ async fn setup_facade_session(
 /// stayed in `suspended`/`persisted`, the next message would `session/load` the same session while
 /// the old process still owns an in-flight turn.
 fn purge_session_entries(state: &mut PoolState, key: &str) {
+    state.admission_permits.remove(key);
     state.cancel_handles.remove(key);
     state.activity.remove(key);
     state.pgids.remove(key);
@@ -299,6 +306,7 @@ impl SessionPool {
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
+                admission_permits: HashMap::new(),
                 cancel_handles: HashMap::new(),
                 #[cfg(feature = "acp-mcp")]
                 facade_tokens: HashMap::new(),
@@ -313,6 +321,7 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            admission: Arc::new(Semaphore::new(max_sessions)),
             hung_threshold_secs,
             mapping_path,
             meta_path,
@@ -385,6 +394,72 @@ impl SessionPool {
         {
             warn!(path = %self.meta_path.display(), error = %e, "failed to persist session metadata");
         }
+    }
+
+    /// Reserve one pool slot before any ACP process is spawned.
+    ///
+    /// A dead connection being rebuilt keeps its existing slot. Otherwise a
+    /// full pool may suspend the oldest idle connection to make room. The
+    /// returned permit remains local while initialization is in flight, so a
+    /// failed or cancelled creation releases capacity automatically.
+    async fn reserve_admission(
+        &self,
+        thread_id: &str,
+        eviction_candidate: Option<EvictionCandidate>,
+        skipped_locked_candidates: usize,
+    ) -> Result<OwnedSemaphorePermit> {
+        let mut state = self.state.write().await;
+
+        // Rebuilding a dead connection consumes the same logical slot. Move
+        // its permit out of the active map and hold it across initialization.
+        if let Some(permit) = state.admission_permits.remove(thread_id) {
+            return Ok(permit);
+        }
+
+        if let Ok(permit) = Arc::clone(&self.admission).try_acquire_owned() {
+            return Ok(permit);
+        }
+
+        if let Some((key, expected_conn, _, sid)) = eviction_candidate {
+            // The candidate was idle when scanned, but it may have started a
+            // turn since then. Never evict a connection that is busy now.
+            let Ok(_idle_guard) = expected_conn.try_lock() else {
+                warn!(
+                    max_sessions = self.max_sessions,
+                    "pool full but the idle eviction candidate became busy"
+                );
+                return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+            };
+
+            if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                state.admission_permits.remove(&key);
+                state.cancel_handles.remove(&key);
+                state.activity.remove(&key);
+                state.pgids.remove(&key);
+                #[cfg(feature = "acp-mcp")]
+                revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
+                info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session before replacement spawn");
+                if let Some(sid) = sid {
+                    state.persisted.insert(key.clone(), sid.clone());
+                    state.suspended.insert(key, sid);
+                } else {
+                    state.persisted.remove(&key);
+                }
+                self.save_mapping(&state.persisted);
+            } else {
+                warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
+            }
+        } else if skipped_locked_candidates > 0 {
+            warn!(
+                max_sessions = self.max_sessions,
+                skipped_locked_candidates,
+                "pool full but all other sessions were busy during eviction scan"
+            );
+        }
+
+        Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("pool exhausted ({} sessions)", self.max_sessions))
     }
 
     /// Check if session state exists for this thread (active, suspended, or persisted).
@@ -493,6 +568,10 @@ impl SessionPool {
                 eviction_candidate = Some(candidate);
             }
         }
+
+        let admission_permit = self
+            .reserve_admission(thread_id, eviction_candidate, skipped_locked_candidates)
+            .await?;
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
@@ -687,37 +766,6 @@ impl SessionPool {
             state.pgids.remove(thread_id);
         }
 
-        if state.active.len() >= self.max_sessions {
-            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    state.cancel_handles.remove(&key);
-                    state.activity.remove(&key);
-                    state.pgids.remove(&key);
-                    #[cfg(feature = "acp-mcp")]
-                    revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
-                    info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
-                    if let Some(sid) = sid {
-                        state.persisted.insert(key.clone(), sid.clone());
-                        state.suspended.insert(key, sid);
-                    } else {
-                        state.persisted.remove(&key);
-                    }
-                } else {
-                    warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
-                }
-            } else if skipped_locked_candidates > 0 {
-                warn!(
-                    max_sessions = self.max_sessions,
-                    skipped_locked_candidates,
-                    "pool full but all other sessions were busy during eviction scan"
-                );
-            }
-        }
-
-        if state.active.len() >= self.max_sessions {
-            return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
-        }
-
         if cancel_session_id.is_empty() {
             state.persisted.remove(thread_id);
         } else {
@@ -726,6 +774,9 @@ impl SessionPool {
                 .insert(thread_id.to_string(), cancel_session_id.clone());
         }
         state.suspended.remove(thread_id);
+        state
+            .admission_permits
+            .insert(thread_id.to_string(), admission_permit);
         state.active.insert(thread_id.to_string(), new_conn);
         state
             .activity
@@ -1001,6 +1052,7 @@ impl SessionPool {
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
+                state.admission_permits.remove(&key);
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
@@ -1061,6 +1113,7 @@ impl SessionPool {
         self.save_mapping(&state.persisted);
         let count = state.active.len();
         state.active.clear();
+        state.admission_permits.clear();
         state.cancel_handles.clear();
         state.activity.clear();
         state.pgids.clear();
@@ -1111,6 +1164,7 @@ mod tests {
     fn empty_pool_state() -> super::PoolState {
         super::PoolState {
             active: HashMap::new(),
+            admission_permits: HashMap::new(),
             cancel_handles: HashMap::new(),
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
@@ -1380,8 +1434,13 @@ mod tests {
 
     #[test]
     fn purge_session_entries_drops_all_entries_for_evicted_key_only() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let admission_permit = Arc::clone(&admission)
+            .try_acquire_owned()
+            .expect("test permit");
         let mut state = PoolState {
             active: HashMap::new(),
+            admission_permits: HashMap::from([("hung".to_string(), admission_permit)]),
             cancel_handles: HashMap::new(),
             #[cfg(feature = "acp-mcp")]
             facade_tokens: HashMap::new(),
@@ -1412,6 +1471,11 @@ mod tests {
 
         purge_session_entries(&mut state, "hung");
 
+        assert_eq!(
+            admission.available_permits(),
+            1,
+            "evicting logical session state must release its pool slot"
+        );
         // Evicted key must not be resumable: no suspended/persisted entry left.
         assert!(!state.activity.contains_key("hung"));
         assert!(!state.cancel_handles.contains_key("hung"));
