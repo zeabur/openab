@@ -337,6 +337,10 @@ struct AcpSession {
     /// Client-supplied session `_meta` object (raw JSON), forwarded verbatim to
     /// core on each prompt. `None` unless OPENAB_ACP_MCP_SERVERS is on.
     session_meta: Option<serde_json::Value>,
+    /// This connection's permission-request return path for the session. Kept in
+    /// connection-local state so an idle sink handoff can atomically install the
+    /// prompting connection's handle instead of retaining another replica's path.
+    permission_relay: Option<ClientRequestHandle>,
 }
 
 /// A client-declared MCP-over-ACP server (the RFD `"type":"acp"` `mcpServers` entry). Not in
@@ -487,14 +491,9 @@ pub struct ReplySink {
     /// the old connection would delete the *successor's* live sink and silently stop its replies.
     pub owner: String,
     /// Age of the CONNECTION that installed this sink (`connection_generation`, from
-    /// [`TUNNEL_GENERATION`], stamped when that connection was accepted).
-    ///
-    /// The reply registry is process-wide and keyed by `channel_id`, but session busy-state is
-    /// per-connection — so two connections resuming the same session can both start a turn and race
-    /// on this one key. Generation is what orders them: a NEWER connection (a reconnecting client
-    /// taking over the channel) may install over an older one, but an older connection arriving late
-    /// must not clobber the newer's sink. Paired with turn-scoped removal, this stops either turn
-    /// from deleting or overwriting the other's live sink (F4, was the F5-of-round-3 residual).
+    /// [`TUNNEL_GENERATION`], retained as connection-ownership metadata.
+    /// Prompt ownership itself is ordered by active-vs-idle state: an active turn cannot be
+    /// displaced, while an idle route can be claimed by any still-live connection.
     pub generation: u64,
     permission_relay: Option<ClientRequestHandle>,
 }
@@ -583,17 +582,13 @@ pub fn new_reply_registry() -> AcpReplyRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Install `sink` as the reply sink for `channel_id`, unless a strictly NEWER connection already
-/// owns it. Returns true if installed.
-///
-/// A reconnecting client takes over the same `channel_id`, so a newer connection (higher
-/// `generation`) is allowed to install over an older one — but an older connection whose prompt is
-/// processed late must not clobber the newer connection's live sink. Same generation (the same
-/// connection starting its next turn) installs, replacing its own prior sink.
+/// Install an idle connection-level route for `channel_id` without displacing an active turn.
+/// The most recent successful new/resume owns autonomous updates while the session is idle, but
+/// connection age is not a permanent lease: active-active clients may legitimately alternate turns.
 fn install_reply_sink(registry: &AcpReplyRegistry, channel_id: &str, sink: ReplySink) -> bool {
     let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     match reg.get(channel_id) {
-        Some(existing) if existing.generation > sink.generation => false,
+        Some(existing) if existing.turn_id.is_some() => false,
         _ => {
             reg.insert(channel_id.to_string(), sink);
             true
@@ -604,31 +599,16 @@ fn install_reply_sink(registry: &AcpReplyRegistry, channel_id: &str, sink: Reply
 fn activate_reply_sink(
     registry: &AcpReplyRegistry,
     channel_id: &str,
-    session_id: &str,
-    out_tx: &mpsc::UnboundedSender<String>,
-    turn_id: String,
-    tx: mpsc::UnboundedSender<ReplyChunk>,
-    owner: &str,
-    generation: u64,
+    claim: ReplySink,
 ) -> bool {
     let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-    let sink = reg.entry(channel_id.to_string()).or_insert_with(|| ReplySink {
-        turn_id: None,
-        tx: None,
-        session_id: session_id.to_string(),
-        out_tx: out_tx.clone(),
-        owner: owner.to_string(),
-        generation,
-        permission_relay: None,
-    });
-    if sink.generation > generation {
-        return false;
+    match reg.get(channel_id) {
+        Some(existing) if existing.turn_id.is_some() => false,
+        _ => {
+            reg.insert(channel_id.to_string(), claim);
+            true
+        }
     }
-    sink.turn_id = Some(turn_id);
-    sink.tx = Some(tx);
-    sink.owner = owner.to_string();
-    sink.generation = generation;
-    true
 }
 
 /// Remove the reply sink for `channel_id` only if `turn_id` still owns it.
@@ -1790,6 +1770,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     }
                 };
                 let permission_relay = permission_relay_requested(req.params.as_ref());
+                let permission_relay_handle = permission_relay.then(|| ClientRequestHandle {
+                    out_tx: out_tx.clone(),
+                    pending: pending_requests.clone(),
+                    next_id: next_req_id.clone(),
+                });
                 let (http_mcp_servers, session_meta) = if mcp_enabled {
                     (
                         parse_http_mcp_servers(req.params.as_ref()),
@@ -1801,8 +1786,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let (resp, channel_id) =
                     handle_session_new(&sessions, id.clone(), http_mcp_servers, session_meta)
                         .await;
+                let session_id = channel_id.replacen("acp_", "sess_", 1);
+                if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                    session.permission_relay = permission_relay_handle.clone();
+                }
                 if let Some(ref registry) = state.acp_reply_registry {
-                    let session_id = channel_id.replacen("acp_", "sess_", 1);
                     install_reply_sink(
                         registry,
                         &channel_id,
@@ -1813,11 +1801,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                             out_tx: out_tx.clone(),
                             owner: connection_id.clone(),
                             generation: connection_generation,
-                            permission_relay: permission_relay.then(|| ClientRequestHandle {
-                                out_tx: out_tx.clone(),
-                                pending: pending_requests.clone(),
-                                next_id: next_req_id.clone(),
-                            }),
+                            permission_relay: permission_relay_handle,
                         },
                     );
                 }
@@ -1869,6 +1853,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         }
                     };
                 let permission_relay = permission_relay_requested(req.params.as_ref());
+                let permission_relay_handle = permission_relay.then(|| ClientRequestHandle {
+                    out_tx: out_tx.clone(),
+                    pending: pending_requests.clone(),
+                    next_id: next_req_id.clone(),
+                });
                 let (resp, resumed_channel) =
                     handle_session_resume(&sessions, id.clone(), req.params.as_ref(), mcp_enabled)
                         .await;
@@ -1876,6 +1865,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     (state.acp_reply_registry.as_ref(), resumed_channel.as_ref())
                 {
                     let session_id = channel_id.replacen("acp_", "sess_", 1);
+                    if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                        session.permission_relay = permission_relay_handle.clone();
+                    }
                     install_reply_sink(
                         registry,
                         channel_id,
@@ -1886,11 +1878,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                             out_tx: out_tx.clone(),
                             owner: connection_id.clone(),
                             generation: connection_generation,
-                            permission_relay: permission_relay.then(|| ClientRequestHandle {
-                                out_tx: out_tx.clone(),
-                                pending: pending_requests.clone(),
-                                next_id: next_req_id.clone(),
-                            }),
+                            permission_relay: permission_relay_handle,
                         },
                     );
                 }
@@ -2285,6 +2273,7 @@ async fn handle_session_new(
             cancel: None,
             mcp_servers,
             session_meta,
+            permission_relay: None,
         },
     );
 
@@ -2430,6 +2419,7 @@ async fn handle_session_resume(
             cancel: None,
             mcp_servers,
             session_meta,
+            permission_relay: None,
         },
     );
     drop(guard);
@@ -2585,20 +2575,25 @@ async fn handle_session_prompt(
 
     // The session was reserved a moment ago under the lock; just read its channel_id
     // and stored passthrough values (http mcpServers entries, `_meta`).
-    let (channel_id, mcp_servers, session_meta) = match sessions.lock().await.get(&session_id) {
-        Some(s) => (s.channel_id.clone(), s.mcp_servers.clone(), s.session_meta.clone()),
-        None => {
-            let resp =
-                JsonRpcResponse::error(
+    let (channel_id, mcp_servers, session_meta, permission_relay) =
+        match sessions.lock().await.get(&session_id) {
+            Some(s) => (
+                s.channel_id.clone(),
+                s.mcp_servers.clone(),
+                s.session_meta.clone(),
+                s.permission_relay.clone(),
+            ),
+            None => {
+                let resp = JsonRpcResponse::error(
                     id,
                     -32602,
                     format!("Unknown session: {}", redact_id(&session_id)),
                 );
-            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            release_prompt(sessions, &session_id).await;
-            return;
-        }
-    };
+                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                release_prompt(sessions, &session_id).await;
+                return;
+            }
+        };
 
     // Convert to GatewayEvent and dispatch. Build it first so its `event_id` can fence
     // this turn's replies (round-tripped as `GatewayReply.reply_to`).
@@ -2630,12 +2625,15 @@ async fn handle_session_prompt(
         if !activate_reply_sink(
             registry,
             &channel_id,
-            &session_id,
-            out_tx,
-            turn_id.clone(),
-            reply_tx,
-            connection_id,
-            connection_generation,
+            ReplySink {
+                turn_id: Some(turn_id.clone()),
+                tx: Some(reply_tx),
+                session_id: session_id.clone(),
+                out_tx: out_tx.clone(),
+                owner: connection_id.to_string(),
+                generation: connection_generation,
+                permission_relay,
+            },
         ) {
             let resp = JsonRpcResponse::error(id, -32603, "ACP session output sink is unavailable");
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -3597,6 +3595,7 @@ mod acp_requests {
         ));
         let relay_was_required =
             super::permission_relay_required(&registry, "acp_channel").unwrap();
+        super::remove_reply_sink_if_owner(&registry, "acp_channel", "evt_old");
 
         let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel::<String>();
         assert!(super::install_reply_sink(
@@ -4633,6 +4632,7 @@ mod acp_review_fixes {
                 cancel: Some(Arc::new(tokio::sync::Notify::new())),
                 mcp_servers: Vec::new(),
                 session_meta: None,
+                permission_relay: None,
             },
         );
         let (resp, chan) =
@@ -4786,16 +4786,15 @@ mod acp_review_fixes {
     }
 
     // F4 — two connections on one session race on the process-wide reply registry (session busy is
-    // per-connection). Generation orders them: a newer connection takes over, an older one arriving
-    // late cannot clobber it, and neither turn's completion removes the other's live sink.
+    // per-connection). The active turn wins regardless of connection age; after it becomes idle,
+    // another connection may take the next turn without a stale completion removing that new sink.
     #[test]
     fn neither_connection_clobbers_the_others_reply_sink() {
         let registry = new_reply_registry();
-        let sink = |turn: &str, owner: &str, generation: u64| {
-            let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        let idle_sink = |owner: &str, generation: u64| {
             super::ReplySink {
-                turn_id: Some(turn.into()),
-                tx: Some(tx),
+                turn_id: None,
+                tx: None,
                 session_id: "sess_x".into(),
                 out_tx: mpsc::unbounded_channel().0,
                 owner: owner.into(),
@@ -4803,49 +4802,168 @@ mod acp_review_fixes {
                 permission_relay: None,
             }
         };
+        let activate = |turn: &str, owner: &str, generation: u64| {
+            let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
+            super::activate_reply_sink(
+                &registry,
+                "acp_x",
+                super::ReplySink {
+                    turn_id: Some(turn.into()),
+                    tx: Some(tx),
+                    session_id: "sess_x".into(),
+                    out_tx: mpsc::unbounded_channel().0,
+                    owner: owner.into(),
+                    generation,
+                    permission_relay: None,
+                },
+            )
+        };
         let current_turn = || registry.lock().unwrap().get("acp_x").and_then(|s| s.turn_id.clone());
 
-        // Connection A (gen 1) installs its sink.
-        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_a", "conn-A", 1)));
-        // Newer connection B (gen 2) resumes the same session and takes over (reconnect semantics).
-        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_b", "conn-B", 2)));
-        assert_eq!(current_turn().as_deref(), Some("evt_b"), "the newer connection owns the sink");
-
-        // The older connection A, its prompt processed late, must NOT clobber B's live sink.
+        assert!(activate("evt_a", "conn-A", 1));
         assert!(
-            !super::install_reply_sink(&registry, "acp_x", sink("evt_a2", "conn-A", 1)),
-            "an older connection cannot install over a newer one"
+            !super::install_reply_sink(&registry, "acp_x", idle_sink("conn-B", 2)),
+            "a resume cannot replace an active turn"
         );
-        assert_eq!(current_turn().as_deref(), Some("evt_b"), "B's sink survives A's late install");
+        assert!(!activate("evt_b", "conn-B", 2));
+        assert_eq!(current_turn().as_deref(), Some("evt_a"));
 
-        // A's turn completing must not remove B's sink (turn-scoped removal).
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_a");
-        assert_eq!(current_turn().as_deref(), Some("evt_b"), "A's completion must not remove B's sink");
+        assert!(super::install_reply_sink(&registry, "acp_x", idle_sink("conn-B", 2)));
+        assert!(activate("evt_b", "conn-B", 2));
 
-        // B's own completion removes B's sink.
+        super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_a");
+        assert_eq!(current_turn().as_deref(), Some("evt_b"), "A's stale completion cannot remove B");
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_b");
         assert!(current_turn().is_none(), "the owner's completion deactivates its own sink");
     }
 
-    // F4 — the SAME connection starting its next turn replaces its own sink; the stale prior turn's
-    // completion must not then remove the live new one.
+    #[test]
+    fn an_idle_sink_can_be_claimed_by_an_older_live_connection() {
+        let registry = new_reply_registry();
+        let (idle_out_tx, mut idle_out_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_x",
+            super::ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: "sess_x".into(),
+                out_tx: idle_out_tx,
+                owner: "conn-B".into(),
+                generation: 2,
+                permission_relay: None,
+            },
+        ));
+
+        let (turn_tx, _turn_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        let (prompt_out_tx, mut prompt_out_rx) = mpsc::unbounded_channel::<String>();
+        let prompt_permission_relay = ClientRequestHandle {
+            out_tx: prompt_out_tx.clone(),
+            pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+        assert!(
+            super::activate_reply_sink(
+                &registry,
+                "acp_x",
+                super::ReplySink {
+                    turn_id: Some("evt_a".into()),
+                    tx: Some(turn_tx),
+                    session_id: "sess_x".into(),
+                    out_tx: prompt_out_tx,
+                    owner: "conn-A".into(),
+                    generation: 1,
+                    permission_relay: Some(prompt_permission_relay),
+                },
+            ),
+            "an idle route is not a permanent ownership lease"
+        );
+
+        let map = registry.lock().unwrap();
+        let sink = map.get("acp_x").unwrap();
+        assert_eq!(sink.turn_id.as_deref(), Some("evt_a"));
+        assert_eq!(sink.owner, "conn-A");
+        assert_eq!(sink.generation, 1);
+        let relay_out = sink.permission_relay.as_ref().unwrap().out_tx.clone();
+        drop(map);
+
+        relay_out.send("relay-probe".into()).unwrap();
+        assert_eq!(prompt_out_rx.try_recv().unwrap(), "relay-probe");
+        assert!(
+            idle_out_rx.try_recv().is_err(),
+            "the claimed turn must not retain the previous replica's permission path"
+        );
+    }
+
+    #[test]
+    fn an_active_sink_cannot_be_stolen_by_a_newer_connection() {
+        let registry = new_reply_registry();
+        let (active_tx, _active_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        let (active_out_tx, _active_out_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::activate_reply_sink(
+            &registry,
+            "acp_x",
+            super::ReplySink {
+                turn_id: Some("evt_a".into()),
+                tx: Some(active_tx),
+                session_id: "sess_x".into(),
+                out_tx: active_out_tx,
+                owner: "conn-A".into(),
+                generation: 1,
+                permission_relay: None,
+            },
+        ));
+
+        let (competing_tx, _competing_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        let (competing_out_tx, _competing_out_rx) = mpsc::unbounded_channel::<String>();
+        assert!(
+            !super::activate_reply_sink(
+                &registry,
+                "acp_x",
+                super::ReplySink {
+                    turn_id: Some("evt_b".into()),
+                    tx: Some(competing_tx),
+                    session_id: "sess_x".into(),
+                    out_tx: competing_out_tx,
+                    owner: "conn-B".into(),
+                    generation: 2,
+                    permission_relay: None,
+                },
+            ),
+            "a newer connection must wait until the active turn releases ownership"
+        );
+
+        let map = registry.lock().unwrap();
+        let sink = map.get("acp_x").unwrap();
+        assert_eq!(sink.turn_id.as_deref(), Some("evt_a"));
+        assert_eq!(sink.owner, "conn-A");
+    }
+
+    // F4 — after the same connection finishes one turn, its next turn claims the idle sink; a
+    // duplicate stale completion must not then remove the live new one.
     #[test]
     fn a_connections_new_turn_replaces_its_own_sink_without_the_old_turn_removing_it() {
         let registry = new_reply_registry();
-        let sink = |turn: &str| {
+        let activate = |turn: &str| {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
-            super::ReplySink {
-                turn_id: Some(turn.into()),
-                tx: Some(tx),
-                session_id: "sess_x".into(),
-                out_tx: mpsc::unbounded_channel().0,
-                owner: "conn-A".into(),
-                generation: 5,
-                permission_relay: None,
-            }
+            super::activate_reply_sink(
+                &registry,
+                "acp_x",
+                super::ReplySink {
+                    turn_id: Some(turn.into()),
+                    tx: Some(tx),
+                    session_id: "sess_x".into(),
+                    out_tx: mpsc::unbounded_channel().0,
+                    owner: "conn-A".into(),
+                    generation: 5,
+                    permission_relay: None,
+                },
+            )
         };
-        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_1")));
-        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_2")));
+        assert!(activate("evt_1"));
+        super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_1");
+        assert!(activate("evt_2"));
         // Stale turn 1's completion must not remove turn 2's sink.
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_1");
         assert_eq!(
@@ -4935,6 +5053,7 @@ mod acp_review_fixes {
                 cancel: Some(cancel.clone()),
                 mcp_servers: Vec::new(),
                 session_meta: None,
+                permission_relay: None,
             },
         );
         // Cancel arrives before the handler's stream loop (reserved-then-immediate-cancel).
@@ -5109,6 +5228,7 @@ mod acp_review_fixes {
                 cancel: Some(cancel.clone()),
                 mcp_servers: Vec::new(),
                 session_meta: None,
+                permission_relay: None,
             },
         );
 
@@ -5146,7 +5266,14 @@ mod acp_review_fixes {
         let cancel = Arc::new(tokio::sync::Notify::new());
         sessions.lock().await.insert(
             sid.clone(),
-            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()), mcp_servers: Vec::new(), session_meta: None },
+            AcpSession {
+                channel_id: channel_id.clone(),
+                busy: true,
+                cancel: Some(cancel.clone()),
+                mcp_servers: Vec::new(),
+                session_meta: None,
+                permission_relay: None,
+            },
         );
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -5208,7 +5335,14 @@ mod acp_review_fixes {
         let cancel = Arc::new(tokio::sync::Notify::new());
         sessions.lock().await.insert(
             sid.clone(),
-            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()), mcp_servers: Vec::new(), session_meta: None },
+            AcpSession {
+                channel_id: channel_id.clone(),
+                busy: true,
+                cancel: Some(cancel.clone()),
+                mcp_servers: Vec::new(),
+                session_meta: None,
+                permission_relay: None,
+            },
         );
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -5304,6 +5438,7 @@ mod acp_review_fixes {
                 cancel: Some(cancel.clone()),
                 mcp_servers: Vec::new(),
                 session_meta: None,
+                permission_relay: None,
             },
         );
         let params = json!({"sessionId": sid});
@@ -5334,8 +5469,13 @@ mod acp_ws_integration {
 
     /// Serve `/acp` on an ephemeral loopback port. Returns the URL and the tunnel registry, so a
     /// test can drive the server side the way core does.
-    async fn serve() -> (String, AcpTunnelRegistry) {
-        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    async fn serve_with_events() -> (
+        String,
+        AcpTunnelRegistry,
+        AcpReplyRegistry,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
         let mut state = crate::AppState::test_default(tx);
         state.acp = Some(AcpConfig {
             // Keyless loopback: no bearer. A client sending no `Origin` is accepted, which is
@@ -5343,7 +5483,8 @@ mod acp_ws_integration {
             auth_key: None,
             allowed_origins: vec![],
         });
-        state.acp_reply_registry = Some(new_reply_registry());
+        let reply_registry = new_reply_registry();
+        state.acp_reply_registry = Some(reply_registry.clone());
         let registry = new_tunnel_registry();
         state.acp_tunnel_registry = Some(registry.clone());
 
@@ -5355,7 +5496,12 @@ mod acp_ws_integration {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (format!("ws://{addr}/acp"), registry)
+        (format!("ws://{addr}/acp"), registry, reply_registry, rx)
+    }
+
+    async fn serve() -> (String, AcpTunnelRegistry) {
+        let (url, tunnel_registry, _reply_registry, _event_rx) = serve_with_events().await;
+        (url, tunnel_registry)
     }
 
     type Ws = tokio_tungstenite::WebSocketStream<
@@ -5386,6 +5532,150 @@ mod acp_ws_integration {
                 _ => continue,
             }
         }
+    }
+
+    /// A prompt must route permission requests through the connection that is driving that turn.
+    ///
+    /// This deliberately crosses the real WebSocket read loop twice. Connection A creates the
+    /// session with a relay handle bound to A; connection B resumes it with a fresh relay handle;
+    /// then A starts the next prompt from its still-live connection. The permission request is
+    /// issued through the sink activated by `handle_session_prompt`, so observing it on A proves
+    /// prompt activation replaces B's stored resume path with the connection driving the turn.
+    #[tokio::test]
+    async fn a_prompt_after_another_connection_resumes_relays_permission_to_the_prompter() {
+        let (url, _tunnels, reply_registry, mut event_rx) = serve_with_events().await;
+
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
+        assert!(recv(&mut first).await.get("result").is_some());
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {
+                    "cwd": "/w",
+                    "mcpServers": [],
+                    "_meta": {"dev.openab/permissionPolicy": "relay"}
+                }
+            }),
+        )
+        .await;
+        let created = recv(&mut first).await;
+        let session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session/new must return a sessionId")
+            .to_string();
+        let channel_id = derive_channel_id(&session_id).unwrap();
+
+        let (mut resumed, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
+        assert!(recv(&mut resumed).await.get("result").is_some());
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {
+                    "sessionId": session_id,
+                    "cwd": "/w",
+                    "mcpServers": [],
+                    "_meta": {"dev.openab/permissionPolicy": "relay"}
+                }
+            }),
+        )
+        .await;
+        let resume_response = recv(&mut resumed).await;
+        assert!(
+            resume_response.get("result").is_some(),
+            "resume failed: {resume_response}"
+        );
+
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "use a protected tool"}]
+                }
+            }),
+        )
+        .await;
+        event_rx
+            .recv()
+            .await
+            .expect("prompt must dispatch a GatewayEvent");
+        assert!(permission_relay_required(&reply_registry, &channel_id).unwrap());
+
+        let registry = reply_registry.clone();
+        let relay_channel = channel_id.clone();
+        let relay = tokio::spawn(async move {
+            request_permission(
+                &registry,
+                &relay_channel,
+                true,
+                json!({
+                    "sessionId": "sess_inner",
+                    "toolCall": {"toolCallId": "tool-1", "title": "Run protected tool"},
+                    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+                }),
+            )
+            .await
+        });
+
+        let permission = tokio::select! {
+            frame = recv(&mut first) => frame,
+            frame = recv(&mut resumed) => panic!(
+                "permission request followed the stale resume relay instead of the prompting connection: {frame}"
+            ),
+        };
+        assert_eq!(permission["method"], json!("session/request_permission"));
+        assert_eq!(permission["params"]["sessionId"], json!(session_id));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), resumed.next())
+                .await
+                .is_err(),
+            "the connection that only resumed must not receive another connection's permission request"
+        );
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0",
+                "id": permission["id"].clone(),
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
+            }),
+        )
+        .await;
+        assert!(
+            relay.await.unwrap().is_ok(),
+            "the resumed connection's decision must resolve"
+        );
+
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+        let prompt_response = recv(&mut first).await;
+        assert_eq!(prompt_response["id"], json!(3));
+        assert_eq!(prompt_response["result"]["stopReason"], json!("cancelled"));
     }
 
     /// Handle a frame belonging to the inner MCP lifecycle, if it is one.
