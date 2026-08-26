@@ -5534,15 +5534,15 @@ mod acp_ws_integration {
         }
     }
 
-    /// A resumed session must route permission requests through the connection that resumed it.
+    /// A prompt must route permission requests through the connection that is driving that turn.
     ///
     /// This deliberately crosses the real WebSocket read loop twice. Connection A creates the
-    /// session with a relay handle bound to A; connection B resumes it with a fresh relay handle,
-    /// then starts a prompt. The permission request is issued through the sink activated by
-    /// `handle_session_prompt`, so observing it on B proves the whole
-    /// resume-state -> prompt-activation -> permission-relay path uses the new connection.
+    /// session with a relay handle bound to A; connection B resumes it with a fresh relay handle;
+    /// then A starts the next prompt from its still-live connection. The permission request is
+    /// issued through the sink activated by `handle_session_prompt`, so observing it on A proves
+    /// prompt activation replaces B's stored resume path with the connection driving the turn.
     #[tokio::test]
-    async fn a_prompt_after_resume_relays_permission_to_the_resuming_connection() {
+    async fn a_prompt_after_another_connection_resumes_relays_permission_to_the_prompter() {
         let (url, _tunnels, reply_registry, mut event_rx) = serve_with_events().await;
 
         let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -5604,7 +5604,7 @@ mod acp_ws_integration {
         );
 
         send(
-            &mut resumed,
+            &mut first,
             json!({
                 "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                 "params": {
@@ -5636,17 +5636,22 @@ mod acp_ws_integration {
             .await
         });
 
-        let permission = recv(&mut resumed).await;
+        let permission = tokio::select! {
+            frame = recv(&mut first) => frame,
+            frame = recv(&mut resumed) => panic!(
+                "permission request followed the stale resume relay instead of the prompting connection: {frame}"
+            ),
+        };
         assert_eq!(permission["method"], json!("session/request_permission"));
         assert_eq!(permission["params"]["sessionId"], json!(session_id));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(200), first.next())
+            tokio::time::timeout(std::time::Duration::from_millis(200), resumed.next())
                 .await
                 .is_err(),
-            "the superseded connection must not receive the resumed turn's permission request"
+            "the connection that only resumed must not receive another connection's permission request"
         );
         send(
-            &mut resumed,
+            &mut first,
             json!({
                 "jsonrpc": "2.0",
                 "id": permission["id"].clone(),
@@ -5660,7 +5665,7 @@ mod acp_ws_integration {
         );
 
         send(
-            &mut resumed,
+            &mut first,
             json!({
                 "jsonrpc": "2.0",
                 "method": "session/cancel",
@@ -5668,7 +5673,7 @@ mod acp_ws_integration {
             }),
         )
         .await;
-        let prompt_response = recv(&mut resumed).await;
+        let prompt_response = recv(&mut first).await;
         assert_eq!(prompt_response["id"], json!(3));
         assert_eq!(prompt_response["result"]["stopReason"], json!("cancelled"));
     }
