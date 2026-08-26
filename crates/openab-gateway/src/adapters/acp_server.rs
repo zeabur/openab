@@ -5469,8 +5469,13 @@ mod acp_ws_integration {
 
     /// Serve `/acp` on an ephemeral loopback port. Returns the URL and the tunnel registry, so a
     /// test can drive the server side the way core does.
-    async fn serve() -> (String, AcpTunnelRegistry) {
-        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    async fn serve_with_events() -> (
+        String,
+        AcpTunnelRegistry,
+        AcpReplyRegistry,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
         let mut state = crate::AppState::test_default(tx);
         state.acp = Some(AcpConfig {
             // Keyless loopback: no bearer. A client sending no `Origin` is accepted, which is
@@ -5478,7 +5483,8 @@ mod acp_ws_integration {
             auth_key: None,
             allowed_origins: vec![],
         });
-        state.acp_reply_registry = Some(new_reply_registry());
+        let reply_registry = new_reply_registry();
+        state.acp_reply_registry = Some(reply_registry.clone());
         let registry = new_tunnel_registry();
         state.acp_tunnel_registry = Some(registry.clone());
 
@@ -5490,7 +5496,12 @@ mod acp_ws_integration {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (format!("ws://{addr}/acp"), registry)
+        (format!("ws://{addr}/acp"), registry, reply_registry, rx)
+    }
+
+    async fn serve() -> (String, AcpTunnelRegistry) {
+        let (url, tunnel_registry, _reply_registry, _event_rx) = serve_with_events().await;
+        (url, tunnel_registry)
     }
 
     type Ws = tokio_tungstenite::WebSocketStream<
@@ -5521,6 +5532,145 @@ mod acp_ws_integration {
                 _ => continue,
             }
         }
+    }
+
+    /// A resumed session must route permission requests through the connection that resumed it.
+    ///
+    /// This deliberately crosses the real WebSocket read loop twice. Connection A creates the
+    /// session with a relay handle bound to A; connection B resumes it with a fresh relay handle,
+    /// then starts a prompt. The permission request is issued through the sink activated by
+    /// `handle_session_prompt`, so observing it on B proves the whole
+    /// resume-state -> prompt-activation -> permission-relay path uses the new connection.
+    #[tokio::test]
+    async fn a_prompt_after_resume_relays_permission_to_the_resuming_connection() {
+        let (url, _tunnels, reply_registry, mut event_rx) = serve_with_events().await;
+
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
+        assert!(recv(&mut first).await.get("result").is_some());
+        send(
+            &mut first,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {
+                    "cwd": "/w",
+                    "mcpServers": [],
+                    "_meta": {"dev.openab/permissionPolicy": "relay"}
+                }
+            }),
+        )
+        .await;
+        let created = recv(&mut first).await;
+        let session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session/new must return a sessionId")
+            .to_string();
+        let channel_id = derive_channel_id(&session_id).unwrap();
+
+        let (mut resumed, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
+        assert!(recv(&mut resumed).await.get("result").is_some());
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {
+                    "sessionId": session_id,
+                    "cwd": "/w",
+                    "mcpServers": [],
+                    "_meta": {"dev.openab/permissionPolicy": "relay"}
+                }
+            }),
+        )
+        .await;
+        let resume_response = recv(&mut resumed).await;
+        assert!(
+            resume_response.get("result").is_some(),
+            "resume failed: {resume_response}"
+        );
+
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "use a protected tool"}]
+                }
+            }),
+        )
+        .await;
+        event_rx
+            .recv()
+            .await
+            .expect("prompt must dispatch a GatewayEvent");
+        assert!(permission_relay_required(&reply_registry, &channel_id).unwrap());
+
+        let registry = reply_registry.clone();
+        let relay_channel = channel_id.clone();
+        let relay = tokio::spawn(async move {
+            request_permission(
+                &registry,
+                &relay_channel,
+                true,
+                json!({
+                    "sessionId": "sess_inner",
+                    "toolCall": {"toolCallId": "tool-1", "title": "Run protected tool"},
+                    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+                }),
+            )
+            .await
+        });
+
+        let permission = recv(&mut resumed).await;
+        assert_eq!(permission["method"], json!("session/request_permission"));
+        assert_eq!(permission["params"]["sessionId"], json!(session_id));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), first.next())
+                .await
+                .is_err(),
+            "the superseded connection must not receive the resumed turn's permission request"
+        );
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0",
+                "id": permission["id"].clone(),
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}
+            }),
+        )
+        .await;
+        assert!(
+            relay.await.unwrap().is_ok(),
+            "the resumed connection's decision must resolve"
+        );
+
+        send(
+            &mut resumed,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+        let prompt_response = recv(&mut resumed).await;
+        assert_eq!(prompt_response["id"], json!(3));
+        assert_eq!(prompt_response["result"]["stopReason"], json!("cancelled"));
     }
 
     /// Handle a frame belonging to the inner MCP lifecycle, if it is one.
