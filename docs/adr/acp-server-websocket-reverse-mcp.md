@@ -562,7 +562,9 @@ Five **DOM-semantic** MCP tools, served by the extension: `katashiro.read_dom` (
   session forwards the inner agent's `session/request_permission` to the outer ACP client through
   the existing server→client request correlation path, then returns that client's decision to the
   inner agent. Relay errors and timeouts cancel the tool request rather than falling back to
-  approval. `initialize` advertises `_meta["dev.openab/permissionRelay"] = true` so a client can
+  approval. The relay requirement is snapshotted when a turn starts, so a reconnect or resume
+  cannot silently downgrade that in-flight turn; losing its relay handle cancels the request.
+  `initialize` advertises `_meta["dev.openab/permissionRelay"] = true` so a client can
   detect support before opting in. This changes only backends that emit ACP permission requests;
   OpenCode currently does not, so its backend-native permission behavior is outside this change.
   Prior art supports the same relay boundary: OpenClaw maps gateway exec approvals into ACP

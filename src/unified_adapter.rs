@@ -209,9 +209,26 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    fn agent_permission_relay_required(&self, channel: &ChannelRef) -> Result<bool> {
+        if channel.platform != "acp" {
+            return Ok(false);
+        }
+        let registry = self
+            .gw_state
+            .acp_reply_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ACP permission relay registry is unavailable"))?;
+        openab_gateway::adapters::acp_server::permission_relay_required(
+            registry,
+            &channel.channel_id,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
     async fn request_agent_permission(
         &self,
         channel: &ChannelRef,
+        relay_required: bool,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         if channel.platform == "acp" {
@@ -223,6 +240,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             if let Some(outcome) = openab_gateway::adapters::acp_server::request_permission(
                 registry,
                 &channel.channel_id,
+                relay_required,
                 params.clone(),
             )
             .await

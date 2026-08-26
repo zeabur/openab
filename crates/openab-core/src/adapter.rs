@@ -430,14 +430,27 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Snapshot whether this turn requires a relayed permission decision.
+    /// The router captures this once at turn start so reconnects cannot
+    /// silently downgrade an in-flight turn to the legacy auto-approve path.
+    fn agent_permission_relay_required(&self, _channel: &ChannelRef) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Decide an agent-initiated ACP tool permission request. Existing chat
     /// surfaces retain the historical auto-approve behavior; ACP-backed hosts
     /// may override this to relay the request to their own authorization UI.
     async fn request_agent_permission(
         &self,
         _channel: &ChannelRef,
+        relay_required: bool,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        if relay_required {
+            return Err(anyhow::anyhow!(
+                "permission relay was required at turn start but is unavailable"
+            ));
+        }
         Ok(build_permission_response(Some(&params)))
     }
 
@@ -475,6 +488,7 @@ async fn handle_permission_request(
     adapter: &Arc<dyn ChatAdapter>,
     channel: &ChannelRef,
     responder: &PermissionResponder,
+    relay_required: bool,
     message: &JsonRpcMessage,
 ) -> bool {
     if message.method.as_deref() != Some("session/request_permission") {
@@ -489,7 +503,10 @@ async fn handle_permission_request(
         .params
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
-    let outcome = match adapter.request_agent_permission(channel, params).await {
+    let outcome = match adapter
+        .request_agent_permission(channel, relay_required, params)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             warn!(?error, "agent permission relay failed; cancelling tool use");
@@ -814,6 +831,8 @@ impl AdapterRouter {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
                     let permission_responder = conn.permission_responder();
+                    let permission_relay_required =
+                        adapter.agent_permission_relay_required(&thread_channel)?;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
@@ -1005,6 +1024,7 @@ impl AdapterRouter {
                             &adapter,
                             &thread_channel,
                             &permission_responder,
+                            permission_relay_required,
                             &notification,
                         )
                         .await
@@ -1202,6 +1222,7 @@ impl AdapterRouter {
                                     &idle_adapter,
                                     &idle_channel,
                                     &idle_permission_responder,
+                                    permission_relay_required,
                                     &notification,
                                 )
                                 .await

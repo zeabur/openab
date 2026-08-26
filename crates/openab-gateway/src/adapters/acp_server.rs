@@ -950,11 +950,26 @@ async fn send_request_with_cancel(
 /// `Ok(None)` preserves the historical auto-approve policy. `Err` means relay
 /// was requested but no usable client path or decision remained, so callers
 /// must fail closed rather than falling back to approval.
+pub fn permission_relay_required(
+    registry: &AcpReplyRegistry,
+    channel_id: &str,
+) -> Result<bool, String> {
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let sink = reg
+        .get(channel_id)
+        .ok_or_else(|| "ACP session output sink is unavailable".to_string())?;
+    Ok(sink.permission_relay.is_some())
+}
+
 pub async fn request_permission(
     registry: &AcpReplyRegistry,
     channel_id: &str,
+    relay_required: bool,
     mut params: Value,
 ) -> Result<Option<Value>, String> {
+    if !relay_required {
+        return Ok(None);
+    }
     let (session_id, handle) = {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let sink = reg
@@ -962,9 +977,9 @@ pub async fn request_permission(
             .ok_or_else(|| "ACP session output sink is unavailable".to_string())?;
         (sink.session_id.clone(), sink.permission_relay.clone())
     };
-    let Some(handle) = handle else {
-        return Ok(None);
-    };
+    let handle = handle.ok_or_else(|| {
+        "ACP permission relay required at turn start but is no longer available".to_string()
+    })?;
 
     let Some(object) = params.as_object_mut() else {
         return Err("session/request_permission params must be an object".into());
@@ -3471,8 +3486,9 @@ mod acp_requests {
         let pending = new_pending();
         let next_id = Arc::new(AtomicU64::new(1));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        registry.lock().unwrap().insert(
-            "acp_channel".into(),
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
             ReplySink {
                 turn_id: None,
                 tx: None,
@@ -3486,13 +3502,14 @@ mod acp_requests {
                     next_id,
                 }),
             },
-        );
+        ));
 
         let registry2 = registry.clone();
         let relay = tokio::spawn(async move {
             request_permission(
                 &registry2,
                 "acp_channel",
+                true,
                 json!({
                     "sessionId": "sess_inner",
                     "toolCall": {"toolCallId": "tool-1", "title": "Run command"},
@@ -3528,8 +3545,9 @@ mod acp_requests {
     async fn permission_request_keeps_legacy_auto_approve_without_opt_in() {
         let registry = new_reply_registry();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        registry.lock().unwrap().insert(
-            "acp_channel".into(),
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
             ReplySink {
                 turn_id: None,
                 tx: None,
@@ -3539,12 +3557,13 @@ mod acp_requests {
                 generation: 0,
                 permission_relay: None,
             },
-        );
+        ));
 
         assert_eq!(
             request_permission(
                 &registry,
                 "acp_channel",
+                false,
                 json!({"sessionId": "sess_inner", "options": []}),
             )
             .await
@@ -3552,6 +3571,64 @@ mod acp_requests {
             None
         );
         assert!(out_rx.try_recv().is_err(), "default policy must not emit a client request");
+    }
+
+    #[tokio::test]
+    async fn permission_request_never_downgrades_after_a_relay_turn_is_replaced() {
+        let registry = new_reply_registry();
+        let pending = new_pending();
+        let (relay_tx, _relay_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
+            ReplySink {
+                turn_id: Some("evt_old".into()),
+                tx: None,
+                session_id: "sess_outer".into(),
+                out_tx: relay_tx.clone(),
+                owner: "conn-old".into(),
+                generation: 1,
+                permission_relay: Some(ClientRequestHandle {
+                    out_tx: relay_tx,
+                    pending,
+                    next_id: Arc::new(AtomicU64::new(1)),
+                }),
+            },
+        ));
+        let relay_was_required =
+            super::permission_relay_required(&registry, "acp_channel").unwrap();
+
+        let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel::<String>();
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_channel",
+            ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: "sess_outer".into(),
+                out_tx: replacement_tx,
+                owner: "conn-new".into(),
+                generation: 2,
+                permission_relay: None,
+            },
+        ));
+
+        assert!(relay_was_required, "the old turn opted into relay");
+        assert!(
+            request_permission(
+                &registry,
+                "acp_channel",
+                relay_was_required,
+                json!({"sessionId": "sess_inner", "options": []}),
+            )
+            .await
+            .is_err(),
+            "a relay-enabled turn must fail closed after reconnect, never return the legacy fallback"
+        );
+        assert!(
+            replacement_rx.try_recv().is_err(),
+            "a replacement without relay metadata has no permission request path"
+        );
     }
 
     #[tokio::test]
