@@ -655,6 +655,10 @@ impl SessionPool {
         };
         #[cfg(not(feature = "acp-mcp"))]
         let spawn_env = self.config.env.clone();
+        // Callers may pass a per-session working directory that doesn't exist
+        // yet (e.g. per-conversation isolation). Create it so the spawn's
+        // current_dir() doesn't fail.
+        let _ = std::fs::create_dir_all(&effective_workdir);
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
