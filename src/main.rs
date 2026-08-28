@@ -1186,6 +1186,20 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "acp")]
             {
                 gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());
+
+                // Bridge ACP session/cancel to the pool: the gateway sends the
+                // thread key, the receiver calls pool.cancel_session().
+                let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                gw_state_inner.acp_pool_cancel_tx = Some(cancel_tx);
+                let cancel_pool = pool.clone();
+                tokio::spawn(async move {
+                    use openab_core::redact::redact_session_ids;
+                    while let Some(thread_key) = cancel_rx.recv().await {
+                        if let Err(e) = cancel_pool.cancel_session(&thread_key).await {
+                            tracing::debug!(key = %redact_session_ids(&thread_key), error = %e, "pool cancel_session (session may have ended)");
+                        }
+                    }
+                });
             }
 
             // Pre-download identity probe: lets adapters consult the shared

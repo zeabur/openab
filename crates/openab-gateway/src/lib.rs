@@ -6,7 +6,7 @@ pub mod store;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 // --- Reply token cache for LINE hybrid Reply/Push dispatch ---
 
@@ -95,6 +95,11 @@ pub struct AppState {
     /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
     pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
+    /// Pool-side session cancel. The ACP server sends `"acp:{channel_id}"` here
+    /// when a `session/cancel` notification arrives or an idle timeout fires;
+    /// the receiver calls `pool.cancel_session(thread_id)`.
+    #[cfg(feature = "acp")]
+    pub acp_pool_cancel_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 
@@ -135,6 +140,8 @@ impl AppState {
             acp_reply_registry: None,
             #[cfg(feature = "acp")]
             acp_tunnel_registry: None,
+            #[cfg(feature = "acp")]
+            acp_pool_cancel_tx: None,
             #[cfg(feature = "lineworks")]
             lineworks: None,
             ws_token: None,
@@ -257,6 +264,8 @@ impl AppState {
             acp_reply_registry,
             #[cfg(feature = "acp")]
             acp_tunnel_registry,
+            #[cfg(feature = "acp")]
+            acp_pool_cancel_tx: None,
             #[cfg(feature = "lineworks")]
             lineworks,
             ws_token,
@@ -839,6 +848,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp_reply_registry,
         #[cfg(feature = "acp")]
         acp_tunnel_registry,
+        #[cfg(feature = "acp")]
+        acp_pool_cancel_tx: None,
         #[cfg(feature = "lineworks")]
         lineworks,
         ws_token,

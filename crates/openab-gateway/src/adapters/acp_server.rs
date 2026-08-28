@@ -2091,7 +2091,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 // Notification form fires the cancel signal (no response); a request-shaped
                 // cancel is rejected -32600 rather than acked with an empty success (R17-F3c).
                 if let Some(resp) =
-                    handle_session_cancel(&sessions, id, req.params.as_ref(), is_notification).await
+                    handle_session_cancel(&state, &sessions, id, req.params.as_ref(), is_notification).await
                 {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 }
@@ -2442,6 +2442,7 @@ async fn handle_session_resume(
 /// is rejected with -32600 invalid request and does NOT fire the signal, rather than being
 /// acknowledged with an empty success frame (R17-F3c).
 async fn handle_session_cancel(
+    state: &Arc<crate::AppState>,
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
     params: Option<&Value>,
@@ -2456,12 +2457,33 @@ async fn handle_session_cancel(
     }
     let sess_key = params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str());
     if let Some(k) = sess_key {
-        let notify = sessions.lock().await.get(k).and_then(|s| s.cancel.clone());
+        let (notify, channel_id) = {
+            let guard = sessions.lock().await;
+            let session = guard.get(k);
+            (
+                session.and_then(|s| s.cancel.clone()),
+                session.map(|s| s.channel_id.clone()),
+            )
+        };
         if let Some(n) = notify {
             n.notify_one();
         }
+        if let Some(ch) = channel_id {
+            send_pool_cancel(state, &ch);
+        }
     }
     None
+}
+
+/// Best-effort pool-side cancel: sends the thread key so the pool's agent
+/// process receives `session/cancel` on its stdin, stopping the in-flight
+/// tool call. A missing sender (standalone gateway) or a closed channel is
+/// silently ignored — the gateway-side cancel already stops the stream.
+fn send_pool_cancel(state: &crate::AppState, channel_id: &str) {
+    if let Some(ref tx) = state.acp_pool_cancel_tx {
+        let thread_key = format!("acp:{channel_id}");
+        let _ = tx.send(thread_key);
+    }
 }
 
 /// Derive the deterministic `channel_id` (`acp_<uuid>`) from a client-supplied
@@ -2734,6 +2756,14 @@ async fn handle_session_prompt(
                 }
             }
         }
+    }
+
+    // On timeout, tell the pool to cancel the agent process so it stops the
+    // in-flight tool call. The gateway-side cancel (above) only stops the
+    // streaming loop; without this the agent process keeps running until the
+    // pool's own idle reaper kills it.
+    if timed_out {
+        send_pool_cancel(state, &channel_id);
     }
 
     // Cleanup: remove from registry, release busy flag, clear cancel signal.
@@ -5411,7 +5441,9 @@ mod acp_review_fixes {
     async fn cancel_as_request_is_rejected_not_empty_success() {
         let sessions = sessions_map();
         let params = json!({"sessionId": format!("sess_{}", Uuid::new_v4())});
-        let resp = handle_session_cancel(&sessions, json!(42), Some(&params), false)
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        let state = Arc::new(crate::AppState::test_default(tx));
+        let resp = handle_session_cancel(&state, &sessions, json!(42), Some(&params), false)
             .await
             .expect("a request-shaped cancel must produce a response, not silence");
         let v = serde_json::to_value(&resp).unwrap();
@@ -5442,7 +5474,9 @@ mod acp_review_fixes {
             },
         );
         let params = json!({"sessionId": sid});
-        let resp = handle_session_cancel(&sessions, Value::Null, Some(&params), true).await;
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        let state = Arc::new(crate::AppState::test_default(tx));
+        let resp = handle_session_cancel(&state, &sessions, Value::Null, Some(&params), true).await;
         assert!(resp.is_none(), "a notification cancel must produce no response frame");
         // notify_one stored a permit, so notified() resolves immediately — the signal fired.
         assert!(
