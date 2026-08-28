@@ -284,30 +284,39 @@ pub(crate) async fn run_reader_loop<R>(
         };
         debug!(line = line.trim(), "acp_recv");
 
-        // Response (has id) → resolve pending AND forward to subscriber
-        if let Some(id) = msg.id {
-            let mut map = pending.lock().await;
-            if let Some(tx) = map.remove(&id) {
-                // Forward to subscriber so they see the completion
-                if let Some(ntx) = current_notification_sender(&notify_tx).await {
-                    // Clone the essential fields for the subscriber
-                    let _ = ntx
-                        .send(JsonRpcMessage {
-                            id: Some(id),
-                            method: None,
-                            result: msg.result.clone(),
-                            error: msg.error.clone(),
-                            params: None,
-                        })
-                        .await;
+        // Response (has id, no method) → resolve pending AND forward to
+        // subscriber. An id-bearing message WITH a method is a request FROM
+        // the agent (e.g. session/request_permission); its id lives in the
+        // agent's own JSON-RPC namespace and must never be matched against
+        // our pending map — on a numeric collision the request would be
+        // swallowed as the prompt's response, ending the turn with
+        // "(no response)" and leaving the agent blocked forever on an answer
+        // that never comes.
+        if msg.method.is_none() {
+            if let Some(id) = msg.id {
+                let mut map = pending.lock().await;
+                if let Some(tx) = map.remove(&id) {
+                    // Forward to subscriber so they see the completion
+                    if let Some(ntx) = current_notification_sender(&notify_tx).await {
+                        // Clone the essential fields for the subscriber
+                        let _ = ntx
+                            .send(JsonRpcMessage {
+                                id: Some(id),
+                                method: None,
+                                result: msg.result.clone(),
+                                error: msg.error.clone(),
+                                params: None,
+                            })
+                            .await;
+                    }
+                    let _ = tx.send(msg);
+                    continue;
                 }
-                let _ = tx.send(msg);
-                continue;
+                // Stale id (#732): pending was already abandoned. Falls through
+                // to subscriber forwarding; the adapter recv loop filters by
+                // request_id so it can't leak into the next prompt.
+                trace!(request_id = id, "stale id-bearing message after abandon");
             }
-            // Stale id (#732): pending was already abandoned. Falls through
-            // to subscriber forwarding; the adapter recv loop filters by
-            // request_id so it can't leak into the next prompt.
-            trace!(request_id = id, "stale id-bearing message after abandon");
         }
 
         // Notification → forward to subscriber
@@ -1137,6 +1146,66 @@ mod reader_loop_tests {
             forwarded.method.as_deref(),
             Some("session/request_permission")
         );
+
+        reader.abort();
+    }
+
+    // The agent numbers its own requests independently of the broker's ids.
+    // When an agent request id collides with a pending broker request id, the
+    // request must still reach the subscriber as a request — not resolve the
+    // pending entry as if it were the response (which ended real turns with
+    // "(no response)" and left the agent blocked forever on the permission).
+    #[tokio::test]
+    async fn agent_request_with_colliding_id_does_not_resolve_pending() {
+        let (agent_side, broker_side) = duplex(4096);
+        let (broker_reader, _broker_writer) = tokio::io::split(broker_side);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (prompt_tx, mut prompt_rx) = oneshot::channel();
+        pending.lock().await.insert(3u64, prompt_tx);
+        let (notify_tx, mut notify_rx) = mpsc::channel(4);
+        let subscriber: NotificationSender = Arc::new(Mutex::new(Some(notify_tx)));
+
+        let reader = tokio::spawn(run_reader_loop(broker_reader, pending.clone(), subscriber));
+        let (_agent_reader, mut agent_writer) = tokio::io::split(agent_side);
+        // Agent-initiated request whose id collides with the pending prompt id 3.
+        agent_writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":{"sessionId":"inner","options":[{"optionId":"allow","kind":"allow_once"}]}}"#,
+            )
+            .await
+            .unwrap();
+        agent_writer.write_all(b"\n").await.unwrap();
+
+        let forwarded =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notify_rx.recv())
+                .await
+                .expect("colliding request must be forwarded, not swallowed")
+                .expect("subscriber must remain connected");
+        assert_eq!(
+            forwarded.method.as_deref(),
+            Some("session/request_permission"),
+            "the request must keep its method so the recv loop can answer it"
+        );
+        assert!(
+            pending.lock().await.contains_key(&3),
+            "the pending prompt must remain unresolved"
+        );
+        assert!(
+            prompt_rx.try_recv().is_err(),
+            "the prompt oneshot must not fire from the agent's request"
+        );
+
+        // The real response (no method) still resolves the pending entry.
+        agent_writer
+            .write_all(br#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#)
+            .await
+            .unwrap();
+        agent_writer.write_all(b"\n").await.unwrap();
+        let resolved = tokio::time::timeout(std::time::Duration::from_millis(100), prompt_rx)
+            .await
+            .expect("response must resolve the pending prompt")
+            .expect("oneshot must deliver");
+        assert!(resolved.result.is_some());
 
         reader.abort();
     }
