@@ -1858,9 +1858,26 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     pending: pending_requests.clone(),
                     next_id: next_req_id.clone(),
                 });
-                let (resp, resumed_channel) =
+                let (mut resp, resumed_channel) =
                     handle_session_resume(&sessions, id.clone(), req.params.as_ref(), mcp_enabled)
                         .await;
+                // Report whether the pool's inner agent session actually
+                // survived. Gateway-side resume is bookkeeping and always
+                // succeeds; without this signal a client cannot tell a live
+                // continuation from a session the pool has already evicted,
+                // and skips its own recovery (e.g. a history preamble).
+                if let Some(ref channel_id) = resumed_channel {
+                    if let Some(alive) = query_pool_liveness(&state, channel_id).await {
+                        if let Some(result) =
+                            resp.result.as_mut().and_then(|value| value.as_object_mut())
+                        {
+                            result.insert(
+                                "_meta".into(),
+                                json!({ "dev.openab/sessionAlive": alive }),
+                            );
+                        }
+                    }
+                }
                 if let (Some(registry), Some(channel_id)) =
                     (state.acp_reply_registry.as_ref(), resumed_channel.as_ref())
                 {
@@ -2483,6 +2500,20 @@ fn send_pool_cancel(state: &crate::AppState, channel_id: &str) {
     if let Some(ref cancel) = state.acp_pool_cancel {
         cancel.send(format!("acp:{channel_id}"));
     }
+}
+
+/// Ask the pool whether the inner agent session behind this channel is still
+/// live. `None` = no bridge wired (standalone gateway), the queue was full, or
+/// the pool did not answer within the timeout — callers omit the signal rather
+/// than guessing.
+async fn query_pool_liveness(state: &crate::AppState, channel_id: &str) -> Option<bool> {
+    let tx = state.acp_pool_liveness.as_ref()?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.try_send((format!("acp:{channel_id}"), reply_tx)).ok()?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), reply_rx)
+        .await
+        .ok()?
+        .ok()
 }
 
 /// Derive the deterministic `channel_id` (`acp_<uuid>`) from a client-supplied
@@ -5484,6 +5515,32 @@ mod acp_review_fixes {
                 .is_ok(),
             "notification cancel must fire the session's cancel signal"
         );
+    }
+
+    // Pool-liveness bridge: the query carries the derived thread key, returns
+    // the pool's answer, and degrades to None when no bridge is wired.
+    #[tokio::test]
+    async fn pool_liveness_query_round_trips_and_degrades_without_a_bridge() {
+        let (btx, _) = tokio::sync::broadcast::channel(1);
+        let mut state = crate::AppState::test_default(btx);
+        assert_eq!(
+            query_pool_liveness(&state, "acp_abc").await,
+            None,
+            "no bridge wired must yield None, not a guess"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+            String,
+            tokio::sync::oneshot::Sender<bool>,
+        )>(4);
+        state.acp_pool_liveness = Some(tx);
+        tokio::spawn(async move {
+            while let Some((key, reply)) = rx.recv().await {
+                let _ = reply.send(key == "acp:acp_live");
+            }
+        });
+        assert_eq!(query_pool_liveness(&state, "acp_live").await, Some(true));
+        assert_eq!(query_pool_liveness(&state, "acp_gone").await, Some(false));
     }
 }
 
