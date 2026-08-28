@@ -51,9 +51,43 @@ const MAX_INFLIGHT_ESTABLISHES: usize = 64;
 /// documents itself against this value. As a bare literal in the middle of a loop it was invisible
 /// to exactly the person who needed it — the operator raising the tunnel timeout into it.
 ///
-/// Not operator-configurable today. Anything set above it is silently capped here, which is why the
-/// config path warns rather than letting a larger value look effective.
+/// Default when `OPENAB_ACP_IDLE_TIMEOUT_SECS` is unset or invalid. The effective value comes from
+/// [`acp_prompt_idle_timeout_secs`]; anything configured above the effective value is silently
+/// capped there, which is why the config path warns rather than letting a larger value look
+/// effective.
+///
+/// Timeout ordering contract (each layer strictly below the next, so the layer that owns the
+/// failure also reports it): gateway idle timeout (this) < pool `prompt_hard_timeout_secs` <
+/// client per-prompt timeout (Nuphos: 15 min).
 pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
+
+/// Floor for the env override: below this a single slow chunk boundary would spuriously kill
+/// healthy turns.
+const ACP_PROMPT_IDLE_TIMEOUT_MIN_SECS: u64 = 30;
+
+static ACP_PROMPT_IDLE_TIMEOUT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The effective per-chunk idle timeout for a prompt turn: `OPENAB_ACP_IDLE_TIMEOUT_SECS` when it
+/// parses to a value >= the floor, else the default. Read once per process.
+pub fn acp_prompt_idle_timeout_secs() -> u64 {
+    *ACP_PROMPT_IDLE_TIMEOUT.get_or_init(|| {
+        let resolved =
+            idle_timeout_from_env(std::env::var("OPENAB_ACP_IDLE_TIMEOUT_SECS").ok().as_deref());
+        if resolved != ACP_PROMPT_IDLE_TIMEOUT_SECS {
+            info!(idle_timeout_secs = resolved, "ACP prompt idle timeout overridden via env");
+        }
+        resolved
+    })
+}
+
+/// Pure resolution of the env override, testable without process-global env: a missing,
+/// non-numeric, or below-floor value falls back to the default rather than guessing.
+pub fn idle_timeout_from_env(raw: Option<&str>) -> u64 {
+    match raw.and_then(|value| value.trim().parse::<u64>().ok()) {
+        Some(value) if value >= ACP_PROMPT_IDLE_TIMEOUT_MIN_SECS => value,
+        _ => ACP_PROMPT_IDLE_TIMEOUT_SECS,
+    }
+}
 
 /// Whether a configured tunnel timeout is overtaken by the idle timeout, and so cannot decide the
 /// outcome.
@@ -62,7 +96,7 @@ pub const ACP_PROMPT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// interesting part is one comparison, and an inverted `>=` would be silent in exactly the case it
 /// exists to report.
 pub fn tunnel_timeout_is_ineffective(configured_secs: u64) -> bool {
-    configured_secs >= ACP_PROMPT_IDLE_TIMEOUT_SECS
+    configured_secs >= acp_prompt_idle_timeout_secs()
 }
 
 /// Warn when a configured tunnel timeout cannot take effect because the idle timeout above overtakes
@@ -78,9 +112,9 @@ pub fn warn_if_tunnel_timeout_is_ineffective(configured_secs: u64) {
     if tunnel_timeout_is_ineffective(configured_secs) {
         warn!(
             configured = configured_secs,
-            effective_ceiling = ACP_PROMPT_IDLE_TIMEOUT_SECS,
+            effective_ceiling = acp_prompt_idle_timeout_secs(),
             "[mcp] tunnel_timeout_seconds is at or above the ACP prompt idle timeout, which is not \
-             configurable — the turn ends there first, so this value cannot take effect"
+             configurable at runtime — the turn ends there first, so this value cannot take effect"
         );
     }
 }
@@ -2756,7 +2790,7 @@ async fn handle_session_prompt(
 
     // Stream replies back as ACP `session/update` notifications.
     let mut sent_len = 0usize;
-    let timeout = tokio::time::Duration::from_secs(ACP_PROMPT_IDLE_TIMEOUT_SECS);
+    let timeout = tokio::time::Duration::from_secs(acp_prompt_idle_timeout_secs());
     // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
@@ -5544,6 +5578,18 @@ mod acp_review_fixes {
                 .is_ok(),
             "notification cancel must fire the session's cancel signal"
         );
+    }
+
+    // Idle-timeout override: a sane value wins; missing, garbage, or
+    // below-floor values fall back to the default instead of guessing.
+    #[test]
+    fn idle_timeout_env_override_resolves_sane_values_and_rejects_the_rest() {
+        assert_eq!(idle_timeout_from_env(None), ACP_PROMPT_IDLE_TIMEOUT_SECS);
+        assert_eq!(idle_timeout_from_env(Some("")), ACP_PROMPT_IDLE_TIMEOUT_SECS);
+        assert_eq!(idle_timeout_from_env(Some("banana")), ACP_PROMPT_IDLE_TIMEOUT_SECS);
+        assert_eq!(idle_timeout_from_env(Some("5")), ACP_PROMPT_IDLE_TIMEOUT_SECS);
+        assert_eq!(idle_timeout_from_env(Some("30")), 30);
+        assert_eq!(idle_timeout_from_env(Some(" 600 ")), 600);
     }
 
     // Version handshake meta: stamped values appear under their reverse-DNS
