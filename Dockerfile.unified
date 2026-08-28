@@ -132,6 +132,13 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 FROM base-node AS claude
 ARG CLAUDE_AGENT_ACP_VERSION=0.70.0
 ARG CLAUDE_CODE_VERSION=2.1.241
+# Version handshake: stamp the git commit this image was built from (pass
+# --build-arg OPENAB_BUILD_SHA=$(git rev-parse --short=12 HEAD)) and the
+# pinned adapter version; the gateway reports both on ACP initialize so
+# clients can log what the deployed runtime actually runs.
+ARG OPENAB_BUILD_SHA=""
+ENV OPENAB_BUILD_SHA=${OPENAB_BUILD_SHA}
+ENV OPENAB_ADAPTER_VERSION=claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION}
 RUN npm install -g @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --retry 3
 ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
 ENV HOME=/home/node

@@ -2212,6 +2212,15 @@ fn handle_initialize(req: &JsonRpcRequest, mcp_http: bool) -> JsonRpcResponse {
             format!("Unsupported protocolVersion {client_version}; this agent supports {ACP_PROTOCOL_VERSION}"),
         );
     }
+    // Build identity for the version handshake: the image build stamps
+    // OPENAB_BUILD_SHA (the git commit the binary was built from) into the
+    // environment; clients log it so a deployed runtime that drifted from
+    // the source tree they were developed against is observable instead of
+    // silent. Absent (local/dev builds) the key is omitted, never guessed.
+    let caps_meta = version_handshake_meta(
+        std::env::var("OPENAB_BUILD_SHA").ok().as_deref(),
+        std::env::var("OPENAB_ADAPTER_VERSION").ok().as_deref(),
+    );
     // ACP initialize response. We advertise `sessionCapabilities.resume` (we support
     // session/resume) but NOT `loadSession` — the gateway cannot replay conversation
     // history to the client (it lives inside the downstream agent CLI).
@@ -2221,9 +2230,7 @@ fn handle_initialize(req: &JsonRpcRequest, mcp_http: bool) -> JsonRpcResponse {
             "protocolVersion": negotiated,
             "agentCapabilities": {
                 "loadSession": false,
-                "_meta": {
-                    "dev.openab/permissionRelay": true
-                },
+                "_meta": caps_meta,
                 // Advertised because the serde default is {http:false, sse:false}, so saying
                 // NOTHING already claims "no MCP transport support" — while this gateway ships
                 // MCP-over-ACP. Silence was not neutral (R4).
@@ -2496,6 +2503,28 @@ async fn handle_session_cancel(
 /// process receives `session/cancel` on its stdin, stopping the in-flight
 /// tool call. A missing sender (standalone gateway) or a closed channel is
 /// silently ignored — the gateway-side cancel already stops the stream.
+/// The `agentCapabilities._meta` object for `initialize`: the permission-relay
+/// capability plus the version handshake. The image build stamps the git
+/// commit (`OPENAB_BUILD_SHA`) and the pinned adapter version
+/// (`OPENAB_ADAPTER_VERSION`); an unset or empty value omits its key so a
+/// local/dev build never reports a guessed identity.
+fn version_handshake_meta(
+    build_sha: Option<&str>,
+    adapter_version: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut meta = serde_json::Map::new();
+    meta.insert("dev.openab/permissionRelay".into(), json!(true));
+    for (value, key) in [
+        (build_sha, "dev.openab/buildSha"),
+        (adapter_version, "dev.openab/adapterVersion"),
+    ] {
+        if let Some(value) = value.filter(|s| !s.is_empty()) {
+            meta.insert(key.into(), json!(value));
+        }
+    }
+    meta
+}
+
 fn send_pool_cancel(state: &crate::AppState, channel_id: &str) {
     if let Some(ref cancel) = state.acp_pool_cancel {
         cancel.send(format!("acp:{channel_id}"));
@@ -5514,6 +5543,26 @@ mod acp_review_fixes {
                 .await
                 .is_ok(),
             "notification cancel must fire the session's cancel signal"
+        );
+    }
+
+    // Version handshake meta: stamped values appear under their reverse-DNS
+    // keys; unset or empty values omit the key entirely.
+    #[test]
+    fn version_handshake_meta_reports_stamped_values_and_omits_absent_ones() {
+        let bare = version_handshake_meta(None, None);
+        assert_eq!(bare.get("dev.openab/permissionRelay"), Some(&json!(true)));
+        assert!(!bare.contains_key("dev.openab/buildSha"));
+        assert!(!bare.contains_key("dev.openab/adapterVersion"));
+
+        let empty = version_handshake_meta(Some(""), Some(""));
+        assert!(!empty.contains_key("dev.openab/buildSha"));
+
+        let full = version_handshake_meta(Some("1d86daa14566"), Some("claude-agent-acp@0.70.0"));
+        assert_eq!(full.get("dev.openab/buildSha"), Some(&json!("1d86daa14566")));
+        assert_eq!(
+            full.get("dev.openab/adapterVersion"),
+            Some(&json!("claude-agent-acp@0.70.0"))
         );
     }
 
