@@ -1189,7 +1189,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // Bridge ACP session/cancel to the pool: the gateway sends the
                 // thread key, the receiver calls pool.cancel_session().
-                let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<String>(64);
                 gw_state_inner.acp_pool_cancel_tx = Some(cancel_tx);
                 let cancel_pool = pool.clone();
                 tokio::spawn(async move {

@@ -97,9 +97,10 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// Pool-side session cancel. The ACP server sends `"acp:{channel_id}"` here
     /// when a `session/cancel` notification arrives or an idle timeout fires;
-    /// the receiver calls `pool.cancel_session(thread_id)`.
+    /// the receiver calls `pool.cancel_session(thread_id)`. Bounded: excess
+    /// cancels are dropped (idempotent, so harmless).
     #[cfg(feature = "acp")]
-    pub acp_pool_cancel_tx: Option<mpsc::UnboundedSender<String>>,
+    pub acp_pool_cancel_tx: Option<mpsc::Sender<String>>,
 }
 
 

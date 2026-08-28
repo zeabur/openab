@@ -2482,7 +2482,7 @@ async fn handle_session_cancel(
 fn send_pool_cancel(state: &crate::AppState, channel_id: &str) {
     if let Some(ref tx) = state.acp_pool_cancel_tx {
         let thread_key = format!("acp:{channel_id}");
-        let _ = tx.send(thread_key);
+        let _ = tx.try_send(thread_key);
     }
 }
 
