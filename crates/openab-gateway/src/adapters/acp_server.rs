@@ -2480,9 +2480,8 @@ async fn handle_session_cancel(
 /// tool call. A missing sender (standalone gateway) or a closed channel is
 /// silently ignored — the gateway-side cancel already stops the stream.
 fn send_pool_cancel(state: &crate::AppState, channel_id: &str) {
-    if let Some(ref tx) = state.acp_pool_cancel_tx {
-        let thread_key = format!("acp:{channel_id}");
-        let _ = tx.try_send(thread_key);
+    if let Some(ref cancel) = state.acp_pool_cancel {
+        cancel.send(format!("acp:{channel_id}"));
     }
 }
 

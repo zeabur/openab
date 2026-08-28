@@ -1187,16 +1187,21 @@ async fn main() -> anyhow::Result<()> {
             {
                 gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());
 
-                // Bridge ACP session/cancel to the pool: the gateway sends the
-                // thread key, the receiver calls pool.cancel_session().
-                let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<String>(64);
-                gw_state_inner.acp_pool_cancel_tx = Some(cancel_tx);
+                // Bridge ACP session/cancel to the pool: the gateway inserts
+                // thread keys into a coalesced set, the receiver drains and
+                // calls pool.cancel_session(). Dedup guarantees every distinct
+                // session's cancel is retained even under load.
+                let (cancel_tx, cancel_rx) = openab_gateway::AcpPoolCancel::new();
+                gw_state_inner.acp_pool_cancel = Some(cancel_tx);
                 let cancel_pool = pool.clone();
                 tokio::spawn(async move {
                     use openab_core::redact::redact_session_ids;
-                    while let Some(thread_key) = cancel_rx.recv().await {
-                        if let Err(e) = cancel_pool.cancel_session(&thread_key).await {
-                            tracing::debug!(key = %redact_session_ids(&thread_key), error = %e, "pool cancel_session (session may have ended)");
+                    loop {
+                        cancel_rx.notified().await;
+                        for thread_key in cancel_rx.drain() {
+                            if let Err(e) = cancel_pool.cancel_session(&thread_key).await {
+                                tracing::debug!(key = %redact_session_ids(&thread_key), error = %e, "pool cancel_session (session may have ended)");
+                            }
                         }
                     }
                 });

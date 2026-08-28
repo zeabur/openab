@@ -6,7 +6,7 @@ pub mod store;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 
 // --- Reply token cache for LINE hybrid Reply/Push dispatch ---
 
@@ -46,6 +46,41 @@ pub type IngressTrustProbe = Arc<dyn Fn(&str, &str, &str) -> bool + Send + Sync>
 /// secret is not configured, so it accepts unauthenticated POSTs. See #1356.
 fn l1_unenforceable(active: bool, l1_configured: bool) -> bool {
     active && !l1_configured
+}
+
+/// Coalesced pool-cancel queue: inserts are deduplicated by thread key,
+/// so every distinct session's cancel is retained even if one client
+/// sends many cancels. Memory is bounded by the number of live sessions.
+#[cfg(feature = "acp")]
+#[derive(Clone)]
+pub struct AcpPoolCancel {
+    pending: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "acp")]
+impl AcpPoolCancel {
+    pub fn new() -> (Self, Self) {
+        let inner = Self {
+            pending: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        (inner.clone(), inner)
+    }
+
+    pub fn send(&self, thread_key: String) {
+        self.pending.lock().unwrap().insert(thread_key);
+        self.notify.notify_one();
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        let mut set = self.pending.lock().unwrap();
+        set.drain().collect()
+    }
+
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
 }
 
 pub struct AppState {
@@ -95,12 +130,12 @@ pub struct AppState {
     /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
     pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
-    /// Pool-side session cancel. The ACP server sends `"acp:{channel_id}"` here
-    /// when a `session/cancel` notification arrives or an idle timeout fires;
-    /// the receiver calls `pool.cancel_session(thread_id)`. Bounded: excess
-    /// cancels are dropped (idempotent, so harmless).
+    /// Pool-side session cancel. The ACP server inserts thread keys here;
+    /// a receiver task drains the set and calls `pool.cancel_session()`.
+    /// Coalesced per session: duplicates are absorbed, so every distinct
+    /// session's cancel is retained even under load.
     #[cfg(feature = "acp")]
-    pub acp_pool_cancel_tx: Option<mpsc::Sender<String>>,
+    pub acp_pool_cancel: Option<AcpPoolCancel>,
 }
 
 
@@ -142,7 +177,7 @@ impl AppState {
             #[cfg(feature = "acp")]
             acp_tunnel_registry: None,
             #[cfg(feature = "acp")]
-            acp_pool_cancel_tx: None,
+            acp_pool_cancel: None,
             #[cfg(feature = "lineworks")]
             lineworks: None,
             ws_token: None,
@@ -266,7 +301,7 @@ impl AppState {
             #[cfg(feature = "acp")]
             acp_tunnel_registry,
             #[cfg(feature = "acp")]
-            acp_pool_cancel_tx: None,
+            acp_pool_cancel: None,
             #[cfg(feature = "lineworks")]
             lineworks,
             ws_token,
@@ -850,7 +885,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         #[cfg(feature = "acp")]
         acp_tunnel_registry,
         #[cfg(feature = "acp")]
-        acp_pool_cancel_tx: None,
+        acp_pool_cancel: None,
         #[cfg(feature = "lineworks")]
         lineworks,
         ws_token,
