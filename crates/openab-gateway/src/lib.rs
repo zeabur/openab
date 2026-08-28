@@ -136,7 +136,18 @@ pub struct AppState {
     /// session's cancel is retained even under load.
     #[cfg(feature = "acp")]
     pub acp_pool_cancel: Option<AcpPoolCancel>,
+    /// Pool-side session liveness query. `session/resume` sends a thread key
+    /// plus a oneshot; a receiver task answers `pool.has_active_session()`,
+    /// letting the resume response report whether the inner agent session
+    /// actually survived (`_meta["dev.openab/sessionAlive"]`).
+    #[cfg(feature = "acp")]
+    pub acp_pool_liveness: Option<AcpPoolLivenessTx>,
 }
+
+/// Sender half of the pool-liveness query bridge: `(thread_key, reply)`.
+#[cfg(feature = "acp")]
+pub type AcpPoolLivenessTx =
+    tokio::sync::mpsc::Sender<(String, tokio::sync::oneshot::Sender<bool>)>;
 
 
 impl AppState {
@@ -178,6 +189,8 @@ impl AppState {
             acp_tunnel_registry: None,
             #[cfg(feature = "acp")]
             acp_pool_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_pool_liveness: None,
             #[cfg(feature = "lineworks")]
             lineworks: None,
             ws_token: None,
@@ -302,6 +315,8 @@ impl AppState {
             acp_tunnel_registry,
             #[cfg(feature = "acp")]
             acp_pool_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_pool_liveness: None,
             #[cfg(feature = "lineworks")]
             lineworks,
             ws_token,
@@ -886,6 +901,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp_tunnel_registry,
         #[cfg(feature = "acp")]
         acp_pool_cancel: None,
+        #[cfg(feature = "acp")]
+        acp_pool_liveness: None,
         #[cfg(feature = "lineworks")]
         lineworks,
         ws_token,

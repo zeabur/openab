@@ -1205,6 +1205,21 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 });
+
+                // Liveness query bridge: session/resume asks whether the
+                // inner agent session behind a thread key still exists, so
+                // the resume response can report it to the client.
+                let (liveness_tx, mut liveness_rx) = tokio::sync::mpsc::channel::<(
+                    String,
+                    tokio::sync::oneshot::Sender<bool>,
+                )>(64);
+                gw_state_inner.acp_pool_liveness = Some(liveness_tx);
+                let liveness_pool = pool.clone();
+                tokio::spawn(async move {
+                    while let Some((thread_key, reply)) = liveness_rx.recv().await {
+                        let _ = reply.send(liveness_pool.has_active_session(&thread_key).await);
+                    }
+                });
             }
 
             // Pre-download identity probe: lets adapters consult the shared
