@@ -1017,6 +1017,16 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
+                                // Agent is alive and prompt is in-flight — emit a heartbeat so the
+                                // gateway's per-chunk idle timer (ACP_PROMPT_IDLE_TIMEOUT_SECS) resets.
+                                if platform_is_acp {
+                                    let _ = adapter
+                                        .forward_agent_update(
+                                            &thread_channel,
+                                            serde_json::json!({ "sessionUpdate": "heartbeat" }),
+                                        )
+                                        .await;
+                                }
                                 continue;
                             }
                         };
