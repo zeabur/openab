@@ -133,6 +133,10 @@ struct Fixture {
 }
 
 async fn setup(platform: &str, thread_key: &str) -> Fixture {
+    setup_with_agent(platform, thread_key, FAKE_AGENT).await
+}
+
+async fn setup_with_agent(platform: &str, thread_key: &str, agent_script: &str) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Isolate ~/.openab persistence (thread_map.json / session_meta.json).
     std::env::set_var("HOME", tmp.path());
@@ -140,7 +144,7 @@ async fn setup(platform: &str, thread_key: &str) -> Fixture {
     std::env::remove_var("OPENAB_STREAM_EDIT_INTERVAL_MS");
 
     let script = tmp.path().join("fake_agent.sh");
-    std::fs::write(&script, FAKE_AGENT).expect("write fake agent");
+    std::fs::write(&script, agent_script).expect("write fake agent");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -280,4 +284,65 @@ async fn non_acp_streaming_keeps_paced_edit_loop() {
         ),
         _ => unreachable!(),
     }
+}
+
+/// A fake agent that stays silent for 3s after `session/prompt` — long enough
+/// for the router's 1s liveness tick to fire several times — then completes.
+const SLOW_AGENT: &str = r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"fake","version":"0"},"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_fake"}}\n' "$id"
+      ;;
+    *'"session/prompt"'*)
+      sleep 3
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"##;
+
+// ACP: while the agent is alive but silent (a long tool call), each liveness
+// tick must emit a schema-valid `session_info_update` heartbeat so the
+// gateway's per-chunk idle timer keeps resetting instead of killing the turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_liveness_tick_emits_session_info_heartbeat() {
+    let _guard = env_lock();
+    let fx = setup_with_agent("acp", "acp:heartbeat", SLOW_AGENT).await;
+    let recorder = Arc::new(RecordingAdapter::new(false));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    run_turn(&fx, &adapter, "acp:heartbeat").await;
+
+    let calls = recorder.calls();
+    let heartbeats = calls
+        .iter()
+        .filter(|c| matches!(c, Call::Update(k) if k == "session_info_update"))
+        .count();
+    assert!(
+        heartbeats >= 1,
+        "expected at least one session_info_update heartbeat during the \
+         3s-silent prompt (1s liveness interval): {calls:?}"
+    );
+}
+
+// Non-ACP platforms must not receive heartbeats — the idle-timer problem the
+// heartbeat solves only exists on the ACP gateway path.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_acp_liveness_tick_emits_no_heartbeat() {
+    let _guard = env_lock();
+    let fx = setup_with_agent("gateway", "gateway:heartbeat", SLOW_AGENT).await;
+    let recorder = Arc::new(RecordingAdapter::new(true));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    run_turn(&fx, &adapter, "gateway:heartbeat").await;
+
+    let calls = recorder.calls();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Update(_))),
+        "no agent updates (heartbeats included) may leave the ACP path: {calls:?}"
+    );
 }
