@@ -1017,6 +1017,25 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
+                                // Agent is alive with a prompt in flight but silent (e.g. a
+                                // long-running tool call). Emit a schema-valid
+                                // `session_info_update` carrying only `updatedAt` — ACP v1
+                                // defines it as an "ISO 8601 timestamp of last activity" with
+                                // no required fields — so the gateway's per-chunk idle timer
+                                // (ACP_PROMPT_IDLE_TIMEOUT_SECS) resets while the agent lives,
+                                // and a dead agent still times out (no heartbeat without
+                                // `conn.alive()`).
+                                if platform_is_acp {
+                                    let _ = adapter
+                                        .forward_agent_update(
+                                            &thread_channel,
+                                            serde_json::json!({
+                                                "sessionUpdate": "session_info_update",
+                                                "updatedAt": chrono::Utc::now().to_rfc3339(),
+                                            }),
+                                        )
+                                        .await;
+                                }
                                 continue;
                             }
                         };

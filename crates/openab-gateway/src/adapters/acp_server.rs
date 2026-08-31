@@ -3162,6 +3162,20 @@ mod acp_conformance {
         }));
     }
 
+    #[test]
+    fn session_update_liveness_heartbeat() {
+        // the broker's liveness heartbeat (openab-core adapter.rs) — an
+        // `updatedAt`-only partial SessionInfoUpdate must stay schema-valid,
+        // because it is what keeps the idle timer from killing long tool calls.
+        conforms::<sc::SessionNotification>(json!({
+            "sessionId": "sess_00000000-0000-0000-0000-000000000000",
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "updatedAt": "2026-08-31T12:00:00+00:00"
+            }
+        }));
+    }
+
     // --- inbound requests (params clients send) ---
 
     #[test]
