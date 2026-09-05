@@ -486,19 +486,57 @@ impl SessionPool {
         mcp_servers: &[serde_json::Value],
         session_meta: Option<&serde_json::Value>,
     ) -> Result<bool> {
+        self.get_or_restore(
+            thread_id,
+            working_dir_override,
+            mcp_servers,
+            session_meta,
+            false,
+        )
+        .await
+    }
+
+    /// Restore only a known native session, without a prompt or output attachment.
+    pub async fn restore_for_config(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+        meta: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.get_or_restore(thread_id, Some(cwd), mcp_servers, meta, true)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_or_restore(
+        &self,
+        thread_id: &str,
+        working_dir_override: Option<&str>,
+        mcp_servers: &[serde_json::Value],
+        session_meta: Option<&serde_json::Value>,
+        restore_only: bool,
+    ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
+            if restore_only
+                && !state.persisted.contains_key(thread_id)
+                && !state.active.contains_key(thread_id)
+            {
+                return Err(anyhow!("No saved native session to restore"));
+            }
             // A non-empty declaration updates the stored set even when a live
             // session short-circuits below: it takes effect on the next spawn,
             // never restarting a live session.
-            if !mcp_servers.is_empty()
+            if !restore_only
+                && !mcp_servers.is_empty()
                 && state.session_mcp_servers.get(thread_id).map(Vec::as_slice) != Some(mcp_servers)
             {
                 state
                     .session_mcp_servers
                     .insert(thread_id.to_string(), mcp_servers.to_vec());
             }
-            if let Some(meta) = session_meta {
+            if let Some(meta) = session_meta.filter(|_| !restore_only) {
                 if state.session_meta.get(thread_id) != Some(meta) {
                     state.session_meta.insert(thread_id.to_string(), meta.clone());
                 }
@@ -531,6 +569,21 @@ impl SessionPool {
             }
             if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
+            }
+        }
+
+        if restore_only {
+            if saved_session_id.is_none() {
+                return Err(anyhow!("No saved native session to restore"));
+            }
+            let mut state = self.state.write().await;
+            state
+                .session_mcp_servers
+                .insert(thread_id.to_string(), mcp_servers.to_vec());
+            if let Some(meta) = session_meta {
+                state
+                    .session_meta
+                    .insert(thread_id.to_string(), meta.clone());
             }
         }
 
@@ -688,6 +741,9 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
+                        if restore_only {
+                            return Err(e.context("Could not restore the saved native session"));
+                        }
                         let err_str = e.to_string();
                         let is_transient =
                             TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
@@ -719,6 +775,11 @@ impl SessionPool {
         }
 
         if !resumed {
+            if restore_only {
+                return Err(anyhow!(
+                    "Agent does not support restoring the saved session"
+                ));
+            }
             new_conn
                 .session_new(
                     &effective_workdir,

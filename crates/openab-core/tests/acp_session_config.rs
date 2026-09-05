@@ -18,7 +18,10 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$RECORD"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-    *'"initialize"'*) result='{"agentInfo":{"name":"fixture"},"agentCapabilities":{}}';;
+    *'"initialize"'*) result='{"agentInfo":{"name":"fixture"},"agentCapabilities":{"loadSession":true}}';;
+    *'"session/load"'*)
+      if [ -f "$FAIL_FILE" ]; then printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"cannot restore"}}\n' "$id"; continue; fi
+      result='{"configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"b","options":[{"name":"B","value":"b"}]}]}';;
     *'"session/new"'*) result='{"sessionId":"inner","configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"a","options":[{"name":"A","value":"a"},{"name":"B","value":"b"},{"name":"Reject","value":"reject"}]}]}';;
     *'"session/set_config_option"'*'"value":"reject"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"rejected"}}\n' "$id"; continue;;
     *'"session/set_config_option"'*'"value":"disconnect"'*) exit 0;;
@@ -30,15 +33,21 @@ done
 "##).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let config = AgentConfig {
+    let config = || AgentConfig {
         command: script.to_string_lossy().into(),
         args: vec![],
         working_dir: tmp.path().to_string_lossy().into(),
-        env: HashMap::from([("RECORD".into(), record.to_string_lossy().into())]),
+        env: HashMap::from([
+            ("RECORD".into(), record.to_string_lossy().into()),
+            (
+                "FAIL_FILE".into(),
+                tmp.path().join("fail").to_string_lossy().into(),
+            ),
+        ]),
         inherit_env: vec![],
         command_explicit: true,
     };
-    let pool = Arc::new(SessionPool::new(config, 4, 60, HashMap::new()));
+    let pool = Arc::new(SessionPool::new(config(), 4, 60, HashMap::new()));
     assert_eq!(
         pool.session_config_options("missing", None)
             .await
@@ -123,7 +132,47 @@ done
     })
     .await
     .unwrap();
-    let calls = std::fs::read_to_string(record).unwrap();
+    let calls = std::fs::read_to_string(&record).unwrap();
+    drop(pool);
+    let restored = SessionPool::new(config(), 4, 60, HashMap::new());
+    assert!(restored
+        .restore_for_config("unknown", "/", &[], None)
+        .await
+        .is_err());
+    let meta = serde_json::json!({"owner": "fresh-owner-context"});
+    restored
+        .restore_for_config("first", tmp.path().to_str().unwrap(), &[], Some(&meta))
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .session_config_options("first", None)
+            .await
+            .unwrap()["configOptions"][0]["currentValue"],
+        "b"
+    );
+    drop(restored);
+    std::fs::write(tmp.path().join("fail"), "").unwrap();
+    let failed = SessionPool::new(config(), 4, 60, HashMap::new());
+    assert!(failed
+        .restore_for_config("first", "/", &[], Some(&meta))
+        .await
+        .is_err());
+    assert_eq!(
+        failed
+            .session_config_options("first", None)
+            .await
+            .unwrap_err()
+            .0,
+        -32004
+    );
+    let after = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(
+        after.matches("session/new").count(),
+        calls.matches("session/new").count()
+    );
+    assert!(after.contains("fresh-owner-context"));
+    assert!(!after.contains("session/prompt"));
     assert!(!calls.contains("session/prompt"));
     assert!(!calls.contains("invalid"));
 }

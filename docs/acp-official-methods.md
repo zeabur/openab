@@ -116,3 +116,13 @@ an unconfirmed agent write `-32603`. The standalone gateway without the bridge r
 handling, API writes never fall back to prompts or synthesize a successful selection.
 Only select/string options are exposed (the inner initialize does not advertise boolean
 configuration support). Available options and effort/Fast support remain agent-owned.
+
+### Restoring configuration after idle eviction or restart
+
+`_openab/session/config_options` accepts an optional `restore` object containing
+`cwd`, `mcpServers`, and `_meta`. With ACP passthrough enabled this loads only a
+known, persisted native session before returning its configuration. It never
+creates a new conversation, sends a prompt, or installs an output sink. Unknown
+sessions and rejected native loads fail without replacing the saved mapping.
+Supply fresh session-scoped context; clients must authorize the session owner
+before requesting restoration. Ordinary reads retain their existing behavior.

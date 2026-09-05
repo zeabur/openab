@@ -2171,6 +2171,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         id,
                         req.params.as_ref(),
                         req.method == "session/set_config_option",
+                        mcp_enabled,
                     )
                     .await;
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -2610,6 +2611,7 @@ async fn handle_session_config(
     id: Value,
     params: Option<&Value>,
     write: bool,
+    mcp_enabled: bool,
 ) -> JsonRpcResponse {
     let channel = params
         .and_then(|p| p.get("sessionId"))
@@ -2634,6 +2636,29 @@ async fn handle_session_config(
     } else {
         None
     };
+    let restore = if let Some(context) = params.and_then(|p| p.get("restore")) {
+        let Some(cwd) = context
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 4096)
+        else {
+            return JsonRpcResponse::error(id, -32602, "Invalid restore working directory");
+        };
+        if !mcp_enabled {
+            return JsonRpcResponse::error(id, -32601, "Session restore context is disabled");
+        }
+        let Some(meta) = parse_session_meta(Some(context)) else {
+            return JsonRpcResponse::error(id, -32602, "Restore requires bounded session metadata");
+        };
+        Some((
+            cwd.to_string(),
+            parse_http_mcp_servers(Some(context)),
+            Some(meta),
+        ))
+    } else {
+        None
+    };
+    let timeout_secs = if restore.is_some() { 90 } else { 35 };
     let Some(tx) = &state.acp_pool_config else {
         return JsonRpcResponse::error(
             id,
@@ -2646,13 +2671,14 @@ async fn handle_session_config(
         .try_send(crate::AcpPoolConfigRequest {
             thread_key: format!("acp:{channel}"),
             selection,
+            restore,
             reply,
         })
         .is_err()
     {
         return JsonRpcResponse::error(id, ACP_OVERLOADED, "Configuration queue is full");
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(35), response).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response).await {
         Ok(Ok(Ok(value))) => JsonRpcResponse::success(id, value),
         Ok(Ok(Err((code, message)))) => JsonRpcResponse::error(id, code, message),
         _ => JsonRpcResponse::error(id, -32603, "Runtime did not confirm session configuration"),
@@ -8125,18 +8151,25 @@ mod session_config_tests {
         let mut state = crate::AppState::test_default(events);
         let sid = format!("sess_{}", Uuid::new_v4());
         let params = json!({"sessionId": sid, "configId": "model", "value": "gpt-test"});
-        let missing = handle_session_config(&state, json!(1), Some(&params), false).await;
+        let missing = handle_session_config(&state, json!(1), Some(&params), false, false).await;
         assert_eq!(missing.error.unwrap().code, -32601);
         let (tx, mut rx) = mpsc::channel::<crate::AcpPoolConfigRequest>(2);
         state.acp_pool_config = Some(tx);
-        let bad =
-            handle_session_config(&state, json!(1), Some(&json!({"sessionId":"bad"})), false).await;
+        let bad = handle_session_config(
+            &state,
+            json!(1),
+            Some(&json!({"sessionId":"bad"})),
+            false,
+            false,
+        )
+        .await;
         assert_eq!(bad.error.unwrap().code, -32602);
         let bad_value = handle_session_config(
             &state,
             json!(1),
             Some(&json!({"sessionId":sid,"configId":"model","value":true})),
             true,
+            false,
         )
         .await;
         assert_eq!(bad_value.error.unwrap().code, -32602);
@@ -8155,13 +8188,42 @@ mod session_config_tests {
             assert_eq!(write.selection, Some(("model".into(), "gpt-test".into())));
             write.reply.send(Err((-32005, "busy".into()))).unwrap();
         });
-        let read = handle_session_config(&state, json!(2), Some(&params), false).await;
+        let read = handle_session_config(&state, json!(2), Some(&params), false, false).await;
         assert_eq!(
             read.result.unwrap()["configOptions"][0]["currentValue"],
             "before"
         );
-        let write = handle_session_config(&state, json!(3), Some(&params), true).await;
+        let write = handle_session_config(&state, json!(3), Some(&params), true, false).await;
         assert_eq!(write.error.unwrap().code, -32005);
+        worker.await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::AcpPoolConfigRequest>(2);
+        state.acp_pool_config = Some(tx);
+        let restore = json!({"sessionId": sid, "restore": {"cwd":"/saved", "_meta":{"owner":"fresh"}, "mcpServers": []}});
+        assert_eq!(
+            handle_session_config(&state, json!(4), Some(&restore), false, false)
+                .await
+                .error
+                .unwrap()
+                .code,
+            -32601
+        );
+        let worker = tokio::spawn(async move {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(
+                request.restore,
+                Some(("/saved".into(), vec![], Some(json!({"owner":"fresh"}))))
+            );
+            request
+                .reply
+                .send(Ok(json!({"configOptions": []})))
+                .unwrap();
+        });
+        assert!(
+            handle_session_config(&state, json!(5), Some(&restore), false, true)
+                .await
+                .error
+                .is_none()
+        );
         worker.await.unwrap();
     }
 }

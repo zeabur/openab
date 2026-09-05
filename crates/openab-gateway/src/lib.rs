@@ -84,11 +84,13 @@ impl AcpPoolCancel {
 }
 
 /// Config control bridge; requests carry only a capability session key and
-/// typed selection. It never claims the session's output or creates an agent.
+/// typed selection. Optional restore context can load a saved native session;
+/// it never claims output, starts a prompt, or creates a fresh conversation.
 #[cfg(feature = "acp")]
 pub struct AcpPoolConfigRequest {
     pub thread_key: String,
     pub selection: Option<(String, String)>,
+    pub restore: Option<(String, Vec<serde_json::Value>, Option<serde_json::Value>)>,
     pub reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, (i32, String)>>,
 }
 
