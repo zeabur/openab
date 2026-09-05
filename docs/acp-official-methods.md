@@ -109,7 +109,8 @@ runtime-advertised string selection using ACP `session/set_config_option`
 The session ID is the same opaque resume capability; it can be used on a control-only
 connection after `initialize`, without taking over that session's output sink.
 
-Neither method creates/resumes an inner session or starts a model turn. A dormant
+Without the explicit restore context below, neither method creates/resumes an inner
+session or starts a model turn. A dormant
 session returns `-32004`, a busy session `-32005`, an invalid selection `-32602`, and
 an unconfirmed agent write `-32603`. The standalone gateway without the bridge returns
 `-32601`. Notification-shaped requests are ignored. Unlike interactive slash-command
@@ -120,7 +121,10 @@ configuration support). Available options and effort/Fast support remain agent-o
 ### Restoring configuration after idle eviction or restart
 
 `_openab/session/config_options` accepts an optional `restore` object containing
-`cwd`, `mcpServers`, and `_meta`. With ACP passthrough enabled this loads only a
+`cwd`, `mcpServers`, and `_meta`. All three fields are required; `mcpServers` must
+be an explicit array (use `[]` only to intentionally select no tools). Missing or
+non-array MCP declarations are rejected before any saved context can change.
+With ACP passthrough enabled this loads only a
 known, persisted native session before returning its configuration. It never
 creates a new conversation, sends a prompt, or installs an output sink. Unknown
 sessions and rejected native loads fail without replacing the saved mapping.

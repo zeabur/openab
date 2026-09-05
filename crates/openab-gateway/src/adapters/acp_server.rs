@@ -2650,6 +2650,15 @@ async fn handle_session_config(
         let Some(meta) = parse_session_meta(Some(context)) else {
             return JsonRpcResponse::error(id, -32602, "Restore requires bounded session metadata");
         };
+        // Restore context must be complete: omission must never clear saved tools.
+        // An explicit empty array is the caller's intentional no-tools selection.
+        if !matches!(context.get("mcpServers"), Some(Value::Array(_))) {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "Restore requires an explicit mcpServers array",
+            );
+        }
         Some((
             cwd.to_string(),
             parse_http_mcp_servers(Some(context)),
@@ -8207,6 +8216,23 @@ mod session_config_tests {
                 .code,
             -32601
         );
+        for value in [None, Some(Value::Null), Some(json!({}))] {
+            let mut incomplete = restore.clone();
+            incomplete["restore"]
+                .as_object_mut()
+                .unwrap()
+                .remove("mcpServers");
+            if let Some(value) = value {
+                incomplete["restore"]["mcpServers"] = value;
+            }
+            let rejected =
+                handle_session_config(&state, json!(6), Some(&incomplete), false, true).await;
+            assert_eq!(rejected.error.unwrap().code, -32602);
+            assert!(
+                rx.try_recv().is_err(),
+                "incomplete restore cannot mutate saved tools"
+            );
+        }
         let worker = tokio::spawn(async move {
             let request = rx.recv().await.unwrap();
             assert_eq!(
