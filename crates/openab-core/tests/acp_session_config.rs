@@ -21,6 +21,7 @@ while IFS= read -r line; do
     *'"initialize"'*) result='{"agentInfo":{"name":"fixture"},"agentCapabilities":{}}';;
     *'"session/new"'*) result='{"sessionId":"inner","configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"a","options":[{"name":"A","value":"a"},{"name":"B","value":"b"},{"name":"Reject","value":"reject"}]}]}';;
     *'"session/set_config_option"'*'"value":"reject"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"rejected"}}\n' "$id"; continue;;
+    *'"session/set_config_option"'*'"value":"disconnect"'*) exit 0;;
     *'"session/set_config_option"'*) result='{"configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"b","options":[{"name":"B","value":"b"},{"name":"Reject","value":"reject"}]}]}';;
     *) result='{}';;
   esac
@@ -100,9 +101,28 @@ done
         -32603
     );
     assert_eq!(
-        pool.session_config_options("first", None).await.unwrap()["configOptions"],
-        serde_json::json!([])
+        pool.session_config_options("first", None).await.unwrap(),
+        value
     );
+    assert_eq!(
+        pool.session_config_options("first", Some(("model", "b")))
+            .await
+            .unwrap(),
+        value
+    );
+    // A lost response remains ambiguous: never retain a claimed current value.
+    pool.with_connection("second", |conn| {
+        Box::pin(async move {
+            assert!(conn
+                .set_config_option_strict("model", "disconnect")
+                .await
+                .is_err());
+            assert!(conn.config_options.is_empty());
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
     let calls = std::fs::read_to_string(record).unwrap();
     assert!(!calls.contains("session/prompt"));
     assert!(!calls.contains("invalid"));
