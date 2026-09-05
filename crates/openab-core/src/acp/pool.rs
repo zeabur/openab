@@ -874,6 +874,57 @@ impl SessionPool {
         conn.set_config_option(config_id, value).await
     }
 
+    /// Control an existing inner session without attaching an output sink,
+    /// starting a prompt, or changing the session's execution principal.
+    pub async fn session_config_options(
+        &self,
+        thread_id: &str,
+        selection: Option<(&str, &str)>,
+    ) -> std::result::Result<serde_json::Value, (i32, String)> {
+        let handle = self
+            .state
+            .read()
+            .await
+            .active
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    -32004,
+                    "Session is not running; send a message to resume it".into(),
+                )
+            })?;
+        let mut conn = handle.try_lock().map_err(|_| {
+            (
+                -32005,
+                "Session is responding; wait for the current turn to finish".into(),
+            )
+        })?;
+        if !conn.alive() {
+            return Err((
+                -32004,
+                "Session is not running; send a message to resume it".into(),
+            ));
+        }
+        if let Some((id, value)) = selection {
+            let valid = conn.config_options.iter().any(|option| {
+                option.id == id && option.options.iter().any(|choice| choice.value == value)
+            });
+            if !valid {
+                return Err((-32602, "Unknown configuration option or value".into()));
+            }
+            conn.set_config_option_strict(id, value)
+                .await
+                .map_err(|_| {
+                    (
+                        -32603,
+                        "Agent could not confirm the configuration change".into(),
+                    )
+                })?;
+        }
+        Ok(serde_json::json!({ "configOptions": conn.config_options }))
+    }
+
     /// Query account-level usage/billing from the backend agent for a session
     /// (kiro-cli extension). Fails when there is no active session for the
     /// thread or the backend does not support usage queries.

@@ -680,6 +680,48 @@ impl AcpConnection {
         Ok(self.config_options.clone())
     }
 
+    /// Strict configuration control for API clients. Never synthesize success or
+    /// send a slash-command prompt when the agent rejects a setting.
+    pub async fn set_config_option_strict(
+        &mut self,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+        let response = self
+            .send_request(
+                "session/set_config_option",
+                Some(json!({
+                    "sessionId": session_id, "configId": config_id, "value": value,
+                })),
+            )
+            .await;
+        match response {
+            Ok(response) => {
+                let options = response
+                    .result
+                    .as_ref()
+                    .map(parse_config_options)
+                    .unwrap_or_default();
+                self.config_options = options;
+                if self.config_options.is_empty() {
+                    return Err(anyhow!("agent did not return configuration options"));
+                }
+                Ok(self.config_options.clone())
+            }
+            Err(error) => {
+                // A lost response may have applied: stop advertising the old
+                // value until the agent next publishes its actual state.
+                self.config_options.clear();
+                Err(error)
+            }
+        }
+    }
+
     /// Query account-level usage/billing via kiro-cli's
     /// `_kiro.dev/commands/execute` extension (the `/usage` slash command).
     ///

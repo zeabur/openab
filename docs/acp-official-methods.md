@@ -98,3 +98,21 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 - **Still unverified** — field-level exactness of `agentCapabilities` /
   `clientCapabilities` sub-objects against a *third-party* ACP client (e.g. Zed), and
   `ContentBlock` variants beyond `text` (image / audio / resource).
+
+### Unified runtime session configuration
+
+The unified binary advertises `agentCapabilities._meta["dev.openab/sessionConfig"]`
+when the session configuration bridge is installed. Clients can read an **existing,
+idle inner session** with `_openab/session/config_options` (`{sessionId}`), and set a
+runtime-advertised string selection using ACP `session/set_config_option`
+(`{sessionId, configId, value}`). Both return `{configOptions}` from the inner agent.
+The session ID is the same opaque resume capability; it can be used on a control-only
+connection after `initialize`, without taking over that session's output sink.
+
+Neither method creates/resumes an inner session or starts a model turn. A dormant
+session returns `-32004`, a busy session `-32005`, an invalid selection `-32602`, and
+an unconfirmed agent write `-32603`. The standalone gateway without the bridge returns
+`-32601`. Notification-shaped requests are ignored. Unlike interactive slash-command
+handling, API writes never fall back to prompts or synthesize a successful selection.
+Only select/string options are exposed (the inner initialize does not advertise boolean
+configuration support). Available options and effort/Fast support remain agent-owned.

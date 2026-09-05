@@ -83,6 +83,15 @@ impl AcpPoolCancel {
     }
 }
 
+/// Config control bridge; requests carry only a capability session key and
+/// typed selection. It never claims the session's output or creates an agent.
+#[cfg(feature = "acp")]
+pub struct AcpPoolConfigRequest {
+    pub thread_key: String,
+    pub selection: Option<(String, String)>,
+    pub reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, (i32, String)>>,
+}
+
 pub struct AppState {
     pub telegram_bot_token: Option<String>,
     pub telegram_secret_token: Option<String>,
@@ -142,6 +151,8 @@ pub struct AppState {
     /// actually survived (`_meta["dev.openab/sessionAlive"]`).
     #[cfg(feature = "acp")]
     pub acp_pool_liveness: Option<AcpPoolLivenessTx>,
+    #[cfg(feature = "acp")]
+    pub acp_pool_config: Option<tokio::sync::mpsc::Sender<AcpPoolConfigRequest>>,
 }
 
 /// Sender half of the pool-liveness query bridge: `(thread_key, reply)`.
@@ -191,6 +202,8 @@ impl AppState {
             acp_pool_cancel: None,
             #[cfg(feature = "acp")]
             acp_pool_liveness: None,
+            #[cfg(feature = "acp")]
+            acp_pool_config: None,
             #[cfg(feature = "lineworks")]
             lineworks: None,
             ws_token: None,
@@ -317,6 +330,8 @@ impl AppState {
             acp_pool_cancel: None,
             #[cfg(feature = "acp")]
             acp_pool_liveness: None,
+            #[cfg(feature = "acp")]
+            acp_pool_config: None,
             #[cfg(feature = "lineworks")]
             lineworks,
             ws_token,
@@ -903,6 +918,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp_pool_cancel: None,
         #[cfg(feature = "acp")]
         acp_pool_liveness: None,
+        #[cfg(feature = "acp")]
+        acp_pool_config: None,
         #[cfg(feature = "lineworks")]
         lineworks,
         ws_token,
