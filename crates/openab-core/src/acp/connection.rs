@@ -537,6 +537,19 @@ impl AcpConnection {
     }
 
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
+        let resp = self.send_request_response(method, params).await?;
+        if let Some(err) = &resp.error {
+            return Err(anyhow!("{err}"));
+        }
+        Ok(resp)
+    }
+
+    /// Preserve explicit agent errors separately from a missing response.
+    async fn send_request_response(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<JsonRpcMessage> {
         let id = self.next_id();
         let req = JsonRpcRequest::new(id, method, params);
         let data = serde_json::to_string(&req)?;
@@ -552,8 +565,10 @@ impl AcpConnection {
             .map_err(|_| anyhow!("timeout waiting for {method} response"))?
             .map_err(|_| anyhow!("channel closed waiting for {method}"))?;
 
-        if let Some(err) = &resp.error {
-            return Err(anyhow!("{err}"));
+        // The reader synthesizes an id-less error when stdout closes. It is
+        // not an agent acknowledgement and cannot confirm a write's outcome.
+        if resp.id.is_none() {
+            return Err(anyhow!("connection closed waiting for {method}"));
         }
         Ok(resp)
     }
@@ -678,6 +693,53 @@ impl AcpConnection {
         }
 
         Ok(self.config_options.clone())
+    }
+
+    /// Strict configuration control for API clients. Never synthesize success or
+    /// send a slash-command prompt when the agent rejects a setting.
+    pub async fn set_config_option_strict(
+        &mut self,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        let session_id = self
+            .acp_session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("no session"))?
+            .clone();
+        let response = self
+            .send_request_response(
+                "session/set_config_option",
+                Some(json!({
+                    "sessionId": session_id, "configId": config_id, "value": value,
+                })),
+            )
+            .await;
+        match response {
+            Ok(response) => {
+                if let Some(error) = response.error {
+                    // An explicit rejection leaves the last acknowledged state
+                    // usable, so a subsequent valid selection can be retried.
+                    return Err(anyhow!("{error}"));
+                }
+                let options = response
+                    .result
+                    .as_ref()
+                    .map(parse_config_options)
+                    .unwrap_or_default();
+                self.config_options = options;
+                if self.config_options.is_empty() {
+                    return Err(anyhow!("agent did not return configuration options"));
+                }
+                Ok(self.config_options.clone())
+            }
+            Err(error) => {
+                // A lost response may have applied: stop advertising the old
+                // value until the agent next publishes its actual state.
+                self.config_options.clear();
+                Err(error)
+            }
+        }
     }
 
     /// Query account-level usage/billing via kiro-cli's

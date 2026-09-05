@@ -1206,6 +1206,46 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
 
+                let (config_tx, mut config_rx) =
+                    tokio::sync::mpsc::channel::<openab_gateway::AcpPoolConfigRequest>(32);
+                gw_state_inner.acp_pool_config = Some(config_tx);
+                let config_pool = pool.clone();
+                tokio::spawn(async move {
+                    while let Some(request) = config_rx.recv().await {
+                        // A queued request whose caller disconnected must not
+                        // silently apply later.
+                        if request.reply.is_closed() {
+                            continue;
+                        }
+                        if let Some((cwd, servers, meta)) = &request.restore {
+                            if config_pool
+                                .restore_for_config(
+                                    &request.thread_key,
+                                    cwd,
+                                    servers,
+                                    meta.as_ref(),
+                                )
+                                .await
+                                .is_err()
+                            {
+                                let _ = request.reply.send(Err((
+                                    -32004,
+                                    "Saved session could not be restored".into(),
+                                )));
+                                continue;
+                            }
+                        }
+                        let selection = request
+                            .selection
+                            .as_ref()
+                            .map(|(id, value)| (id.as_str(), value.as_str()));
+                        let result = config_pool
+                            .session_config_options(&request.thread_key, selection)
+                            .await;
+                        let _ = request.reply.send(result);
+                    }
+                });
+
                 // Liveness query bridge: session/resume asks whether the
                 // inner agent session behind a thread key still exists, so
                 // the resume response can report it to the client.
