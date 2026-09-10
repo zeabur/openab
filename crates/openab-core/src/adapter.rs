@@ -430,6 +430,19 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Finish a failed ACP turn without reporting a successful prompt response.
+    /// Other adapters keep the historical text-only error presentation.
+    async fn fail_agent_turn(
+        &self,
+        channel: &ChannelRef,
+        partial: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.send_message(channel, &format!("{partial}\n\n⚠️ {error}"))
+            .await?;
+        Ok(())
+    }
+
     /// Snapshot whether this turn requires a relayed permission decision.
     /// The router captures this once at turn start so reconnects cannot
     /// silently downgrade an in-flight turn to the legacy auto-approve path.
@@ -1232,8 +1245,11 @@ impl AdapterRouter {
                         }
                     }
 
-                    conn.prompt_done(platform_is_acp.then_some(idle_tx)).await;
-                    if platform_is_acp {
+                    // Cancellation emits late tool updates. They belong to this failed
+                    // prompt, not a new autonomous turn, and must not acquire an idle sink.
+                    let observe_idle = platform_is_acp && response_error.is_none();
+                    conn.prompt_done(observe_idle.then_some(idle_tx)).await;
+                    if observe_idle {
                         let idle_permission_responder = permission_responder.clone();
                         tokio::spawn(async move {
                             while let Some(notification) = idle_rx.recv().await {
@@ -1299,15 +1315,16 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
-                    // ACP direct relay: the raw buffer is exactly what the inline
-                    // snapshots carried; the terminal send below repeats it verbatim
+                    // ACP failures retain the raw partial text in every streaming mode,
+                    // without the display-only warning or send-once answer trimming.
+                    // Direct relay also repeats this snapshot at successful completion
                     // so the gateway's snapshot diff yields no duplicate chunk.
-                    let acp_streamed = if acp_direct {
+                    let acp_streamed = if platform_is_acp {
                         text_buf.clone()
                     } else {
                         String::new()
                     };
-                    let acp_error = if acp_direct {
+                    let acp_error = if platform_is_acp {
                         response_error.clone()
                     } else {
                         None
@@ -1362,7 +1379,12 @@ impl AdapterRouter {
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
                     }
-                    if native {
+                    if let Some(ref error) = acp_error {
+                        if let Err(e) = adapter.fail_agent_turn(&thread_channel, &acp_streamed, error).await {
+                            tracing::warn!(error = ?e, "acp terminal error send failed");
+                            delivery_failed = true;
+                        }
+                    } else if native {
                         if let Some(msg) = &native_msg {
                             if !native_pending.is_empty() {
                                 if let Err(e) =
@@ -1422,13 +1444,11 @@ impl AdapterRouter {
                     } else if acp_direct {
                         // Terminal delivery closes the turn at the gateway (Done →
                         // session/prompt response). Repeating the exact streamed
-                        // snapshot diffs to nothing new; content the deltas never
-                        // carried (error banner, empty-turn sentinel) is appended
-                        // so it still reaches the client exactly once.
+                        // snapshot diffs to nothing new; an empty-turn sentinel
+                        // still reaches the client exactly once. Failures were
+                        // delivered through fail_agent_turn above.
                         let terminal = if acp_streamed.is_empty() {
                             final_content.clone()
-                        } else if let Some(ref err) = acp_error {
-                            format!("{acp_streamed}\n\n⚠️ {err}")
                         } else {
                             acp_streamed
                         };

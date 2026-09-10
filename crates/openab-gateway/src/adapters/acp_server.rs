@@ -501,6 +501,8 @@ pub enum ReplyChunk {
     /// Raw agent-side `session/update` payload (thought chunk, tool_call, …)
     /// relayed verbatim to the ACP client.
     Update(serde_json::Value),
+    /// Agent failed (runtime error, process exit, or hard timeout).
+    Error(String),
     /// Agent finished responding
     Done,
 }
@@ -2923,6 +2925,7 @@ async fn handle_session_prompt(
     // Typed StopReason (T2.1) so the final PromptResponse is constructed from acp_schema.
     let mut stop_reason = crate::adapters::acp_schema::StopReason::EndTurn;
     let mut timed_out = false;
+    let mut agent_error = None;
 
     loop {
         tokio::select! {
@@ -2969,7 +2972,15 @@ async fn handle_session_prompt(
                         };
                         let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
                     }
-                    Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
+                    Ok(Some(ReplyChunk::Error(error))) => {
+                        agent_error = Some(error);
+                        break;
+                    }
+                    Ok(Some(ReplyChunk::Done)) => break,
+                    Ok(None) => {
+                        agent_error = Some("Agent reply stream closed before completion".into());
+                        break;
+                    }
                     Err(_) => {
                         warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
                         timed_out = true;
@@ -3004,7 +3015,9 @@ async fn handle_session_prompt(
 
     // Final response. A backend timeout has no ACP stopReason, so it is an error;
     // otherwise return the turn's PromptResponse { stopReason }.
-    let resp = if timed_out {
+    let resp = if let Some(error) = agent_error {
+        JsonRpcResponse::error(id, -32603, &error)
+    } else if timed_out {
         JsonRpcResponse::error(id, -32603, "Timed out waiting for agent backend")
     } else {
         // T2.1: construct the typed PromptResponse; serializes to { "stopReason": ... }.
@@ -3159,6 +3172,11 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
     let tx = match destination {
         Destination::Turn { tx, turn_id } => {
             match reply.command.as_deref() {
+                Some("agent_error") => {
+                    let _ = tx.send(ReplyChunk::Error(full_text));
+                    remove_reply_sink_if_owner(registry, key, &turn_id);
+                    return;
+                }
                 None | Some("send_message") => {
                     let _ = tx.send(ReplyChunk::Text(full_text));
                     let _ = tx.send(ReplyChunk::Done);
@@ -4921,6 +4939,95 @@ mod acp_review_fixes {
             command: command.map(|c| c.into()),
             request_id: None,
             quote_message_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_failure_returns_rpc_error_and_releases_the_session() {
+        for cause in [
+            "ENOSPC: no space left on device",
+            "Agent exceeded hard timeout (1800s)",
+        ] {
+            let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+            let mut st = crate::AppState::test_default(event_tx);
+            let registry = new_reply_registry();
+            st.acp_reply_registry = Some(registry.clone());
+            let state = Arc::new(st);
+            let sessions = sessions_map();
+            let (created, _) = handle_session_new(&sessions, json!(1), Vec::new(), None).await;
+            let sid = serde_json::to_value(created).unwrap()["result"]["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let channel = derive_channel_id(&sid).unwrap();
+            // A subsequent prompt on the same session must work after the failure.
+            for fail in [true, false] {
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                {
+                    let mut map = sessions.lock().await;
+                    let session = map.get_mut(&sid).unwrap();
+                    assert!(!session.busy);
+                    session.busy = true;
+                    session.cancel = Some(cancel.clone());
+                }
+                let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+                let params = json!({"sessionId": sid, "prompt": [{"type":"text","text":"work"}]});
+                let drive = async {
+                    let event: Value =
+                        serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
+                    let origin = event["event_id"].as_str().unwrap();
+                    handle_reply(
+                        &reply(&channel, "evt_stale", "wrong error", Some("agent_error")),
+                        &registry,
+                    )
+                    .await;
+                    handle_reply(
+                        &reply(&channel, origin, "Partial work", Some("edit_message")),
+                        &registry,
+                    )
+                    .await;
+                    handle_reply(
+                        &reply(
+                            &channel,
+                            origin,
+                            if fail { cause } else { "Partial work" },
+                            Some(if fail { "agent_error" } else { "send_message" }),
+                        ),
+                        &registry,
+                    )
+                    .await;
+                };
+                tokio::join!(
+                    handle_session_prompt(
+                        &state,
+                        &sessions,
+                        json!(7),
+                        Some(&params),
+                        &out_tx,
+                        sid.clone(),
+                        cancel,
+                        "conn-test",
+                        0
+                    ),
+                    drive,
+                );
+                let partial: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+                assert_eq!(
+                    partial["params"]["update"]["content"]["text"],
+                    json!("Partial work")
+                );
+                let result: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+                assert_eq!(result["id"], json!(7));
+                if fail {
+                    assert_eq!(result["error"]["message"], json!(cause));
+                    assert!(result.get("result").is_none());
+                } else {
+                    assert_eq!(result["result"]["stopReason"], json!("end_turn"));
+                }
+                let map = sessions.lock().await;
+                assert!(!map[&sid].busy);
+                assert!(map[&sid].cancel.is_none());
+            }
         }
     }
 

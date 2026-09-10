@@ -209,6 +209,19 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    async fn fail_agent_turn(
+        &self,
+        channel: &ChannelRef,
+        partial: &str,
+        error: &str,
+    ) -> Result<()> {
+        let snapshot = self.build_reply(channel, partial, Some("edit_message"), None);
+        self.dispatch_reply(&snapshot).await;
+        let failure = self.build_reply(channel, error, Some("agent_error"), None);
+        self.dispatch_reply(&failure).await;
+        Ok(())
+    }
+
     fn agent_permission_relay_required(&self, channel: &ChannelRef) -> Result<bool> {
         if channel.platform != "acp" {
             return Ok(false);
