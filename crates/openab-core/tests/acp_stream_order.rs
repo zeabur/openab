@@ -387,7 +387,22 @@ done
 "##;
 
 async fn assert_failed_turn(script: &str, expected: &str, timeout: u64) {
+    for streaming in [None, Some("0"), Some("1")] {
+        assert_failed_turn_in_mode(script, expected, timeout, streaming).await;
+    }
+}
+
+async fn assert_failed_turn_in_mode(
+    script: &str,
+    expected: &str,
+    timeout: u64,
+    streaming: Option<&str>,
+) {
     let fx = setup_with_timeout("acp", "acp:failure", script, timeout).await;
+    match streaming {
+        Some(value) => std::env::set_var("OPENAB_ACP_STREAMING", value),
+        None => std::env::remove_var("OPENAB_ACP_STREAMING"),
+    }
     let recorder = Arc::new(RecordingAdapter::new(false));
     let adapter: Arc<dyn ChatAdapter> = recorder.clone();
     run_turn(&fx, &adapter, "acp:failure").await;

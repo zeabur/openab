@@ -1315,10 +1315,11 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
-                    // ACP direct relay: the raw buffer is exactly what the inline
-                    // snapshots carried; the terminal send below repeats it verbatim
+                    // ACP failures retain the raw partial text in every streaming mode,
+                    // without the display-only warning or send-once answer trimming.
+                    // Direct relay also repeats this snapshot at successful completion
                     // so the gateway's snapshot diff yields no duplicate chunk.
-                    let acp_streamed = if acp_direct {
+                    let acp_streamed = if platform_is_acp {
                         text_buf.clone()
                     } else {
                         String::new()
@@ -1379,8 +1380,7 @@ impl AdapterRouter {
                         let _ = adapter.set_status(&thread_channel, "").await;
                     }
                     if let Some(ref error) = acp_error {
-                        let partial = if acp_direct { &acp_streamed } else { &final_content };
-                        if let Err(e) = adapter.fail_agent_turn(&thread_channel, partial, error).await {
+                        if let Err(e) = adapter.fail_agent_turn(&thread_channel, &acp_streamed, error).await {
                             tracing::warn!(error = ?e, "acp terminal error send failed");
                             delivery_failed = true;
                         }
