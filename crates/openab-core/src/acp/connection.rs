@@ -200,8 +200,14 @@ impl SessionActivity {
     }
 
     /// Record that the agent-initiated relay just forwarded an update.
+    ///
+    /// Clamped away from 0, which is the "never relayed" sentinel: `now_ms` is
+    /// milliseconds since process boot, so a relay in the process's first
+    /// millisecond would otherwise stamp itself as never having run and hand
+    /// the session straight back to the eviction scan.
     pub fn mark_agent_relay(&self) {
-        self.agent_relay_ms.store(Self::now_ms(), Ordering::Release);
+        self.agent_relay_ms
+            .store(Self::now_ms().max(1), Ordering::Release);
     }
 
     /// Elapsed time since the relay last forwarded an update, or `None` when it
