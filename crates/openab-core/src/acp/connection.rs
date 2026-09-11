@@ -127,6 +127,14 @@ pub struct SessionActivity {
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
     prompt_in_flight: AtomicBool,
+    /// Milliseconds since process boot (monotonic) of the last update forwarded
+    /// by the agent-initiated relay, or 0 before it forwards its first.
+    ///
+    /// Written only by that relay. An agent-initiated turn holds no connection
+    /// mutex, never sets `prompt_in_flight`, and does not move `last_active_ms`
+    /// — so without this stamp such a session is indistinguishable from an idle
+    /// one, and sorts as the stalest, which makes it the pool's first pick.
+    agent_relay_ms: AtomicU64,
 }
 
 impl Default for SessionActivity {
@@ -140,6 +148,7 @@ impl SessionActivity {
         Self {
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
+            agent_relay_ms: AtomicU64::new(0),
         }
     }
 
@@ -175,6 +184,19 @@ impl SessionActivity {
 
     pub fn in_flight(&self) -> bool {
         self.prompt_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Record that the agent-initiated relay just forwarded an update.
+    pub fn mark_agent_relay(&self) {
+        self.agent_relay_ms.store(Self::now_ms(), Ordering::Release);
+    }
+
+    /// Elapsed time since the relay last forwarded an update, or `None` when it
+    /// never has (an ordinary session that only ever served client prompts).
+    pub fn agent_relay_age(&self) -> Option<std::time::Duration> {
+        let last = self.agent_relay_ms.load(Ordering::Acquire);
+
+        (last != 0).then(|| std::time::Duration::from_millis(Self::now_ms().saturating_sub(last)))
     }
 
     #[cfg(test)]
@@ -1305,6 +1327,20 @@ mod reader_loop_tests {
         // A future timestamp must not underflow: age saturates at zero.
         activity.set_last_active_ms(u64::MAX);
         assert_eq!(activity.age(), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn session_activity_agent_relay_age_is_none_until_the_relay_stamps_it() {
+        let activity = SessionActivity::new();
+        // An ordinary session that only ever served client prompts must stay
+        // evictable: touch() and set_in_flight() are not relay activity.
+        activity.touch();
+        activity.set_in_flight(true);
+        assert!(activity.agent_relay_age().is_none());
+        activity.mark_agent_relay();
+        assert!(activity
+            .agent_relay_age()
+            .is_some_and(|age| age < std::time::Duration::from_secs(60)));
     }
 
     #[test]

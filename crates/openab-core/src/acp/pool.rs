@@ -139,6 +139,34 @@ fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, 
     );
 }
 
+/// Seconds of lock-free silence after which a session is no longer treated as
+/// relaying an agent-initiated turn.
+///
+/// An agent-initiated turn (a scheduled wakeup, a post-turn write-back) streams
+/// through the idle subscriber installed by `prompt_done`. Nobody holds the
+/// connection mutex while it does, `prompt_in_flight` is false (it is cleared by
+/// `prompt_done` itself, and `cleanup_idle` re-clears it whenever the mutex is
+/// free), and `last_active` only advances on client prompts — so such a session
+/// sorts as the *oldest* and is the first thing the eviction scan picks. The
+/// relay stamps `SessionActivity::mark_agent_relay` for every update it
+/// forwards, which is the only honest signal available without the mutex.
+const AGENT_RELAY_GRACE_SECS: u64 = 120;
+
+/// True while the relay stamp is fresh enough that an agent-initiated turn is
+/// still streaming through the idle subscriber.
+fn relay_is_streaming(relay_age: std::time::Duration, grace: std::time::Duration) -> bool {
+    relay_age < grace
+}
+
+/// Returns true when a session must be skipped by the pool-full eviction scan
+/// because its agent-initiated relay is still forwarding updates.
+fn candidate_relaying(activity: Option<&SessionActivity>, grace: std::time::Duration) -> bool {
+    activity.is_some_and(|a| {
+        a.agent_relay_age()
+            .is_some_and(|age| relay_is_streaming(age, grace))
+    })
+}
+
 /// Returns true when `candidate_last_active` is a better eviction target than `current_oldest`.
 fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Instant) -> bool {
     match current_oldest {
@@ -509,11 +537,23 @@ impl SessionPool {
                 .collect()
         };
 
+        let relay_grace = std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS);
         let mut eviction_candidate: Option<EvictionCandidate> = None;
         let mut skipped_locked_candidates = 0usize;
         let mut skipped_in_flight_candidates = 0usize;
+        let mut skipped_relaying_candidates = 0usize;
         for (key, conn, activity) in snapshot {
             if key == thread_id {
+                continue;
+            }
+            // Never suspend a session whose agent-initiated turn is mid-relay.
+            // That turn carries no client request id, so nothing downstream can
+            // tell it apart from a turn that simply never ends: killing the agent
+            // strands the consumer on a stream that stops without a terminal
+            // update. `in_flight` does not cover this — it is false for the whole
+            // relay — so the relay stamp is checked on its own.
+            if candidate_relaying(activity.as_deref(), relay_grace) {
+                skipped_relaying_candidates += 1;
                 continue;
             }
             // Never suspend a session that still has a turn in flight. Doing so
@@ -764,11 +804,15 @@ impl SessionPool {
                 } else {
                     warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
                 }
-            } else if skipped_locked_candidates > 0 || skipped_in_flight_candidates > 0 {
+            } else if skipped_locked_candidates > 0
+                || skipped_in_flight_candidates > 0
+                || skipped_relaying_candidates > 0
+            {
                 warn!(
                     max_sessions = self.max_sessions,
                     skipped_locked_candidates,
                     skipped_in_flight_candidates,
+                    skipped_relaying_candidates,
                     "pool full but all other sessions were busy during eviction scan"
                 );
             }
@@ -1414,6 +1458,50 @@ mod tests {
     #[test]
     fn candidate_in_flight_treats_missing_handle_as_evictable() {
         assert!(!candidate_in_flight(None));
+    }
+
+    /// An agent-initiated turn (scheduled wakeup, post-turn write-back) streams
+    /// through the idle subscriber: no mutex held, `in_flight` false, and
+    /// `last_active` frozen at the end of the last client prompt. Only the relay
+    /// stamp keeps such a session out of the victim set.
+    #[test]
+    fn candidate_relaying_protects_a_session_mid_agent_turn() {
+        let activity = SessionActivity::new();
+        activity.mark_agent_relay();
+        assert!(!candidate_in_flight(Some(&activity)));
+        assert!(candidate_relaying(
+            Some(&activity),
+            std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+        ));
+    }
+
+    #[test]
+    fn candidate_relaying_allows_a_session_that_never_relayed() {
+        let activity = SessionActivity::new();
+        activity.touch();
+        assert!(!candidate_relaying(
+            Some(&activity),
+            std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+        ));
+    }
+
+    #[test]
+    fn candidate_relaying_treats_missing_handle_as_evictable() {
+        assert!(!candidate_relaying(
+            None,
+            std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+        ));
+    }
+
+    #[test]
+    fn relay_is_streaming_releases_a_session_silent_past_the_grace() {
+        let grace = std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS);
+        assert!(relay_is_streaming(std::time::Duration::from_secs(3), grace));
+        assert!(!relay_is_streaming(grace, grace));
+        assert!(!relay_is_streaming(
+            grace + std::time::Duration::from_secs(1),
+            grace,
+        ));
     }
 
     /// The force-evict warning must log NEITHER id raw — both the `acp_<uuid>` channel (inside the
