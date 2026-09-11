@@ -34,7 +34,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       targets: ${{ steps.version.outputs.targets }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Resolve version and target matrix
         id: version
@@ -60,7 +60,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
@@ -110,7 +110,7 @@ jobs:
           gh release upload "$TAG" "$NAME" --repo "${{ github.repository }}" --clobber
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: oabctl-${{ needs.resolve.outputs.version }}-${{ matrix.target }}
           path: operator/oabctl-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz
