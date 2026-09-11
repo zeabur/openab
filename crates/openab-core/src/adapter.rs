@@ -1285,11 +1285,15 @@ impl AdapterRouter {
                                     .forward_agent_update(&idle_channel, update.clone())
                                     .await
                                 {
+                                    // Keep listening. This task is the session's
+                                    // only route for agent-initiated turns until
+                                    // the next `prompt_done` installs another, so
+                                    // retiring it on one failed forward loses every
+                                    // later background update as well.
                                     tracing::debug!(
                                         ?error,
                                         "failed to forward autonomous ACP session update"
                                     );
-                                    break;
                                 }
                             }
                             // The receiver ends only when the connection behind it
