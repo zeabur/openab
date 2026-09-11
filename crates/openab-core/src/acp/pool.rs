@@ -76,6 +76,10 @@ pub struct SessionPool {
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
+/// Active connections paired with their lock-free activity handles, as read by
+/// the pool-full eviction scan. A handle is `None` only for an entry torn down
+/// between the two map reads.
+type ActiveWithActivity = Vec<(String, Arc<Mutex<AcpConnection>>, Option<Arc<SessionActivity>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
@@ -541,11 +545,7 @@ impl SessionPool {
         // example `session/request_permission`) holds no lock and emits no ACP
         // traffic, so `try_lock` and `last_active` both make it look like the
         // oldest idle session.
-        let snapshot: Vec<(
-            String,
-            Arc<Mutex<AcpConnection>>,
-            Option<Arc<SessionActivity>>,
-        )> = {
+        let snapshot: ActiveWithActivity = {
             let state = self.state.read().await;
             state
                 .active
