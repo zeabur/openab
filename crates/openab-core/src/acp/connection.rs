@@ -135,6 +135,18 @@ pub struct SessionActivity {
     /// — so without this stamp such a session is indistinguishable from an idle
     /// one, and sorts as the stalest, which makes it the pool's first pick.
     agent_relay_ms: AtomicU64,
+    /// Milliseconds since process boot (monotonic) at which the agent-initiated
+    /// relay started waiting for a permission decision, or 0 when it is not
+    /// waiting.
+    ///
+    /// A permission wait is the one part of such a turn that is *supposed* to
+    /// take arbitrarily long: a human is being asked. The relay is parked on
+    /// that await, forwarding nothing, so `agent_relay_ms` ages out and the
+    /// freshness window alone would hand the session to the eviction scan
+    /// precisely while it waits — killing the turn the user is about to
+    /// approve. Readers bound this themselves (see the pool's hung threshold);
+    /// an open wait is not licence to pin a session forever.
+    agent_permission_wait_ms: AtomicU64,
 }
 
 impl Default for SessionActivity {
@@ -149,6 +161,7 @@ impl SessionActivity {
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
             agent_relay_ms: AtomicU64::new(0),
+            agent_permission_wait_ms: AtomicU64::new(0),
         }
     }
 
@@ -197,6 +210,32 @@ impl SessionActivity {
         let last = self.agent_relay_ms.load(Ordering::Acquire);
 
         (last != 0).then(|| std::time::Duration::from_millis(Self::now_ms().saturating_sub(last)))
+    }
+
+    /// Record that the agent-initiated relay has started waiting for a
+    /// permission decision. Idempotent: a re-entry keeps the original start, so
+    /// the age readers see is the age of the wait, not of the last call.
+    pub fn begin_agent_permission_wait(&self) {
+        let _ = self.agent_permission_wait_ms.compare_exchange(
+            0,
+            Self::now_ms().max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Record that the decision arrived (or the request failed): no wait is open.
+    pub fn end_agent_permission_wait(&self) {
+        self.agent_permission_wait_ms.store(0, Ordering::Release);
+    }
+
+    /// How long the open permission wait has lasted, or `None` when the relay
+    /// is not waiting on one.
+    pub fn agent_permission_wait_age(&self) -> Option<std::time::Duration> {
+        let started = self.agent_permission_wait_ms.load(Ordering::Acquire);
+
+        (started != 0)
+            .then(|| std::time::Duration::from_millis(Self::now_ms().saturating_sub(started)))
     }
 
     #[cfg(test)]
@@ -1341,6 +1380,23 @@ mod reader_loop_tests {
         assert!(activity
             .agent_relay_age()
             .is_some_and(|age| age < std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn session_activity_permission_wait_keeps_its_original_start() {
+        let activity = SessionActivity::new();
+
+        assert!(activity.agent_permission_wait_age().is_none());
+        activity.begin_agent_permission_wait();
+        let first = activity.agent_permission_wait_age();
+
+        assert!(first.is_some());
+        // A second request while one is open must not restart the clock, or a
+        // chatty agent could keep a stale wait looking fresh forever.
+        activity.begin_agent_permission_wait();
+        assert!(activity.agent_permission_wait_age() >= first);
+        activity.end_agent_permission_wait();
+        assert!(activity.agent_permission_wait_age().is_none());
     }
 
     #[test]

@@ -1240,15 +1240,30 @@ impl AdapterRouter {
                             let mut relayed_any_update = false;
                             while let Some(notification) = idle_rx.recv().await {
                                 idle_activity.mark_agent_relay();
-                                if handle_permission_request(
+                                // A permission request parks this loop on a human
+                                // for as long as they take. Nothing is forwarded
+                                // meanwhile, so the relay stamp above ages out and
+                                // the session would look idle exactly while it is
+                                // waiting to be approved. Mark the wait for as long
+                                // as it is open.
+                                let awaiting_permission = notification.method.as_deref()
+                                    == Some("session/request_permission");
+                                if awaiting_permission {
+                                    idle_activity.begin_agent_permission_wait();
+                                }
+                                let handled = handle_permission_request(
                                     &idle_adapter,
                                     &idle_channel,
                                     &idle_permission_responder,
                                     permission_relay_required,
                                     &notification,
                                 )
-                                .await
-                                {
+                                .await;
+                                if awaiting_permission {
+                                    idle_activity.end_agent_permission_wait();
+                                    idle_activity.mark_agent_relay();
+                                }
+                                if handled {
                                     continue;
                                 }
                                 let Some(update) = notification

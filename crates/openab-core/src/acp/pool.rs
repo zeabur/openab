@@ -167,6 +167,23 @@ fn candidate_relaying(activity: Option<&SessionActivity>, grace: std::time::Dura
     })
 }
 
+/// Returns true when a session must be skipped because its agent-initiated
+/// relay is parked on a permission decision.
+///
+/// Bounded by the same threshold `cleanup_idle` uses for hung sessions: a
+/// decision nobody ever makes must not pin a pool slot forever, and that path
+/// cannot reclaim this one (the relay holds no mutex and sets no in-flight
+/// flag, so `classify_hung` never sees it).
+fn candidate_awaiting_permission(
+    activity: Option<&SessionActivity>,
+    hung_threshold: std::time::Duration,
+) -> bool {
+    activity.is_some_and(|a| {
+        a.agent_permission_wait_age()
+            .is_some_and(|age| age < hung_threshold)
+    })
+}
+
 /// Returns true when `candidate_last_active` is a better eviction target than `current_oldest`.
 fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Instant) -> bool {
     match current_oldest {
@@ -538,10 +555,12 @@ impl SessionPool {
         };
 
         let relay_grace = std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS);
+        let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
         let mut eviction_candidate: Option<EvictionCandidate> = None;
         let mut skipped_locked_candidates = 0usize;
         let mut skipped_in_flight_candidates = 0usize;
         let mut skipped_relaying_candidates = 0usize;
+        let mut skipped_permission_candidates = 0usize;
         for (key, conn, activity) in snapshot {
             if key == thread_id {
                 continue;
@@ -554,6 +573,12 @@ impl SessionPool {
             // relay — so the relay stamp is checked on its own.
             if candidate_relaying(activity.as_deref(), relay_grace) {
                 skipped_relaying_candidates += 1;
+                continue;
+            }
+            // The relay stamp ages out while a human is deciding; the wait
+            // itself is what says the turn is still alive.
+            if candidate_awaiting_permission(activity.as_deref(), hung_threshold) {
+                skipped_permission_candidates += 1;
                 continue;
             }
             // Never suspend a session that still has a turn in flight. Doing so
@@ -807,12 +832,14 @@ impl SessionPool {
             } else if skipped_locked_candidates > 0
                 || skipped_in_flight_candidates > 0
                 || skipped_relaying_candidates > 0
+                || skipped_permission_candidates > 0
             {
                 warn!(
                     max_sessions = self.max_sessions,
                     skipped_locked_candidates,
                     skipped_in_flight_candidates,
                     skipped_relaying_candidates,
+                    skipped_permission_candidates,
                     "pool full but all other sessions were busy during eviction scan"
                 );
             }
@@ -1491,6 +1518,45 @@ mod tests {
             None,
             std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
         ));
+    }
+
+    /// The gap the relay freshness window alone leaves open: a turn parked on a
+    /// permission request forwards nothing, so its relay stamp ages past the
+    /// grace while the user is still deciding.
+    #[test]
+    fn candidate_awaiting_permission_protects_a_turn_parked_on_a_decision() {
+        let activity = SessionActivity::new();
+        let hung = std::time::Duration::from_secs(1_920);
+
+        activity.mark_agent_relay();
+        activity.begin_agent_permission_wait();
+        assert!(candidate_awaiting_permission(Some(&activity), hung));
+        // And the protection is not permanent: a wait older than the hung
+        // threshold stops holding the slot.
+        assert!(!candidate_awaiting_permission(
+            Some(&activity),
+            std::time::Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn candidate_awaiting_permission_is_false_once_the_decision_lands() {
+        let activity = SessionActivity::new();
+        let hung = std::time::Duration::from_secs(1_920);
+
+        activity.begin_agent_permission_wait();
+        activity.end_agent_permission_wait();
+        assert!(!candidate_awaiting_permission(Some(&activity), hung));
+    }
+
+    #[test]
+    fn candidate_awaiting_permission_ignores_sessions_that_never_waited() {
+        let activity = SessionActivity::new();
+        let hung = std::time::Duration::from_secs(1_920);
+
+        activity.mark_agent_relay();
+        assert!(!candidate_awaiting_permission(Some(&activity), hung));
+        assert!(!candidate_awaiting_permission(None, hung));
     }
 
     #[test]
