@@ -1201,8 +1201,9 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, candidate_in_flight, classify_hung, classify_idle, get_or_insert_gate,
-        purge_session_entries, remove_if_same_handle, PoolState,
+        better_candidate, candidate_awaiting_permission, candidate_in_flight, candidate_relaying,
+        classify_hung, classify_idle, get_or_insert_gate, purge_session_entries, relay_is_streaming,
+        remove_if_same_handle, AGENT_RELAY_GRACE_SECS, PoolState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
