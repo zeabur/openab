@@ -76,6 +76,10 @@ pub struct SessionPool {
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
+/// Active connections paired with their lock-free activity handles, as read by
+/// the pool-full eviction scan. A handle is `None` only for an entry torn down
+/// between the two map reads.
+type ActiveWithActivity = Vec<(String, Arc<Mutex<AcpConnection>>, Option<Arc<SessionActivity>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
@@ -97,6 +101,16 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+/// Returns true when a session must be skipped by the pool-full eviction scan
+/// because it still has a turn in flight.
+///
+/// A missing activity handle means the session predates the handle map or was
+/// already torn down; treat it as evictable, matching the pre-existing behaviour
+/// for entries the scan cannot inspect.
+fn candidate_in_flight(activity: Option<&SessionActivity>) -> bool {
+    activity.is_some_and(|a| a.in_flight())
 }
 
 /// Returns true when a session should be treated as stale during idle cleanup.
@@ -127,6 +141,51 @@ fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, 
         threshold_secs,
         "force-evicting hung session"
     );
+}
+
+/// Seconds of lock-free silence after which a session is no longer treated as
+/// relaying an agent-initiated turn.
+///
+/// An agent-initiated turn (a scheduled wakeup, a post-turn write-back) streams
+/// through the idle subscriber installed by `prompt_done`. Nobody holds the
+/// connection mutex while it does, `prompt_in_flight` is false (it is cleared by
+/// `prompt_done` itself, and `cleanup_idle` re-clears it whenever the mutex is
+/// free), and `last_active` only advances on client prompts — so such a session
+/// sorts as the *oldest* and is the first thing the eviction scan picks. The
+/// relay stamps `SessionActivity::mark_agent_relay` for every update it
+/// forwards, which is the only honest signal available without the mutex.
+const AGENT_RELAY_GRACE_SECS: u64 = 120;
+
+/// True while the relay stamp is fresh enough that an agent-initiated turn is
+/// still streaming through the idle subscriber.
+fn relay_is_streaming(relay_age: std::time::Duration, grace: std::time::Duration) -> bool {
+    relay_age < grace
+}
+
+/// Returns true when a session must be skipped by the pool-full eviction scan
+/// because its agent-initiated relay is still forwarding updates.
+fn candidate_relaying(activity: Option<&SessionActivity>, grace: std::time::Duration) -> bool {
+    activity.is_some_and(|a| {
+        a.agent_relay_age()
+            .is_some_and(|age| relay_is_streaming(age, grace))
+    })
+}
+
+/// Returns true when a session must be skipped because its agent-initiated
+/// relay is parked on a permission decision.
+///
+/// Bounded by the same threshold `cleanup_idle` uses for hung sessions: a
+/// decision nobody ever makes must not pin a pool slot forever, and that path
+/// cannot reclaim this one (the relay holds no mutex and sets no in-flight
+/// flag, so `classify_hung` never sees it).
+fn candidate_awaiting_permission(
+    activity: Option<&SessionActivity>,
+    hung_threshold: std::time::Duration,
+) -> bool {
+    activity.is_some_and(|a| {
+        a.agent_permission_wait_age()
+            .is_some_and(|age| age < hung_threshold)
+    })
 }
 
 /// Returns true when `candidate_last_active` is a better eviction target than `current_oldest`.
@@ -278,6 +337,27 @@ fn revoke_facade_token_for_key(
             registrar.revoke(&token);
         }
     }
+}
+
+/// Write a `session/cancel` notification straight to the agent's stdin.
+///
+/// Uses the lock-free cancel handle rather than the connection mutex, so it works
+/// even while a turn is streaming (which holds that mutex).
+async fn send_session_cancel(
+    stdin: &Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+    session_id: &str,
+) -> Result<()> {
+    let data = serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))?;
+    use tokio::io::AsyncWriteExt;
+    let mut w = stdin.lock().await;
+    w.write_all(data.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await?;
+    Ok(())
 }
 
 impl SessionPool {
@@ -460,19 +540,55 @@ impl SessionPool {
         }
 
         // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+        // The activity handle comes along because a session can be mid-turn while
+        // its connection mutex is free: a turn parked on an out-of-band reply (for
+        // example `session/request_permission`) holds no lock and emits no ACP
+        // traffic, so `try_lock` and `last_active` both make it look like the
+        // oldest idle session.
+        let snapshot: ActiveWithActivity = {
             let state = self.state.read().await;
             state
                 .active
                 .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .map(|(k, v)| (k.clone(), Arc::clone(v), state.activity.get(k).cloned()))
                 .collect()
         };
 
+        let relay_grace = std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS);
+        let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
         let mut eviction_candidate: Option<EvictionCandidate> = None;
         let mut skipped_locked_candidates = 0usize;
-        for (key, conn) in snapshot {
+        let mut skipped_in_flight_candidates = 0usize;
+        let mut skipped_relaying_candidates = 0usize;
+        let mut skipped_permission_candidates = 0usize;
+        for (key, conn, activity) in snapshot {
             if key == thread_id {
+                continue;
+            }
+            // Never suspend a session whose agent-initiated turn is mid-relay.
+            // That turn carries no client request id, so nothing downstream can
+            // tell it apart from a turn that simply never ends: killing the agent
+            // strands the consumer on a stream that stops without a terminal
+            // update. `in_flight` does not cover this — it is false for the whole
+            // relay — so the relay stamp is checked on its own.
+            if candidate_relaying(activity.as_deref(), relay_grace) {
+                skipped_relaying_candidates += 1;
+                continue;
+            }
+            // The relay stamp ages out while a human is deciding; the wait
+            // itself is what says the turn is still alive.
+            if candidate_awaiting_permission(activity.as_deref(), hung_threshold) {
+                skipped_permission_candidates += 1;
+                continue;
+            }
+            // Never suspend a session that still has a turn in flight. Doing so
+            // kills the agent process mid-turn: every pending tool call fails with
+            // "Tool use aborted", the client's replies are dropped as belonging to
+            // a superseded turn, and the turn ends without a stop reason, so the
+            // conversation appears stuck forever. Genuinely hung turns are still
+            // reclaimed by `cleanup_idle` via `classify_hung`.
+            if candidate_in_flight(activity.as_deref()) {
+                skipped_in_flight_candidates += 1;
                 continue;
             }
             let conn_handle = Arc::clone(&conn);
@@ -672,6 +788,10 @@ impl SessionPool {
         new_conn.set_facade_token_guard(facade_token_guard);
         let new_conn = Arc::new(Mutex::new(new_conn));
 
+        // Cancel handle of the session we suspend below, if any. Sent after the
+        // state lock is released (lock ordering: never await I/O under `state`).
+        let mut evicted_cancel: Option<CancelHandle> = None;
+
         let mut state = self.state.write().await;
 
         // Another task may have created a healthy connection while we were
@@ -694,7 +814,7 @@ impl SessionPool {
         if state.active.len() >= self.max_sessions {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    state.cancel_handles.remove(&key);
+                    evicted_cancel = state.cancel_handles.remove(&key);
                     state.activity.remove(&key);
                     state.pgids.remove(&key);
                     #[cfg(feature = "acp-mcp")]
@@ -709,10 +829,17 @@ impl SessionPool {
                 } else {
                     warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
                 }
-            } else if skipped_locked_candidates > 0 {
+            } else if skipped_locked_candidates > 0
+                || skipped_in_flight_candidates > 0
+                || skipped_relaying_candidates > 0
+                || skipped_permission_candidates > 0
+            {
                 warn!(
                     max_sessions = self.max_sessions,
                     skipped_locked_candidates,
+                    skipped_in_flight_candidates,
+                    skipped_relaying_candidates,
+                    skipped_permission_candidates,
                     "pool full but all other sessions were busy during eviction scan"
                 );
             }
@@ -757,6 +884,23 @@ impl SessionPool {
                 .entry(thread_id.to_string())
                 .or_insert_with(|| effective_workdir.clone());
             self.save_meta(&state.session_workdirs);
+        }
+
+        drop(state);
+
+        // Tell the suspended session's agent to end whatever it was doing. The
+        // eviction scan skips in-flight sessions, so this is normally a no-op on an
+        // idle agent; when it is not, `session/cancel` makes the turn terminate with
+        // a stop reason instead of disappearing, which is what lets the client close
+        // the turn out rather than showing it as still running.
+        if let Some((stdin, session_id)) = evicted_cancel {
+            if let Err(e) = send_session_cancel(&stdin, &session_id).await {
+                warn!(
+                    session_id = %crate::redact::redact_session_ids(&session_id),
+                    error = %e,
+                    "failed to cancel suspended session"
+                );
+            }
         }
 
         // Return true only for genuinely new sessions — not resumed or reconnected ones.
@@ -850,18 +994,8 @@ impl SessionPool {
                 .cloned()
                 .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?
         };
-        let data = serde_json::to_string(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/cancel",
-            "params": {"sessionId": session_id}
-        }))?;
         tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "sending session/cancel");
-        use tokio::io::AsyncWriteExt;
-        let mut w = stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
-        Ok(())
+        send_session_cancel(&stdin, &session_id).await
     }
 
     /// Reset a session: cancel any in-flight operation, remove the active connection,
@@ -876,17 +1010,9 @@ impl SessionPool {
             let state = self.state.read().await;
             state.cancel_handles.get(thread_id).cloned()
         } {
-            let data = serde_json::to_string(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": {"sessionId": session_id}
-            }))?;
             tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
-            use tokio::io::AsyncWriteExt;
-            let mut w = stdin.lock().await;
-            let _ = w.write_all(data.as_bytes()).await;
-            let _ = w.write_all(b"\n").await;
-            let _ = w.flush().await;
+            // Best-effort: a reset proceeds even if the agent's stdin is already gone.
+            let _ = send_session_cancel(&stdin, &session_id).await;
         }
 
         let mut state = self.state.write().await;
@@ -1075,8 +1201,9 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        better_candidate, candidate_awaiting_permission, candidate_in_flight, candidate_relaying,
+        classify_hung, classify_idle, get_or_insert_gate, purge_session_entries, relay_is_streaming,
+        remove_if_same_handle, AGENT_RELAY_GRACE_SECS, PoolState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1335,6 +1462,113 @@ mod tests {
     fn better_candidate_keeps_existing_on_equal_last_active() {
         let ts = Instant::now() - std::time::Duration::from_secs(60);
         assert!(!better_candidate(Some(ts), ts));
+    }
+
+    /// A session parked on `session/request_permission` holds no connection lock
+    /// and stops touching `last_active`, so the pool-full scan used to pick it as
+    /// the "oldest idle" victim and kill its agent mid-turn. `in_flight` is the
+    /// only signal that survives that parking, so it is what the scan must use.
+    #[test]
+    fn candidate_in_flight_protects_parked_turn() {
+        let activity = SessionActivity::new();
+        activity.set_in_flight(true);
+        assert!(candidate_in_flight(Some(&activity)));
+    }
+
+    #[test]
+    fn candidate_in_flight_allows_idle_session() {
+        let activity = SessionActivity::new();
+        assert!(!candidate_in_flight(Some(&activity)));
+    }
+
+    /// No handle means the scan cannot inspect the entry; keep the old behaviour
+    /// of treating it as evictable rather than pinning the pool shut.
+    #[test]
+    fn candidate_in_flight_treats_missing_handle_as_evictable() {
+        assert!(!candidate_in_flight(None));
+    }
+
+    /// An agent-initiated turn (scheduled wakeup, post-turn write-back) streams
+    /// through the idle subscriber: no mutex held, `in_flight` false, and
+    /// `last_active` frozen at the end of the last client prompt. Only the relay
+    /// stamp keeps such a session out of the victim set.
+    #[test]
+    fn candidate_relaying_protects_a_session_mid_agent_turn() {
+        let activity = SessionActivity::new();
+        activity.mark_agent_relay();
+        assert!(!candidate_in_flight(Some(&activity)));
+        assert!(candidate_relaying(
+            Some(&activity),
+            std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+        ));
+    }
+
+    #[test]
+    fn candidate_relaying_allows_a_session_that_never_relayed() {
+        let activity = SessionActivity::new();
+        activity.touch();
+        assert!(!candidate_relaying(
+            Some(&activity),
+            std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+        ));
+    }
+
+    #[test]
+    fn candidate_relaying_treats_missing_handle_as_evictable() {
+        assert!(!candidate_relaying(
+            None,
+            std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+        ));
+    }
+
+    /// The gap the relay freshness window alone leaves open: a turn parked on a
+    /// permission request forwards nothing, so its relay stamp ages past the
+    /// grace while the user is still deciding.
+    #[test]
+    fn candidate_awaiting_permission_protects_a_turn_parked_on_a_decision() {
+        let activity = SessionActivity::new();
+        let hung = std::time::Duration::from_secs(1_920);
+
+        activity.mark_agent_relay();
+        activity.begin_agent_permission_wait();
+        assert!(candidate_awaiting_permission(Some(&activity), hung));
+        // And the protection is not permanent: a wait older than the hung
+        // threshold stops holding the slot.
+        assert!(!candidate_awaiting_permission(
+            Some(&activity),
+            std::time::Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn candidate_awaiting_permission_is_false_once_the_decision_lands() {
+        let activity = SessionActivity::new();
+        let hung = std::time::Duration::from_secs(1_920);
+
+        activity.begin_agent_permission_wait();
+        activity.end_agent_permission_wait();
+        assert!(!candidate_awaiting_permission(Some(&activity), hung));
+    }
+
+    #[test]
+    fn candidate_awaiting_permission_ignores_sessions_that_never_waited() {
+        let activity = SessionActivity::new();
+        let hung = std::time::Duration::from_secs(1_920);
+
+        activity.mark_agent_relay();
+        assert!(!candidate_awaiting_permission(Some(&activity), hung));
+        assert!(!candidate_awaiting_permission(None, hung));
+    }
+
+    #[test]
+    fn relay_is_streaming_releases_a_session_silent_past_the_grace() {
+        let grace = std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS);
+        assert!(relay_is_streaming(std::time::Duration::from_secs(3), grace));
+        assert!(!relay_is_streaming(grace, grace));
+        assert!(!relay_is_streaming(
+            grace + std::time::Duration::from_secs(1),
+            grace,
+        ));
     }
 
     /// The force-evict warning must log NEITHER id raw — both the `acp_<uuid>` channel (inside the

@@ -484,6 +484,20 @@ pub trait ChatAdapter: Send + Sync + 'static {
     }
 }
 
+/// The one update openab itself authors: the relay for an agent-initiated turn
+/// lost its connection, so no further updates — including the agent's own
+/// terminal one — can ever arrive for that turn.
+///
+/// Deliberately not shaped like an agent update: this is openab reporting on its
+/// own plumbing, not a synthesized agent message. Consumers key off
+/// `sessionUpdate` and should read it as "this turn ended without a result".
+pub fn agent_relay_interrupted_update() -> serde_json::Value {
+    serde_json::json!({
+        "sessionUpdate": "openab_session_interrupted",
+        "reason": "connection_closed",
+    })
+}
+
 async fn handle_permission_request(
     adapter: &Arc<dyn ChatAdapter>,
     channel: &ChannelRef,
@@ -1213,20 +1227,51 @@ impl AdapterRouter {
                         }
                     }
 
+                    // Lock-free marker for the relay below. The pool's eviction
+                    // scan reads it to tell "idle" apart from "mid agent-initiated
+                    // turn", which is invisible to both `try_lock` and `in_flight`
+                    // because this relay holds no connection mutex and runs after
+                    // `prompt_done` has already cleared the in-flight flag.
+                    let idle_activity = conn.activity_handle();
                     conn.prompt_done(platform_is_acp.then_some(idle_tx)).await;
                     if platform_is_acp {
                         let idle_permission_responder = permission_responder.clone();
                         tokio::spawn(async move {
+                            let mut relay_saw_traffic = false;
                             while let Some(notification) = idle_rx.recv().await {
-                                if handle_permission_request(
+                                // Everything arriving here is agent-initiated turn
+                                // traffic — permission requests included, since the
+                                // idle subscriber only carries what reaches us after
+                                // prompt_done. Counting only *forwarded* updates
+                                // would let a turn whose very first act needs
+                                // approval close silently, which is the exact
+                                // silence this relay exists to break.
+                                relay_saw_traffic = true;
+                                idle_activity.mark_agent_relay();
+                                // A permission request parks this loop on a human
+                                // for as long as they take. Nothing is forwarded
+                                // meanwhile, so the relay stamp above ages out and
+                                // the session would look idle exactly while it is
+                                // waiting to be approved. Mark the wait for as long
+                                // as it is open.
+                                let awaiting_permission = notification.method.as_deref()
+                                    == Some("session/request_permission");
+                                if awaiting_permission {
+                                    idle_activity.begin_agent_permission_wait();
+                                }
+                                let handled = handle_permission_request(
                                     &idle_adapter,
                                     &idle_channel,
                                     &idle_permission_responder,
                                     permission_relay_required,
                                     &notification,
                                 )
-                                .await
-                                {
+                                .await;
+                                if awaiting_permission {
+                                    idle_activity.end_agent_permission_wait();
+                                    idle_activity.mark_agent_relay();
+                                }
+                                if handled {
                                     continue;
                                 }
                                 let Some(update) = notification
@@ -1245,6 +1290,33 @@ impl AdapterRouter {
                                         "failed to forward autonomous ACP session update"
                                     );
                                     break;
+                                }
+                            }
+                            // The receiver ends only when the connection behind it
+                            // is gone: suspended by the pool, force-evicted, or the
+                            // agent process died. An agent-initiated turn carries no
+                            // client request id, so its consumer has no other way to
+                            // learn the turn will never finish — the agent's own
+                            // terminal update died with the process. Say so once,
+                            // explicitly, instead of leaving the consumer attached to
+                            // a stream that already ended.
+                            //
+                            // Advisory: consumers must ignore it when no
+                            // agent-initiated turn is open, because a session whose
+                            // last relayed turn completed normally still reaches this
+                            // line when it is later suspended.
+                            if relay_saw_traffic {
+                                if let Err(error) = idle_adapter
+                                    .forward_agent_update(
+                                        &idle_channel,
+                                        agent_relay_interrupted_update(),
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        ?error,
+                                        "failed to forward autonomous ACP interruption"
+                                    );
                                 }
                             }
                         });
@@ -1941,6 +2013,14 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_relay_interrupted_update_is_tagged_and_carries_a_reason() {
+        let update = agent_relay_interrupted_update();
+
+        assert_eq!(update["sessionUpdate"], "openab_session_interrupted");
+        assert_eq!(update["reason"], "connection_closed");
+    }
 
     #[test]
     fn acp_reply_limit_is_unbounded_others_use_adapter_limit() {
