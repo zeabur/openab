@@ -274,6 +274,10 @@ pub struct AcpConnection {
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: NotificationSender,
+    /// Session-scoped subscriber for agent-initiated turns, kept apart from
+    /// `notify_tx` so it survives a turn that never calls `prompt_done`.
+    /// Installed by `prompt_done`; read by the reader loop as a fallback.
+    idle_notify_tx: NotificationSender,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
@@ -330,6 +334,7 @@ pub(crate) async fn run_reader_loop<R>(
     reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: NotificationSender,
+    idle_notify_tx: NotificationSender,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -377,8 +382,27 @@ pub(crate) async fn run_reader_loop<R>(
             trace!(request_id = id, "stale id-bearing message after abandon");
         }
 
-        // Notification → forward to subscriber
-        if let Some(tx) = current_notification_sender(&notify_tx).await {
+        // Notification → forward to the turn's subscriber, and fall back to the
+        // session-scoped idle subscriber when that turn is gone.
+        //
+        // `session_prompt` points `notify_tx` at the running turn and only
+        // `prompt_done` hands the session back to the idle subscriber, so a turn
+        // that never reaches it — its task dropped mid-flight, or an early
+        // return before the recv loop — leaves `notify_tx` holding a sender
+        // whose receiver died with that turn's stack frame. Every later
+        // agent-initiated turn (a Claude Code background task reporting back, a
+        // ScheduleWakeup firing) was then dropped here until the next client
+        // prompt: the background listener was reclaimed along with the turn.
+        // A closed channel returns the unsent message, so the fallback costs
+        // nothing on the hot path and never duplicates a delivery.
+        let msg = match current_notification_sender(&notify_tx).await {
+            Some(tx) => match tx.send(msg).await {
+                Ok(()) => continue,
+                Err(unsent) => unsent.0,
+            },
+            None => msg,
+        };
+        if let Some(tx) = current_notification_sender(&idle_notify_tx).await {
             let _ = tx.send(msg).await;
         }
     }
@@ -398,9 +422,9 @@ pub(crate) async fn run_reader_loop<R>(
             params: None,
         });
     }
-    // Close the notify channel so rx.recv() returns None
-    let mut sub = notify_tx.lock().await;
-    *sub = None;
+    // Close the notify channels so rx.recv() returns None
+    *notify_tx.lock().await = None;
+    *idle_notify_tx.lock().await = None;
 }
 
 impl AcpConnection {
@@ -538,11 +562,14 @@ impl AcpConnection {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let idle_notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
             pending.clone(),
             notify_tx.clone(),
+            idle_notify_tx.clone(),
         ));
 
         let activity = Arc::new(SessionActivity::new());
@@ -554,6 +581,7 @@ impl AcpConnection {
             next_id: AtomicU64::new(1),
             pending,
             notify_tx,
+            idle_notify_tx,
             acp_session_id: None,
             supports_load_session: false,
             agent_name: String::new(),
@@ -831,6 +859,11 @@ impl AcpConnection {
         &mut self,
         idle_subscriber: Option<mpsc::Sender<JsonRpcMessage>>,
     ) {
+        // Recorded separately as well: the next `session_prompt` overwrites
+        // `notify_tx` with that turn's route, and if the turn never gets back
+        // here the reader loop needs somewhere to send agent-initiated updates
+        // that is not the dead turn.
+        *self.idle_notify_tx.lock().await = idle_subscriber.clone();
         *self.notify_tx.lock().await = idle_subscriber;
         self.activity.touch();
         self.activity.set_in_flight(false);
@@ -1184,7 +1217,8 @@ mod reader_loop_tests {
         let (notify_tx, mut notify_rx) = mpsc::channel(1);
         let subscriber: NotificationSender = Arc::new(Mutex::new(Some(notify_tx)));
 
-        let reader = tokio::spawn(run_reader_loop(broker_reader, pending, subscriber));
+        let idle: NotificationSender = Arc::new(Mutex::new(None));
+        let reader = tokio::spawn(run_reader_loop(broker_reader, pending, subscriber, idle));
         let (_agent_reader, mut agent_writer) = tokio::io::split(agent_side);
         agent_writer
             .write_all(
@@ -1293,6 +1327,7 @@ mod reader_loop_tests {
             agent_stdout_reader,
             pending.clone(),
             notify_tx.clone(),
+            Arc::new(Mutex::new(None)),
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -1332,6 +1367,7 @@ mod reader_loop_tests {
             agent_stdout_reader,
             pending.clone(),
             notify_tx.clone(),
+            Arc::new(Mutex::new(None)),
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -1350,6 +1386,51 @@ mod reader_loop_tests {
             .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(7));
         assert!(pending.lock().await.is_empty());
+
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+    }
+
+    /// Regression: the background listener must outlive the turn it was
+    /// installed after. A turn that ends without `prompt_done` leaves its own
+    /// (now closed) sender parked in `notify_tx`; every agent-initiated update
+    /// after it — a background task reporting back, a ScheduleWakeup — used to
+    /// be dropped there until the next client prompt.
+    #[tokio::test]
+    async fn notification_falls_back_to_idle_subscriber_when_the_turn_is_gone() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // The turn is gone: its receiver dropped with the task's stack frame.
+        let (turn_tx, turn_rx) = mpsc::channel::<JsonRpcMessage>(ACP_NOTIFICATION_CAPACITY);
+        drop(turn_rx);
+        let notify_tx: NotificationSender = Arc::new(Mutex::new(Some(turn_tx)));
+
+        let (idle_tx, mut idle_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
+        let idle_notify_tx: NotificationSender = Arc::new(Mutex::new(Some(idle_tx)));
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            pending.clone(),
+            notify_tx.clone(),
+            idle_notify_tx.clone(),
+        ));
+
+        agent_stdout_writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"inner","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"background task finished"}}}}"#,
+            )
+            .await
+            .unwrap();
+        agent_stdout_writer.write_all(b"\n").await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), idle_rx.recv())
+            .await
+            .expect("idle subscriber should receive the autonomous update")
+            .expect("idle subscriber channel should not be closed");
+        assert_eq!(forwarded.method.as_deref(), Some("session/update"));
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
