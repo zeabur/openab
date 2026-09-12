@@ -1237,8 +1237,16 @@ impl AdapterRouter {
                     if platform_is_acp {
                         let idle_permission_responder = permission_responder.clone();
                         tokio::spawn(async move {
-                            let mut relayed_any_update = false;
+                            let mut relay_saw_traffic = false;
                             while let Some(notification) = idle_rx.recv().await {
+                                // Everything arriving here is agent-initiated turn
+                                // traffic — permission requests included, since the
+                                // idle subscriber only carries what reaches us after
+                                // prompt_done. Counting only *forwarded* updates
+                                // would let a turn whose very first act needs
+                                // approval close silently, which is the exact
+                                // silence this relay exists to break.
+                                relay_saw_traffic = true;
                                 idle_activity.mark_agent_relay();
                                 // A permission request parks this loop on a human
                                 // for as long as they take. Nothing is forwarded
@@ -1273,7 +1281,6 @@ impl AdapterRouter {
                                 else {
                                     continue;
                                 };
-                                relayed_any_update = true;
                                 if let Err(error) = idle_adapter
                                     .forward_agent_update(&idle_channel, update.clone())
                                     .await
@@ -1298,7 +1305,7 @@ impl AdapterRouter {
                             // agent-initiated turn is open, because a session whose
                             // last relayed turn completed normally still reaches this
                             // line when it is later suspended.
-                            if relayed_any_update {
+                            if relay_saw_traffic {
                                 if let Err(error) = idle_adapter
                                     .forward_agent_update(
                                         &idle_channel,
