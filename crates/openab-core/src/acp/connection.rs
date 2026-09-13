@@ -127,6 +127,9 @@ pub struct SessionActivity {
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
     prompt_in_flight: AtomicBool,
+    /// True while a client prompt is parked on a human permission decision.
+    /// Such a wait is intentional silence, not a hung agent.
+    prompt_permission_wait: AtomicBool,
     /// Milliseconds since process boot (monotonic) of the last update forwarded
     /// by the agent-initiated relay, or 0 before it forwards its first.
     ///
@@ -160,6 +163,7 @@ impl SessionActivity {
         Self {
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
+            prompt_permission_wait: AtomicBool::new(false),
             agent_relay_ms: AtomicU64::new(0),
             agent_permission_wait_ms: AtomicU64::new(0),
         }
@@ -182,6 +186,9 @@ impl SessionActivity {
 
     pub fn set_in_flight(&self, in_flight: bool) {
         self.prompt_in_flight.store(in_flight, Ordering::Release);
+        if !in_flight {
+            self.prompt_permission_wait.store(false, Ordering::Release);
+        }
     }
 
     /// Milliseconds since process boot of the last observed activity.
@@ -197,6 +204,18 @@ impl SessionActivity {
 
     pub fn in_flight(&self) -> bool {
         self.prompt_in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn begin_prompt_permission_wait(&self) {
+        self.prompt_permission_wait.store(true, Ordering::Release);
+    }
+
+    pub fn end_prompt_permission_wait(&self) {
+        self.prompt_permission_wait.store(false, Ordering::Release);
+    }
+
+    pub fn prompt_awaiting_permission(&self) -> bool {
+        self.prompt_permission_wait.load(Ordering::Acquire)
     }
 
     /// Record that the agent-initiated relay just forwarded an update.
@@ -828,6 +847,7 @@ impl AcpConnection {
     ) -> Result<(mpsc::Receiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.activity.touch();
+        self.activity.end_prompt_permission_wait();
         self.activity.set_in_flight(true);
 
         let session_id = self
@@ -1569,5 +1589,18 @@ mod reader_loop_tests {
         assert!(activity.in_flight());
         activity.set_in_flight(false);
         assert!(!activity.in_flight());
+    }
+
+    #[test]
+    fn session_activity_prompt_permission_wait_round_trips() {
+        let activity = SessionActivity::new();
+        assert!(!activity.prompt_awaiting_permission());
+        activity.begin_prompt_permission_wait();
+        assert!(activity.prompt_awaiting_permission());
+        activity.end_prompt_permission_wait();
+        assert!(!activity.prompt_awaiting_permission());
+        activity.begin_prompt_permission_wait();
+        activity.set_in_flight(false);
+        assert!(!activity.prompt_awaiting_permission());
     }
 }

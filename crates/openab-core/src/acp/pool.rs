@@ -62,7 +62,7 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
-    /// Force-evict sessions stuck in-flight longer than this threshold
+    /// Force-evict sessions with no prompt activity longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
@@ -123,8 +123,9 @@ fn classify_hung(
     in_flight: bool,
     last_active_age: std::time::Duration,
     threshold: std::time::Duration,
+    awaiting_permission: bool,
 ) -> bool {
-    in_flight && last_active_age > threshold
+    in_flight && !awaiting_permission && last_active_age > threshold
 }
 
 /// Emit the force-evict warning with **both** ids redacted.
@@ -1063,7 +1064,12 @@ impl SessionPool {
             let conn_handle = Arc::clone(&conn);
             let Ok(conn) = conn.try_lock() else {
                 if let Some(activity) = activity_map.get(&key) {
-                    if classify_hung(activity.in_flight(), activity.age(), hung_threshold) {
+                    if classify_hung(
+                        activity.in_flight(),
+                        activity.age(),
+                        hung_threshold,
+                        activity.prompt_awaiting_permission(),
+                    ) {
                         let session_id = cancel_map.get(&key).map(|(_, sid)| sid.clone());
                         warn_force_evicting_hung(
                             &key,
@@ -1437,6 +1443,7 @@ mod tests {
             true,
             std::time::Duration::from_secs(200),
             std::time::Duration::from_secs(120),
+            false,
         ));
     }
 
@@ -1446,6 +1453,7 @@ mod tests {
             true,
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(120),
+            false,
         ));
     }
 
@@ -1455,6 +1463,17 @@ mod tests {
             false,
             std::time::Duration::from_secs(200),
             std::time::Duration::from_secs(120),
+            false,
+        ));
+    }
+
+    #[test]
+    fn classify_hung_ignores_prompt_awaiting_permission() {
+        assert!(!classify_hung(
+            true,
+            std::time::Duration::from_secs(200),
+            std::time::Duration::from_secs(120),
+            true,
         ));
     }
 

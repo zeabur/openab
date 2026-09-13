@@ -542,7 +542,7 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
-    prompt_hard_timeout: std::time::Duration,
+    prompt_inactivity_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
     /// Workspace aliases from `[workspace.aliases]` config.
@@ -570,15 +570,17 @@ impl AdapterRouter {
                 liveness_check_secs,
                 prompt_hard_timeout_secs,
                 "pool.liveness_check_secs >= pool.prompt_hard_timeout_secs; \
-                 the hard ceiling will only fire after the next liveness tick \
-                 and may be effectively bypassed. Lower liveness_check_secs."
+                 inactivity will only be detected after the next liveness tick. \
+                 Lower liveness_check_secs."
             );
         }
         Self {
             pool,
             reactions_config,
             table_mode,
-            prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
+            prompt_inactivity_timeout: std::time::Duration::from_secs(
+                prompt_hard_timeout_secs,
+            ),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             workspace_aliases,
             bot_home,
@@ -828,7 +830,7 @@ impl AdapterRouter {
         // arrival order with the tool/thought updates forwarded on the same path.
         // The gateway diffs successive snapshots into append-only chunks.
         let acp_direct = streaming && platform_is_acp;
-        let prompt_hard_timeout = self.prompt_hard_timeout;
+        let prompt_inactivity_timeout = self.prompt_inactivity_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
         // The prompt receiver below owns delivery while the request is active.
@@ -982,15 +984,22 @@ impl AdapterRouter {
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
-                    // messages and abandons cleanly on dead agent / hard ceiling
-                    // so late responses cannot leak into the next prompt.
+                    // messages and abandons cleanly on dead or inactive agents
+                    // so late responses cannot leak into the next prompt. A long
+                    // turn may run indefinitely while it keeps producing ACP
+                    // updates; duration by itself is not a failure signal.
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
-                    let prompt_start = tokio::time::Instant::now();
+                    let mut last_activity = tokio::time::Instant::now();
+                    let prompt_activity = conn.activity_handle();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
-                                Some(n) => n,
+                                Some(n) => {
+                                    last_activity = tokio::time::Instant::now();
+                                    prompt_activity.touch();
+                                    n
+                                },
                                 // Reader saw EOF: the agent's stdout closed. A *successful*
                                 // turn is always signalled by the id-bearing JSON-RPC response to
                                 // `session/prompt`, which breaks the loop at the id branch below
@@ -1023,10 +1032,10 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
-                                if prompt_start.elapsed() > prompt_hard_timeout {
+                                if last_activity.elapsed() > prompt_inactivity_timeout {
                                     response_error = Some(format!(
-                                        "Agent exceeded hard timeout ({}s)",
-                                        prompt_hard_timeout.as_secs(),
+                                        "Agent exceeded inactivity timeout ({}s)",
+                                        prompt_inactivity_timeout.as_secs(),
                                     ));
                                     conn.abandon_request(request_id).await;
                                     break;
@@ -1034,15 +1043,26 @@ impl AdapterRouter {
                                 continue;
                             }
                         };
-                        if handle_permission_request(
+                        let awaiting_permission = notification.method.as_deref()
+                            == Some("session/request_permission");
+                        if awaiting_permission {
+                            prompt_activity.begin_prompt_permission_wait();
+                        }
+                        let handled_permission = handle_permission_request(
                             &adapter,
                             &thread_channel,
                             &permission_responder,
                             permission_relay_required,
                             &notification,
                         )
-                        .await
-                        {
+                        .await;
+                        if awaiting_permission {
+                            prompt_activity.end_prompt_permission_wait();
+                            // Human approval time is not agent inactivity.
+                            last_activity = tokio::time::Instant::now();
+                            prompt_activity.touch();
+                        }
+                        if handled_permission {
                             continue;
                         }
                         if let Some(notification_id) = notification.id {

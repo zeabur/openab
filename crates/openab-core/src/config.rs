@@ -1719,22 +1719,24 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
-    /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
-    /// abandons the in-flight request, sends `session/cancel` to the agent,
-    /// and clears the pending entry so late responses cannot leak into the
-    /// next prompt's subscriber.
+    /// Maximum silence during a single prompt (#732). Each agent notification
+    /// resets the timer, so a productive turn may run longer than this value.
+    /// Once the agent is inactive for this long, the broker abandons the
+    /// request, sends `session/cancel`, and clears the pending entry so late
+    /// responses cannot leak into the next prompt's subscriber. Time spent
+    /// awaiting a human permission decision is excluded.
     ///
     /// Precision: checked every `liveness_check_secs`, so actual cutoff is
     /// ±`liveness_check_secs` from this value.
     #[serde(default = "default_prompt_hard_timeout_secs")]
     pub prompt_hard_timeout_secs: u64,
     /// Polling cadence (seconds) for the recv-loop liveness check (#732).
-    /// Lower = faster reaction to a dead agent / hard ceiling at the cost of
+    /// Lower = faster reaction to a dead or inactive agent at the cost of
     /// more wakeups while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
-    /// Grace period after `prompt_hard_timeout_secs` before a session stuck
-    /// with its connection mutex held is force-evicted from the pool.
+    /// Grace period after `prompt_hard_timeout_secs` of inactivity before a
+    /// session stuck with its connection mutex held is force-evicted.
     #[serde(default = "default_hung_grace_secs")]
     pub hung_grace_secs: u64,
     /// Config options to set automatically after session creation.
