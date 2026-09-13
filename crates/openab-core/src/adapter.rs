@@ -563,7 +563,7 @@ fn message_matches_session(message: &JsonRpcMessage, session_id: &str) -> bool {
         == Some(session_id)
 }
 
-fn is_current_prompt_permission(message: &JsonRpcMessage, session_id: &str) -> bool {
+fn is_permission_for_session(message: &JsonRpcMessage, session_id: &str) -> bool {
     message.method.as_deref() == Some("session/request_permission")
         && message.id.is_some()
         && message_matches_session(message, session_id)
@@ -1091,7 +1091,7 @@ impl AdapterRouter {
                         let permission_request = notification.method.as_deref()
                             == Some("session/request_permission");
                         let awaiting_permission =
-                            is_current_prompt_permission(&notification, &prompt_session_id);
+                            is_permission_for_session(&notification, &prompt_session_id);
                         if permission_request && !awaiting_permission {
                             warn!(
                                 "ignoring permission request not scoped to the active session"
@@ -1312,6 +1312,16 @@ impl AdapterRouter {
                         tokio::spawn(async move {
                             let mut relay_saw_traffic = false;
                             while let Some(notification) = idle_rx.recv().await {
+                                let permission_request = notification.method.as_deref()
+                                    == Some("session/request_permission");
+                                let awaiting_permission =
+                                    is_permission_for_session(&notification, &prompt_session_id);
+                                if permission_request && !awaiting_permission {
+                                    warn!(
+                                        "ignoring idle permission request not scoped to the session"
+                                    );
+                                    continue;
+                                }
                                 // Everything arriving here is agent-initiated turn
                                 // traffic — permission requests included, since the
                                 // idle subscriber only carries what reaches us after
@@ -1327,8 +1337,6 @@ impl AdapterRouter {
                                 // the session would look idle exactly while it is
                                 // waiting to be approved. Mark the wait for as long
                                 // as it is open.
-                                let awaiting_permission = notification.method.as_deref()
-                                    == Some("session/request_permission");
                                 if awaiting_permission {
                                     idle_activity.begin_agent_permission_wait();
                                 }
@@ -2170,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_permission_handling_requires_active_session() {
+    fn permission_handling_requires_matching_session() {
         let current = incoming(serde_json::json!({
             "id": 8,
             "method": "session/request_permission",
@@ -2181,9 +2189,24 @@ mod tests {
             "method": "session/request_permission",
             "params": {"sessionId": "session-2"}
         }));
+        let missing_session = incoming(serde_json::json!({
+            "id": 10,
+            "method": "session/request_permission",
+            "params": {}
+        }));
+        let malformed_session = incoming(serde_json::json!({
+            "id": 11,
+            "method": "session/request_permission",
+            "params": {"sessionId": 42}
+        }));
 
-        assert!(is_current_prompt_permission(&current, "session-1"));
-        assert!(!is_current_prompt_permission(&cross_session, "session-1"));
+        assert!(is_permission_for_session(&current, "session-1"));
+        assert!(!is_permission_for_session(&cross_session, "session-1"));
+        assert!(!is_permission_for_session(&missing_session, "session-1"));
+        assert!(!is_permission_for_session(
+            &malformed_session,
+            "session-1"
+        ));
     }
 
     #[test]
