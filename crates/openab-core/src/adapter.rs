@@ -534,6 +534,41 @@ async fn handle_permission_request(
     true
 }
 
+fn is_current_prompt_activity(
+    message: &JsonRpcMessage,
+    request_id: u64,
+    session_id: &str,
+) -> bool {
+    if message.id == Some(request_id) {
+        return true;
+    }
+
+    if !message_matches_session(message, session_id) {
+        return false;
+    }
+
+    match message.method.as_deref() {
+        Some("session/update") => classify_notification(message).is_some(),
+        Some("session/request_permission") => message.id.is_some(),
+        _ => false,
+    }
+}
+
+fn message_matches_session(message: &JsonRpcMessage, session_id: &str) -> bool {
+    message
+        .params
+        .as_ref()
+        .and_then(|params| params.get("sessionId"))
+        .and_then(|value| value.as_str())
+        == Some(session_id)
+}
+
+fn is_current_prompt_permission(message: &JsonRpcMessage, session_id: &str) -> bool {
+    message.method.as_deref() == Some("session/request_permission")
+        && message.id.is_some()
+        && message_matches_session(message, session_id)
+}
+
 // --- AdapterRouter ---
 
 /// Shared logic for routing messages to ACP agents, managing sessions,
@@ -542,7 +577,7 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
-    prompt_hard_timeout: std::time::Duration,
+    prompt_inactivity_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
     /// Workspace aliases from `[workspace.aliases]` config.
@@ -570,15 +605,17 @@ impl AdapterRouter {
                 liveness_check_secs,
                 prompt_hard_timeout_secs,
                 "pool.liveness_check_secs >= pool.prompt_hard_timeout_secs; \
-                 the hard ceiling will only fire after the next liveness tick \
-                 and may be effectively bypassed. Lower liveness_check_secs."
+                 inactivity will only be detected after the next liveness tick. \
+                 Lower liveness_check_secs."
             );
         }
         Self {
             pool,
             reactions_config,
             table_mode,
-            prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
+            prompt_inactivity_timeout: std::time::Duration::from_secs(
+                prompt_hard_timeout_secs,
+            ),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             workspace_aliases,
             bot_home,
@@ -828,7 +865,7 @@ impl AdapterRouter {
         // arrival order with the tool/thought updates forwarded on the same path.
         // The gateway diffs successive snapshots into append-only chunks.
         let acp_direct = streaming && platform_is_acp;
-        let prompt_hard_timeout = self.prompt_hard_timeout;
+        let prompt_inactivity_timeout = self.prompt_inactivity_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
         // The prompt receiver below owns delivery while the request is active.
@@ -848,6 +885,10 @@ impl AdapterRouter {
                     let permission_relay_required =
                         adapter.agent_permission_relay_required(&thread_channel)?;
 
+                    let prompt_session_id = conn
+                        .acp_session_id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("no session"))?;
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
@@ -982,15 +1023,28 @@ impl AdapterRouter {
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
-                    // messages and abandons cleanly on dead agent / hard ceiling
-                    // so late responses cannot leak into the next prompt.
+                    // messages and abandons cleanly on dead or inactive agents
+                    // so late responses cannot leak into the next prompt. A long
+                    // turn may run indefinitely while it keeps producing ACP
+                    // updates; duration by itself is not a failure signal.
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
-                    let prompt_start = tokio::time::Instant::now();
+                    let mut last_activity = tokio::time::Instant::now();
+                    let prompt_activity = conn.activity_handle();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
-                                Some(n) => n,
+                                Some(n) => {
+                                    if is_current_prompt_activity(
+                                        &n,
+                                        request_id,
+                                        &prompt_session_id,
+                                    ) {
+                                        last_activity = tokio::time::Instant::now();
+                                        prompt_activity.touch();
+                                    }
+                                    n
+                                },
                                 // Reader saw EOF: the agent's stdout closed. A *successful*
                                 // turn is always signalled by the id-bearing JSON-RPC response to
                                 // `session/prompt`, which breaks the loop at the id branch below
@@ -1023,10 +1077,10 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
-                                if prompt_start.elapsed() > prompt_hard_timeout {
+                                if last_activity.elapsed() > prompt_inactivity_timeout {
                                     response_error = Some(format!(
-                                        "Agent exceeded hard timeout ({}s)",
-                                        prompt_hard_timeout.as_secs(),
+                                        "Agent exceeded inactivity timeout ({}s)",
+                                        prompt_inactivity_timeout.as_secs(),
                                     ));
                                     conn.abandon_request(request_id).await;
                                     break;
@@ -1034,15 +1088,34 @@ impl AdapterRouter {
                                 continue;
                             }
                         };
-                        if handle_permission_request(
+                        let permission_request = notification.method.as_deref()
+                            == Some("session/request_permission");
+                        let awaiting_permission =
+                            is_current_prompt_permission(&notification, &prompt_session_id);
+                        if permission_request && !awaiting_permission {
+                            warn!(
+                                "ignoring permission request not scoped to the active session"
+                            );
+                            continue;
+                        }
+                        if awaiting_permission {
+                            prompt_activity.begin_prompt_permission_wait();
+                        }
+                        let handled_permission = handle_permission_request(
                             &adapter,
                             &thread_channel,
                             &permission_responder,
                             permission_relay_required,
                             &notification,
                         )
-                        .await
-                        {
+                        .await;
+                        if awaiting_permission {
+                            prompt_activity.end_prompt_permission_wait();
+                            // Human approval time is not agent inactivity.
+                            last_activity = tokio::time::Instant::now();
+                            prompt_activity.touch();
+                        }
+                        if handled_permission {
                             continue;
                         }
                         if let Some(notification_id) = notification.id {
@@ -2017,6 +2090,101 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn incoming(value: serde_json::Value) -> JsonRpcMessage {
+        serde_json::from_value(value).expect("valid JSON-RPC fixture")
+    }
+
+    #[test]
+    fn prompt_activity_accepts_current_response_and_known_updates() {
+        assert!(is_current_prompt_activity(
+            &incoming(serde_json::json!({"id": 7, "result": {}})),
+            7,
+            "session-1",
+        ));
+        assert!(is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {"sessionUpdate": "agent_thought_chunk"}
+                }
+            })),
+            7,
+            "session-1",
+        ));
+        assert!(is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "id": 8,
+                "method": "session/request_permission",
+                "params": {"sessionId": "session-1"}
+            })),
+            7,
+            "session-1",
+        ));
+    }
+
+    #[test]
+    fn prompt_activity_rejects_stale_and_arbitrary_messages() {
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({"id": 6, "result": {}})),
+            7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({"method": "agent/ping", "params": {}})),
+            7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {"sessionUpdate": "unknown"}
+                }
+            })),
+            7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-2",
+                    "update": {"sessionUpdate": "agent_thought_chunk"}
+                }
+            })),
+            7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "id": 8,
+                "method": "session/request_permission",
+                "params": {"sessionId": "session-2"}
+            })),
+            7,
+            "session-1",
+        ));
+    }
+
+    #[test]
+    fn prompt_permission_handling_requires_active_session() {
+        let current = incoming(serde_json::json!({
+            "id": 8,
+            "method": "session/request_permission",
+            "params": {"sessionId": "session-1"}
+        }));
+        let cross_session = incoming(serde_json::json!({
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {"sessionId": "session-2"}
+        }));
+
+        assert!(is_current_prompt_permission(&current, "session-1"));
+        assert!(!is_current_prompt_permission(&cross_session, "session-1"));
+    }
 
     #[test]
     fn agent_relay_interrupted_update_is_tagged_and_carries_a_reason() {

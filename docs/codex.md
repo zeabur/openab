@@ -399,7 +399,7 @@ approvals_reviewer = "auto_review"
 > `approvals_reviewer = "user"` on an OpenAB deployment.** Without auto-review,
 > `on-request` pauses each tool call to wait for an interactive human approval,
 > and OpenAB agents have no terminal attached — every tool call hangs in
-> `in_progress` until openab's 1800 s hard timeout fires. Use
+> `in_progress` until OpenAB's inactivity timeout fires. Use
 > `approvals_reviewer = "auto_review"` (recommended, see
 > [§Direct Codex CLI Approval Policy](#direct-codex-cli-approval-policy--auto-review)) or
 > `approval_policy = "never"` for trusted and already-isolated pods (`"never"`

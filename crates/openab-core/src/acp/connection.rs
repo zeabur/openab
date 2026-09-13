@@ -127,6 +127,9 @@ pub struct SessionActivity {
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
     prompt_in_flight: AtomicBool,
+    /// Milliseconds since process boot when a client prompt began waiting on a
+    /// human permission decision, or 0 when no wait is open.
+    prompt_permission_wait_ms: AtomicU64,
     /// Milliseconds since process boot (monotonic) of the last update forwarded
     /// by the agent-initiated relay, or 0 before it forwards its first.
     ///
@@ -160,6 +163,7 @@ impl SessionActivity {
         Self {
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
+            prompt_permission_wait_ms: AtomicU64::new(0),
             agent_relay_ms: AtomicU64::new(0),
             agent_permission_wait_ms: AtomicU64::new(0),
         }
@@ -182,6 +186,9 @@ impl SessionActivity {
 
     pub fn set_in_flight(&self, in_flight: bool) {
         self.prompt_in_flight.store(in_flight, Ordering::Release);
+        if !in_flight {
+            self.prompt_permission_wait_ms.store(0, Ordering::Release);
+        }
     }
 
     /// Milliseconds since process boot of the last observed activity.
@@ -197,6 +204,26 @@ impl SessionActivity {
 
     pub fn in_flight(&self) -> bool {
         self.prompt_in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn begin_prompt_permission_wait(&self) {
+        let _ = self.prompt_permission_wait_ms.compare_exchange(
+            0,
+            Self::now_ms().max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn end_prompt_permission_wait(&self) {
+        self.prompt_permission_wait_ms.store(0, Ordering::Release);
+    }
+
+    pub fn prompt_permission_wait_age(&self) -> Option<std::time::Duration> {
+        let started = self.prompt_permission_wait_ms.load(Ordering::Acquire);
+
+        (started != 0)
+            .then(|| std::time::Duration::from_millis(Self::now_ms().saturating_sub(started)))
     }
 
     /// Record that the agent-initiated relay just forwarded an update.
@@ -828,6 +855,7 @@ impl AcpConnection {
     ) -> Result<(mpsc::Receiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.activity.touch();
+        self.activity.end_prompt_permission_wait();
         self.activity.set_in_flight(true);
 
         let session_id = self
@@ -1569,5 +1597,18 @@ mod reader_loop_tests {
         assert!(activity.in_flight());
         activity.set_in_flight(false);
         assert!(!activity.in_flight());
+    }
+
+    #[test]
+    fn session_activity_prompt_permission_wait_round_trips() {
+        let activity = SessionActivity::new();
+        assert!(activity.prompt_permission_wait_age().is_none());
+        activity.begin_prompt_permission_wait();
+        assert!(activity.prompt_permission_wait_age().is_some());
+        activity.end_prompt_permission_wait();
+        assert!(activity.prompt_permission_wait_age().is_none());
+        activity.begin_prompt_permission_wait();
+        activity.set_in_flight(false);
+        assert!(activity.prompt_permission_wait_age().is_none());
     }
 }

@@ -419,7 +419,9 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
-| `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
+| `prompt_hard_timeout_secs` | u64 | `1800` | Maximum inactivity during one prompt. Valid current-turn agent updates reset the timer, so productive turns may run longer; human permission waits are excluded until the hung-session threshold. The legacy key name is retained for config compatibility. |
+| `liveness_check_secs` | u64 | `30` | Polling cadence for detecting a dead or inactive agent. |
+| `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` of inactivity before a session stuck with its connection mutex held is force-evicted. |
 | `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
 
 **Example** — force Devin to bypass mode and use a specific model:
