@@ -534,9 +534,23 @@ async fn handle_permission_request(
     true
 }
 
-fn is_current_prompt_activity(message: &JsonRpcMessage, request_id: u64) -> bool {
+fn is_current_prompt_activity(
+    message: &JsonRpcMessage,
+    request_id: u64,
+    session_id: &str,
+) -> bool {
     if message.id == Some(request_id) {
         return true;
+    }
+
+    if message
+        .params
+        .as_ref()
+        .and_then(|params| params.get("sessionId"))
+        .and_then(|value| value.as_str())
+        != Some(session_id)
+    {
+        return false;
     }
 
     match message.method.as_deref() {
@@ -862,6 +876,10 @@ impl AdapterRouter {
                     let permission_relay_required =
                         adapter.agent_permission_relay_required(&thread_channel)?;
 
+                    let prompt_session_id = conn
+                        .acp_session_id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("no session"))?;
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
@@ -1008,7 +1026,11 @@ impl AdapterRouter {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => {
-                                    if is_current_prompt_activity(&n, request_id) {
+                                    if is_current_prompt_activity(
+                                        &n,
+                                        request_id,
+                                        &prompt_session_id,
+                                    ) {
                                         last_activity = tokio::time::Instant::now();
                                         prompt_activity.touch();
                                     }
@@ -2061,21 +2083,27 @@ mod tests {
         assert!(is_current_prompt_activity(
             &incoming(serde_json::json!({"id": 7, "result": {}})),
             7,
+            "session-1",
         ));
         assert!(is_current_prompt_activity(
             &incoming(serde_json::json!({
                 "method": "session/update",
-                "params": {"update": {"sessionUpdate": "agent_thought_chunk"}}
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {"sessionUpdate": "agent_thought_chunk"}
+                }
             })),
             7,
+            "session-1",
         ));
         assert!(is_current_prompt_activity(
             &incoming(serde_json::json!({
                 "id": 8,
                 "method": "session/request_permission",
-                "params": {}
+                "params": {"sessionId": "session-1"}
             })),
             7,
+            "session-1",
         ));
     }
 
@@ -2084,17 +2112,43 @@ mod tests {
         assert!(!is_current_prompt_activity(
             &incoming(serde_json::json!({"id": 6, "result": {}})),
             7,
+            "session-1",
         ));
         assert!(!is_current_prompt_activity(
             &incoming(serde_json::json!({"method": "agent/ping", "params": {}})),
             7,
+            "session-1",
         ));
         assert!(!is_current_prompt_activity(
             &incoming(serde_json::json!({
                 "method": "session/update",
-                "params": {"update": {"sessionUpdate": "unknown"}}
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {"sessionUpdate": "unknown"}
+                }
             })),
             7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-2",
+                    "update": {"sessionUpdate": "agent_thought_chunk"}
+                }
+            })),
+            7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "id": 8,
+                "method": "session/request_permission",
+                "params": {"sessionId": "session-2"}
+            })),
+            7,
+            "session-1",
         ));
     }
 
