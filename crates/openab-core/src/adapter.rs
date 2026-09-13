@@ -543,13 +543,7 @@ fn is_current_prompt_activity(
         return true;
     }
 
-    if message
-        .params
-        .as_ref()
-        .and_then(|params| params.get("sessionId"))
-        .and_then(|value| value.as_str())
-        != Some(session_id)
-    {
+    if !message_matches_session(message, session_id) {
         return false;
     }
 
@@ -558,6 +552,21 @@ fn is_current_prompt_activity(
         Some("session/request_permission") => message.id.is_some(),
         _ => false,
     }
+}
+
+fn message_matches_session(message: &JsonRpcMessage, session_id: &str) -> bool {
+    message
+        .params
+        .as_ref()
+        .and_then(|params| params.get("sessionId"))
+        .and_then(|value| value.as_str())
+        == Some(session_id)
+}
+
+fn is_current_prompt_permission(message: &JsonRpcMessage, session_id: &str) -> bool {
+    message.method.as_deref() == Some("session/request_permission")
+        && message.id.is_some()
+        && message_matches_session(message, session_id)
 }
 
 // --- AdapterRouter ---
@@ -1079,8 +1088,16 @@ impl AdapterRouter {
                                 continue;
                             }
                         };
-                        let awaiting_permission = notification.method.as_deref()
+                        let permission_request = notification.method.as_deref()
                             == Some("session/request_permission");
+                        let awaiting_permission =
+                            is_current_prompt_permission(&notification, &prompt_session_id);
+                        if permission_request && !awaiting_permission {
+                            warn!(
+                                "ignoring permission request not scoped to the active session"
+                            );
+                            continue;
+                        }
                         if awaiting_permission {
                             prompt_activity.begin_prompt_permission_wait();
                         }
@@ -2150,6 +2167,23 @@ mod tests {
             7,
             "session-1",
         ));
+    }
+
+    #[test]
+    fn prompt_permission_handling_requires_active_session() {
+        let current = incoming(serde_json::json!({
+            "id": 8,
+            "method": "session/request_permission",
+            "params": {"sessionId": "session-1"}
+        }));
+        let cross_session = incoming(serde_json::json!({
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {"sessionId": "session-2"}
+        }));
+
+        assert!(is_current_prompt_permission(&current, "session-1"));
+        assert!(!is_current_prompt_permission(&cross_session, "session-1"));
     }
 
     #[test]
