@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::connection::{
-    build_permission_response, PermissionResponder, ACP_NOTIFICATION_CAPACITY,
+    build_permission_response, PermissionResponder, SessionActivity, ACP_NOTIFICATION_CAPACITY,
 };
 use crate::acp::protocol::JsonRpcMessage;
 use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
@@ -539,6 +539,9 @@ fn is_current_prompt_activity(
     request_id: u64,
     session_id: &str,
 ) -> bool {
+    if message.method.as_deref() == Some("session/request_permission") {
+        return is_permission_for_session(message, session_id);
+    }
     if message.id == Some(request_id) {
         return true;
     }
@@ -567,6 +570,28 @@ fn is_permission_for_session(message: &JsonRpcMessage, session_id: &str) -> bool
     message.method.as_deref() == Some("session/request_permission")
         && message.id.is_some()
         && message_matches_session(message, session_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IdlePermissionRoute {
+    NotPermission,
+    Reject,
+    Handle,
+}
+
+fn route_idle_permission(
+    message: &JsonRpcMessage,
+    session_id: &str,
+    activity: &SessionActivity,
+) -> IdlePermissionRoute {
+    if message.method.as_deref() != Some("session/request_permission") {
+        return IdlePermissionRoute::NotPermission;
+    }
+    if !is_permission_for_session(message, session_id) {
+        return IdlePermissionRoute::Reject;
+    }
+    activity.begin_agent_permission_wait();
+    IdlePermissionRoute::Handle
 }
 
 // --- AdapterRouter ---
@@ -1312,16 +1337,19 @@ impl AdapterRouter {
                         tokio::spawn(async move {
                             let mut relay_saw_traffic = false;
                             while let Some(notification) = idle_rx.recv().await {
-                                let permission_request = notification.method.as_deref()
-                                    == Some("session/request_permission");
-                                let awaiting_permission =
-                                    is_permission_for_session(&notification, &prompt_session_id);
-                                if permission_request && !awaiting_permission {
+                                let permission_route = route_idle_permission(
+                                    &notification,
+                                    &prompt_session_id,
+                                    &idle_activity,
+                                );
+                                if permission_route == IdlePermissionRoute::Reject {
                                     warn!(
                                         "ignoring idle permission request not scoped to the session"
                                     );
                                     continue;
                                 }
+                                let awaiting_permission =
+                                    permission_route == IdlePermissionRoute::Handle;
                                 // Everything arriving here is agent-initiated turn
                                 // traffic — permission requests included, since the
                                 // idle subscriber only carries what reaches us after
@@ -1337,9 +1365,6 @@ impl AdapterRouter {
                                 // the session would look idle exactly while it is
                                 // waiting to be approved. Mark the wait for as long
                                 // as it is open.
-                                if awaiting_permission {
-                                    idle_activity.begin_agent_permission_wait();
-                                }
                                 let handled = handle_permission_request(
                                     &idle_adapter,
                                     &idle_channel,
@@ -2140,6 +2165,15 @@ mod tests {
             "session-1",
         ));
         assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "id": 7,
+                "method": "session/request_permission",
+                "params": {"sessionId": "session-2"}
+            })),
+            7,
+            "session-1",
+        ));
+        assert!(!is_current_prompt_activity(
             &incoming(serde_json::json!({"method": "agent/ping", "params": {}})),
             7,
             "session-1",
@@ -2207,6 +2241,48 @@ mod tests {
             &malformed_session,
             "session-1"
         ));
+    }
+
+    #[test]
+    fn idle_permission_route_rejects_before_wait_state_mutation() {
+        let activity = SessionActivity::new();
+        let cross_session = incoming(serde_json::json!({
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {"sessionId": "session-2"}
+        }));
+        let malformed_session = incoming(serde_json::json!({
+            "id": 10,
+            "method": "session/request_permission",
+            "params": {"sessionId": 42}
+        }));
+
+        assert_eq!(
+            route_idle_permission(&cross_session, "session-1", &activity),
+            IdlePermissionRoute::Reject
+        );
+        assert!(activity.agent_permission_wait_age().is_none());
+        assert_eq!(
+            route_idle_permission(&malformed_session, "session-1", &activity),
+            IdlePermissionRoute::Reject
+        );
+        assert!(activity.agent_permission_wait_age().is_none());
+    }
+
+    #[test]
+    fn idle_permission_route_opens_wait_only_for_matching_session() {
+        let activity = SessionActivity::new();
+        let current = incoming(serde_json::json!({
+            "id": 8,
+            "method": "session/request_permission",
+            "params": {"sessionId": "session-1"}
+        }));
+
+        assert_eq!(
+            route_idle_permission(&current, "session-1", &activity),
+            IdlePermissionRoute::Handle
+        );
+        assert!(activity.agent_permission_wait_age().is_some());
     }
 
     #[test]
