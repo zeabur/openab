@@ -1724,7 +1724,8 @@ pub struct PoolConfig {
     /// Once the agent is inactive for this long, the broker abandons the
     /// request, sends `session/cancel`, and clears the pending entry so late
     /// responses cannot leak into the next prompt's subscriber. Time spent
-    /// awaiting a human permission decision is excluded.
+    /// awaiting a human permission decision is excluded until the pool's hung
+    /// threshold, so an abandoned decision cannot pin a session forever.
     ///
     /// Precision: checked every `liveness_check_secs`, so actual cutoff is
     /// ±`liveness_check_secs` from this value.

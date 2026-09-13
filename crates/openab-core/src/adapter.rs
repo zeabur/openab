@@ -534,6 +534,18 @@ async fn handle_permission_request(
     true
 }
 
+fn is_current_prompt_activity(message: &JsonRpcMessage, request_id: u64) -> bool {
+    if message.id == Some(request_id) {
+        return true;
+    }
+
+    match message.method.as_deref() {
+        Some("session/update") => classify_notification(message).is_some(),
+        Some("session/request_permission") => message.id.is_some(),
+        _ => false,
+    }
+}
+
 // --- AdapterRouter ---
 
 /// Shared logic for routing messages to ACP agents, managing sessions,
@@ -996,8 +1008,10 @@ impl AdapterRouter {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => {
-                                    last_activity = tokio::time::Instant::now();
-                                    prompt_activity.touch();
+                                    if is_current_prompt_activity(&n, request_id) {
+                                        last_activity = tokio::time::Instant::now();
+                                        prompt_activity.touch();
+                                    }
                                     n
                                 },
                                 // Reader saw EOF: the agent's stdout closed. A *successful*
@@ -2037,6 +2051,52 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn incoming(value: serde_json::Value) -> JsonRpcMessage {
+        serde_json::from_value(value).expect("valid JSON-RPC fixture")
+    }
+
+    #[test]
+    fn prompt_activity_accepts_current_response_and_known_updates() {
+        assert!(is_current_prompt_activity(
+            &incoming(serde_json::json!({"id": 7, "result": {}})),
+            7,
+        ));
+        assert!(is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "agent_thought_chunk"}}
+            })),
+            7,
+        ));
+        assert!(is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "id": 8,
+                "method": "session/request_permission",
+                "params": {}
+            })),
+            7,
+        ));
+    }
+
+    #[test]
+    fn prompt_activity_rejects_stale_and_arbitrary_messages() {
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({"id": 6, "result": {}})),
+            7,
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({"method": "agent/ping", "params": {}})),
+            7,
+        ));
+        assert!(!is_current_prompt_activity(
+            &incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "unknown"}}
+            })),
+            7,
+        ));
+    }
 
     #[test]
     fn agent_relay_interrupted_update_is_tagged_and_carries_a_reason() {
