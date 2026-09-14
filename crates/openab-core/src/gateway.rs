@@ -117,6 +117,8 @@ struct GatewayEvent {
     #[allow(dead_code)]
     timestamp: String,
     platform: String,
+    #[serde(default = "default_gateway_event_type")]
+    event_type: String,
     channel: GwChannel,
     sender: GwSender,
     content: GwContent,
@@ -124,6 +126,10 @@ struct GatewayEvent {
     #[allow(dead_code)]
     mentions: Vec<String>,
     message_id: String,
+}
+
+fn default_gateway_event_type() -> String {
+    "message".into()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -267,6 +273,7 @@ impl GatewayAdapter {
         channel: &ChannelRef,
         content: &str,
         quote_message_id: Option<&str>,
+        stop_reason: Option<&str>,
     ) -> Result<MessageRef> {
         let req_id = if self.streaming {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
@@ -292,7 +299,7 @@ impl GatewayAdapter {
                 content_type: "text".into(),
                 text: content.into(),
             },
-            command: None,
+            command: stop_reason.map(|reason| format!("finish_turn:{reason}")),
             request_id: req_id.clone(),
             quote_message_id: quote_message_id.map(|s| s.to_string()),
         };
@@ -509,7 +516,16 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        self.send_gateway_reply(channel, content, None).await
+        self.send_gateway_reply(channel, content, None, None).await
+    }
+
+    async fn send_terminal_message(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        stop_reason: Option<&str>,
+    ) -> Result<MessageRef> {
+        self.send_gateway_reply(channel, content, None, stop_reason).await
     }
 
     async fn send_message_with_reply(
@@ -518,7 +534,7 @@ impl ChatAdapter for GatewayAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
-        self.send_gateway_reply(channel, content, Some(reply_to_message_id)).await
+        self.send_gateway_reply(channel, content, Some(reply_to_message_id), None).await
     }
 
     async fn create_thread(
@@ -887,6 +903,9 @@ pub async fn run_gateway_adapter(
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
+                                    if route_gateway_control_event(&router, &event) {
+                                        continue;
+                                    }
                                     if should_skip_event(&event, &filter) {
                                         continue;
                                     }
@@ -1360,12 +1379,53 @@ fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEve
     }
 }
 
+/// Handle authenticated gateway control-plane traffic before chat filtering.
+/// The ACP server only emits this event for a session it already owns, so
+/// treating its synthetic sender as user content would let mention/allowlist
+/// policy prevent the Stop button from reaching the runtime.
+fn route_gateway_control_event(router: &crate::adapter::AdapterRouter, event: &GatewayEvent) -> bool {
+    if event.platform != "acp" || event.event_type != "session_cancel" {
+        return false;
+    }
+    let thread_id = event
+        .channel
+        .thread_id
+        .as_deref()
+        .unwrap_or(&event.channel.id);
+    let thread_key = format!("{}:{}", event.platform, thread_id);
+    let pool = router.pool().clone();
+    tokio::spawn(async move {
+        // Prompt dispatch and its immediately-following cancel run in separate
+        // tasks. Give the prompt a bounded window to publish its lock-free
+        // runtime cancel handle instead of losing a fast Stop click.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match pool.cancel_session(&thread_key).await {
+                Ok(()) => break,
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    tracing::trace!(?error, "ACP runtime cancel handle not ready; retrying");
+                }
+                Err(error) => {
+                    warn!(?error, "gateway ACP session cancel failed");
+                    break;
+                }
+            }
+        }
+    });
+    true
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
 ) -> anyhow::Result<bool> {
     let event: GatewayEvent = serde_json::from_str(event_json)
         .map_err(|e| anyhow::anyhow!("invalid gateway event JSON: {e}"))?;
+
+    if route_gateway_control_event(&ctx.router, &event) {
+        return Ok(false);
+    }
 
     // Structural gating (bot filter + @mention) stays in should_skip_event.
     // L2 (channel) + L3 (identity) are now enforced by the shared ingress gate

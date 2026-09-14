@@ -126,6 +126,26 @@ while IFS= read -r line; do
 done
 "##;
 
+const LATE_TOOL_AGENT: &str = r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"fake","version":"0"},"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_fake"}}\n' "$id"
+      ;;
+    *'"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"before"}}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"tool_call","toolCallId":"late","title":"watch checks","status":"in_progress"}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"tool_call_update","toolCallId":"late","title":"watch checks","status":"completed"}}}\n'
+      ;;
+  esac
+done
+"##;
+
 struct Fixture {
     router: AdapterRouter,
     channel: ChannelRef,
@@ -133,6 +153,10 @@ struct Fixture {
 }
 
 async fn setup(platform: &str, thread_key: &str) -> Fixture {
+    setup_with_agent(platform, thread_key, FAKE_AGENT).await
+}
+
+async fn setup_with_agent(platform: &str, thread_key: &str, fake_agent: &str) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Isolate ~/.openab persistence (thread_map.json / session_meta.json).
     std::env::set_var("HOME", tmp.path());
@@ -140,7 +164,7 @@ async fn setup(platform: &str, thread_key: &str) -> Fixture {
     std::env::remove_var("OPENAB_STREAM_EDIT_INTERVAL_MS");
 
     let script = tmp.path().join("fake_agent.sh");
-    std::fs::write(&script, FAKE_AGENT).expect("write fake agent");
+    std::fs::write(&script, fake_agent).expect("write fake agent");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -181,6 +205,26 @@ async fn setup(platform: &str, thread_key: &str) -> Fixture {
         channel,
         _tmp: tmp,
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_turn_waits_for_tool_that_finishes_after_prompt_response() {
+    let _guard = env_lock();
+    let fx = setup_with_agent("acp", "acp:late-tool", LATE_TOOL_AGENT).await;
+    let recorder = Arc::new(RecordingAdapter::new(false));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    run_turn(&fx, &adapter, "acp:late-tool").await;
+
+    assert_eq!(
+        recorder.calls(),
+        vec![
+            Call::Edit { message_id: "draft".into(), content: "before".into() },
+            Call::Update("tool_call".into()),
+            Call::Update("tool_call_update".into()),
+            Call::Send("before".into()),
+        ],
+        "the model response must not split a still-running prompt-owned tool into an autonomous turn"
+    );
 }
 
 async fn run_turn(fx: &Fixture, adapter: &Arc<dyn ChatAdapter>, thread_key: &str) {

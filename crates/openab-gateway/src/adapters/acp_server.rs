@@ -326,10 +326,9 @@ struct AcpSession {
     channel_id: String,
     /// Whether a prompt is currently in-flight for this session
     busy: bool,
-    /// Cancel signal for the in-flight prompt, if any. `session/cancel` fires
-    /// this so the streaming task stops gracefully and returns `stopReason:
-    /// "cancelled"` to the prompt's own request id (rather than hard-aborting
-    /// the task and orphaning that id).
+    /// Local interrupt signal for the in-flight prompt, if any. Client
+    /// `session/cancel` bypasses this and waits for the inner runtime's terminal
+    /// response; this handle remains available for connection-local teardown.
     cancel: Option<Arc<tokio::sync::Notify>>,
     /// Client-declared `"type":"http"` mcpServers entries (raw JSON), forwarded
     /// verbatim to core on each prompt. Empty unless OPENAB_ACP_MCP_SERVERS is on.
@@ -467,8 +466,8 @@ pub enum ReplyChunk {
     /// Raw agent-side `session/update` payload (thought chunk, tool_call, …)
     /// relayed verbatim to the ACP client.
     Update(serde_json::Value),
-    /// Agent finished responding
-    Done,
+    /// Agent finished responding, with the inner runtime's terminal reason.
+    Done(Option<crate::adapters::acp_schema::StopReason>),
 }
 
 /// One active turn's reply sink plus the originating `GatewayEvent` id used to fence
@@ -2088,10 +2087,16 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 prompt_tasks.push(handle);
             }
             "session/cancel" => {
-                // Notification form fires the cancel signal (no response); a request-shaped
-                // cancel is rejected -32600 rather than acked with an empty success (R17-F3c).
-                if let Some(resp) =
-                    handle_session_cancel(&sessions, id, req.params.as_ref(), is_notification).await
+                // Notification form forwards runtime control (no response); a request-shaped
+                // cancel is rejected -32600 rather than acked with empty success (R17-F3c).
+                if let Some(resp) = handle_session_cancel(
+                    &sessions,
+                    &state.event_tx,
+                    id,
+                    req.params.as_ref(),
+                    is_notification,
+                )
+                .await
                 {
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 }
@@ -2435,14 +2440,13 @@ async fn handle_session_resume(
     )
 }
 
-/// Handle `session/cancel`. Per ACP it is a one-way NOTIFICATION: the notification form
-/// (no `id`) fires the session's cancel signal — the in-flight prompt observes it, cleans
-/// up, and returns `stopReason:"cancelled"` to the prompt's own request id — and produces
-/// no response (`None`). A request-shaped cancel (with an `id`) is a protocol violation: it
-/// is rejected with -32600 invalid request and does NOT fire the signal, rather than being
-/// acknowledged with an empty success frame (R17-F3c).
+/// Handle `session/cancel`. Per ACP it is a one-way notification. The notification
+/// forwards a control event to core; only the inner runtime's terminal response
+/// completes the client-facing prompt, preserving one execution-state authority.
+/// A request-shaped cancel is rejected with -32600 (R17-F3c).
 async fn handle_session_cancel(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
+    event_tx: &tokio::sync::broadcast::Sender<String>,
     id: Value,
     params: Option<&Value>,
     is_notification: bool,
@@ -2456,9 +2460,42 @@ async fn handle_session_cancel(
     }
     let sess_key = params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str());
     if let Some(k) = sess_key {
-        let notify = sessions.lock().await.get(k).and_then(|s| s.cancel.clone());
-        if let Some(n) = notify {
-            n.notify_one();
+        let channel_id = sessions
+            .lock()
+            .await
+            .get(k)
+            .map(|session| session.channel_id.clone());
+        if let Some(channel_id) = channel_id {
+            let mut event = GatewayEvent::new(
+                "acp",
+                ChannelInfo {
+                    id: channel_id,
+                    channel_type: "dm".into(),
+                    thread_id: None,
+                    mcp_servers: Vec::new(),
+                    session_meta: None,
+                },
+                SenderInfo {
+                    id: "acp_client".into(),
+                    name: "acp_client".into(),
+                    display_name: "ACP Client".into(),
+                    is_bot: false,
+                },
+                "",
+                &format!("acpcancel_{}", Uuid::new_v4()),
+                Vec::new(),
+            );
+            event.event_type = "session_cancel".into();
+            match serde_json::to_string(&event) {
+                Ok(payload) => {
+                    if event_tx.send(payload).is_err() {
+                        warn!(session = %redact_id(k), "ACP: cancel could not reach agent backend");
+                    }
+                }
+                Err(error) => {
+                    warn!(session = %redact_id(k), ?error, "ACP: failed to serialize cancel event");
+                }
+            }
         }
     }
     None
@@ -2682,7 +2719,8 @@ async fn handle_session_prompt(
 
     loop {
         tokio::select! {
-            // session/cancel fired — stop gracefully.
+            // Reserved for an explicit local interrupt. Client session/cancel
+            // is completed by ReplyChunk::Done(runtime_stop_reason) below.
             _ = cancel.notified() => {
                 stop_reason = crate::adapters::acp_schema::StopReason::Cancelled;
                 break;
@@ -2725,7 +2763,13 @@ async fn handle_session_prompt(
                         };
                         let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
                     }
-                    Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
+                    Ok(Some(ReplyChunk::Done(runtime_stop_reason))) => {
+                        if let Some(reason) = runtime_stop_reason {
+                            stop_reason = reason;
+                        }
+                        break;
+                    }
+                    Ok(None) => break,
                     Err(_) => {
                         warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
                         timed_out = true;
@@ -2909,11 +2953,20 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             match reply.command.as_deref() {
                 None | Some("send_message") => {
                     let _ = tx.send(ReplyChunk::Text(full_text));
-                    let _ = tx.send(ReplyChunk::Done);
+                    let _ = tx.send(ReplyChunk::Done(None));
                     // End only this turn's sink. The registry entry also owns
                     // the connection-lifetime output path used by autonomous
                     // session updates, so removing the whole entry here drops
                     // every update emitted between prompts.
+                    remove_reply_sink_if_owner(registry, key, &turn_id);
+                    return;
+                }
+                Some(command) if command.starts_with("finish_turn:") => {
+                    let reason = command
+                        .strip_prefix("finish_turn:")
+                        .and_then(|value| value.parse().ok());
+                    let _ = tx.send(ReplyChunk::Text(full_text));
+                    let _ = tx.send(ReplyChunk::Done(reason));
                     remove_reply_sink_if_owner(registry, key, &turn_id);
                     return;
                 }
@@ -2948,6 +3001,9 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             }
         }
         None | Some("send_message") => unreachable!("terminal replies return above"),
+        Some(command) if command.starts_with("finish_turn:") => {
+            unreachable!("terminal replies return above")
+        }
         Some("add_reaction") | Some("remove_reaction") => {
             // Reactions are agent state indicators — could map to notifications later
         }
@@ -4753,7 +4809,7 @@ mod acp_review_fixes {
         .await;
 
         assert!(matches!(turn_rx.try_recv(), Ok(ReplyChunk::Text(text)) if text == "done"));
-        assert!(matches!(turn_rx.try_recv(), Ok(ReplyChunk::Done)));
+        assert!(matches!(turn_rx.try_recv(), Ok(ReplyChunk::Done(None))));
         {
             let map = registry.lock().unwrap();
             let sink = map
@@ -5410,8 +5466,9 @@ mod acp_review_fixes {
     #[tokio::test]
     async fn cancel_as_request_is_rejected_not_empty_success() {
         let sessions = sessions_map();
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<String>(4);
         let params = json!({"sessionId": format!("sess_{}", Uuid::new_v4())});
-        let resp = handle_session_cancel(&sessions, json!(42), Some(&params), false)
+        let resp = handle_session_cancel(&sessions, &event_tx, json!(42), Some(&params), false)
             .await
             .expect("a request-shaped cancel must produce a response, not silence");
         let v = serde_json::to_value(&resp).unwrap();
@@ -5423,11 +5480,12 @@ mod acp_review_fixes {
         );
     }
 
-    // R17-F3c — the notification form (no id) still fires the session's cancel signal and
-    // returns no response frame, unchanged.
+    // The notification is control-plane input. It must reach core without
+    // locally completing the outer prompt.
     #[tokio::test]
-    async fn cancel_as_notification_fires_signal_and_returns_no_response() {
+    async fn cancel_as_notification_only_forwards_to_runtime() {
         let sessions = sessions_map();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(4);
         let sid = format!("sess_{}", Uuid::new_v4());
         let cancel = Arc::new(tokio::sync::Notify::new());
         sessions.lock().await.insert(
@@ -5442,15 +5500,83 @@ mod acp_review_fixes {
             },
         );
         let params = json!({"sessionId": sid});
-        let resp = handle_session_cancel(&sessions, Value::Null, Some(&params), true).await;
+        let resp =
+            handle_session_cancel(&sessions, &event_tx, Value::Null, Some(&params), true).await;
         assert!(resp.is_none(), "a notification cancel must produce no response frame");
-        // notify_one stored a permit, so notified() resolves immediately — the signal fired.
+        let event: GatewayEvent = serde_json::from_str(
+            &event_rx.recv().await.expect("cancel must be forwarded to core"),
+        )
+        .unwrap();
+        assert_eq!(event.event_type, "session_cancel");
+        assert_eq!(event.platform, "acp");
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(200), cancel.notified())
+            tokio::time::timeout(std::time::Duration::from_millis(20), cancel.notified())
                 .await
-                .is_ok(),
-            "notification cancel must fire the session's cancel signal"
+                .is_err(),
+            "gateway must not claim completion before the runtime terminates"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_is_forwarded_for_runtime_work_between_prompts() {
+        let sessions = sessions_map();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(4);
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let channel_id = format!("acp_{}", Uuid::new_v4());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession {
+                channel_id: channel_id.clone(),
+                busy: false,
+                cancel: None,
+                mcp_servers: Vec::new(),
+                session_meta: None,
+                permission_relay: None,
+            },
+        );
+        let params = json!({"sessionId": sid});
+        assert!(
+            handle_session_cancel(&sessions, &event_tx, Value::Null, Some(&params), true)
+                .await
+                .is_none()
+        );
+        let event: GatewayEvent = serde_json::from_str(
+            &event_rx.recv().await.expect("idle outer session must forward runtime cancellation"),
+        )
+        .unwrap();
+        assert_eq!(event.event_type, "session_cancel");
+        assert_eq!(event.channel.id, channel_id);
+    }
+
+    #[tokio::test]
+    async fn runtime_cancelled_reason_completes_outer_prompt_as_cancelled() {
+        let registry = new_reply_registry();
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<ReplyChunk>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<String>();
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink {
+                turn_id: Some("evt_current".into()),
+                tx: Some(turn_tx),
+                session_id: "sess_chan".into(),
+                out_tx,
+                owner: "conn-test".into(),
+                generation: 0,
+                permission_relay: None,
+            },
+        );
+        handle_reply(
+            &reply("acp_chan", "evt_current", "", Some("finish_turn:cancelled")),
+            &registry,
+        )
+        .await;
+        assert!(matches!(turn_rx.try_recv(), Ok(ReplyChunk::Text(text)) if text.is_empty()));
+        assert!(matches!(
+            turn_rx.try_recv(),
+            Ok(ReplyChunk::Done(Some(
+                crate::adapters::acp_schema::StopReason::Cancelled
+            )))
+        ));
     }
 }
 
