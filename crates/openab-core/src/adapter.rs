@@ -1660,12 +1660,12 @@ impl AdapterRouter {
                                 }
                             }
                         }
-                    } else if acp_direct {
+                    } else if platform_is_acp {
                         // Terminal delivery closes the turn at the gateway (Done →
-                        // session/prompt response). Repeating the exact streamed
-                        // snapshot diffs to nothing new; content the deltas never
-                        // carried (error banner, empty-turn sentinel) is appended
-                        // so it still reaches the client exactly once.
+                        // session/prompt response) in both streaming and default
+                        // send-once modes. In streaming mode, repeating the exact
+                        // snapshot diffs to nothing new; in send-once mode the
+                        // empty streamed buffer selects the complete final content.
                         let terminal = if acp_streamed.is_empty() {
                             final_content.clone()
                         } else if let Some(ref err) = acp_error {

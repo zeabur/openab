@@ -25,6 +25,7 @@ fn env_lock() -> MutexGuard<'static, ()> {
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
     Send(String),
+    Terminal { content: String, stop_reason: Option<String> },
     Edit { message_id: String, content: String },
     Update(String),
 }
@@ -56,6 +57,21 @@ impl ChatAdapter for RecordingAdapter {
     }
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
         self.calls.lock().unwrap().push(Call::Send(content.to_string()));
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: "m1".into(),
+        })
+    }
+    async fn send_terminal_message(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        stop_reason: Option<&str>,
+    ) -> Result<MessageRef> {
+        self.calls.lock().unwrap().push(Call::Terminal {
+            content: content.to_string(),
+            stop_reason: stop_reason.map(str::to_string),
+        });
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: "m1".into(),
@@ -146,6 +162,24 @@ while IFS= read -r line; do
 done
 "##;
 
+const CANCELLED_AGENT: &str = r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"fake","version":"0"},"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_fake"}}\n' "$id"
+      ;;
+    *'"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$id"
+      ;;
+  esac
+done
+"##;
+
 struct Fixture {
     router: AdapterRouter,
     channel: ChannelRef,
@@ -157,10 +191,23 @@ async fn setup(platform: &str, thread_key: &str) -> Fixture {
 }
 
 async fn setup_with_agent(platform: &str, thread_key: &str, fake_agent: &str) -> Fixture {
+    setup_with_agent_and_streaming(platform, thread_key, fake_agent, true).await
+}
+
+async fn setup_with_agent_and_streaming(
+    platform: &str,
+    thread_key: &str,
+    fake_agent: &str,
+    streaming: bool,
+) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Isolate ~/.openab persistence (thread_map.json / session_meta.json).
     std::env::set_var("HOME", tmp.path());
-    std::env::set_var("OPENAB_ACP_STREAMING", "1");
+    if streaming {
+        std::env::set_var("OPENAB_ACP_STREAMING", "1");
+    } else {
+        std::env::remove_var("OPENAB_ACP_STREAMING");
+    }
     std::env::remove_var("OPENAB_STREAM_EDIT_INTERVAL_MS");
 
     let script = tmp.path().join("fake_agent.sh");
@@ -221,9 +268,36 @@ async fn acp_turn_waits_for_tool_that_finishes_after_prompt_response() {
             Call::Edit { message_id: "draft".into(), content: "before".into() },
             Call::Update("tool_call".into()),
             Call::Update("tool_call_update".into()),
-            Call::Send("before".into()),
+            Call::Terminal {
+                content: "before".into(),
+                stop_reason: Some("end_turn".into()),
+            },
         ],
         "the model response must not split a still-running prompt-owned tool into an autonomous turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_send_once_preserves_the_runtime_stop_reason() {
+    let _guard = env_lock();
+    let fx = setup_with_agent_and_streaming(
+        "acp",
+        "acp:send-once-cancelled",
+        CANCELLED_AGENT,
+        false,
+    )
+    .await;
+    let recorder = Arc::new(RecordingAdapter::new(false));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+
+    run_turn(&fx, &adapter, "acp:send-once-cancelled").await;
+
+    assert_eq!(
+        recorder.calls(),
+        vec![Call::Terminal {
+            content: "partial".into(),
+            stop_reason: Some("cancelled".into()),
+        }],
     );
 }
 
@@ -280,7 +354,10 @@ async fn acp_streaming_relays_text_inline_in_arrival_order() {
             message_id: "draft".into(),
             content: "Linode CLI ok done".into(),
         },
-        Call::Send("Linode CLI ok done".into()),
+        Call::Terminal {
+            content: "Linode CLI ok done".into(),
+            stop_reason: Some("end_turn".into()),
+        },
     ];
     assert_eq!(
         calls, expected,
