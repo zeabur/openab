@@ -686,7 +686,16 @@ impl AcpConnection {
                 "initialize",
                 Some(json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": {},
+                    "clientCapabilities": {
+                        "_meta": {
+                            "jetbrains": {
+                                "air": {
+                                    "version": 1,
+                                    "capabilities": ["asyncTasks"]
+                                }
+                            }
+                        }
+                    },
                     "clientInfo": {"name": "openab", "version": "0.1.0"},
                 })),
             )
