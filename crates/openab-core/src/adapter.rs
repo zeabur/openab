@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -329,6 +330,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
 
+    /// Complete a turn and preserve the runtime's terminal reason when the
+    /// transport can represent it. Ordinary chat adapters ignore the reason.
+    async fn send_terminal_message(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        _stop_reason: Option<&str>,
+    ) -> Result<MessageRef> {
+        self.send_message(channel, content).await
+    }
+
     /// Create a thread from a trigger message, returns the thread channel ref.
     async fn create_thread(
         &self,
@@ -554,6 +566,60 @@ fn is_current_prompt_activity(
         Some("session/update") => classify_notification(message).is_some(),
         Some("session/request_permission") => message.id.is_some(),
         _ => false,
+    }
+}
+
+/// Tracks foreground tool calls that were opened by the current prompt.
+///
+/// Some ACP agents return the `session/prompt` response as soon as the model
+/// stops, while a command launched by that model is still producing ordinary
+/// `tool_call_update` frames. The prompt is not quiescent until both events
+/// have happened: its response arrived and every tool it opened reached a
+/// terminal state.
+#[derive(Default)]
+struct PromptQuiescence {
+    response_received: bool,
+    pending_tools: HashSet<String>,
+}
+
+impl PromptQuiescence {
+    fn observe_update(&mut self, message: &JsonRpcMessage) {
+        let Some(update) = message.params.as_ref().and_then(|params| params.get("update")) else {
+            return;
+        };
+        let Some(kind) = update.get("sessionUpdate").and_then(|value| value.as_str()) else {
+            return;
+        };
+        if kind != "tool_call" && kind != "tool_call_update" {
+            return;
+        }
+        let Some(tool_id) = update
+            .get("toolCallId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        match update.get("status").and_then(|value| value.as_str()) {
+            Some("completed" | "failed" | "cancelled" | "stopped") => {
+                self.pending_tools.remove(tool_id);
+            }
+            Some(_) => {
+                self.pending_tools.insert(tool_id.to_string());
+            }
+            None if kind == "tool_call" => {
+                self.pending_tools.insert(tool_id.to_string());
+            }
+            None => {}
+        }
+    }
+
+    fn receive_response(&mut self) {
+        self.response_received = true;
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.response_received && self.pending_tools.is_empty()
     }
 }
 
@@ -1054,6 +1120,7 @@ impl AdapterRouter {
                     // updates; duration by itself is not a failure signal.
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
+                    let mut prompt_quiescence = PromptQuiescence::default();
                     let mut last_activity = tokio::time::Instant::now();
                     let prompt_activity = conn.activity_handle();
                     loop {
@@ -1158,7 +1225,15 @@ impl AdapterRouter {
                             if let Some(ref result) = notification.result {
                                 turn_result = parse_turn_result(result);
                             }
-                            break;
+                            prompt_quiescence.receive_response();
+                            if !platform_is_acp || prompt_quiescence.is_quiescent() {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        if platform_is_acp {
+                            prompt_quiescence.observe_update(&notification);
                         }
 
                         // ACP relays thought/tool updates natively — forward the raw
@@ -1322,6 +1397,9 @@ impl AdapterRouter {
                                 }
                                 _ => {}
                             }
+                        }
+                        if platform_is_acp && prompt_quiescence.is_quiescent() {
+                            break;
                         }
                     }
 
@@ -1582,12 +1660,12 @@ impl AdapterRouter {
                                 }
                             }
                         }
-                    } else if acp_direct {
+                    } else if platform_is_acp {
                         // Terminal delivery closes the turn at the gateway (Done →
-                        // session/prompt response). Repeating the exact streamed
-                        // snapshot diffs to nothing new; content the deltas never
-                        // carried (error banner, empty-turn sentinel) is appended
-                        // so it still reaches the client exactly once.
+                        // session/prompt response) in both streaming and default
+                        // send-once modes. In streaming mode, repeating the exact
+                        // snapshot diffs to nothing new; in send-once mode the
+                        // empty streamed buffer selects the complete final content.
                         let terminal = if acp_streamed.is_empty() {
                             final_content.clone()
                         } else if let Some(ref err) = acp_error {
@@ -1595,7 +1673,14 @@ impl AdapterRouter {
                         } else {
                             acp_streamed
                         };
-                        if let Err(e) = adapter.send_message(&thread_channel, &terminal).await {
+                        if let Err(e) = adapter
+                            .send_terminal_message(
+                                &thread_channel,
+                                &terminal,
+                                turn_result.stop_reason.as_deref(),
+                            )
+                            .await
+                        {
                             tracing::warn!(error = ?e, platform = %thread_channel.platform, "acp terminal send failed");
                             delivery_failed = true;
                         }
@@ -2209,6 +2294,62 @@ mod tests {
             7,
             "session-1",
         ));
+    }
+
+    #[test]
+    fn acp_prompt_is_not_quiescent_until_late_tool_finishes() {
+        let mut state = PromptQuiescence::default();
+        state.observe_update(&incoming(serde_json::json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "tool_call", "toolCallId": "exec-1", "status": "in_progress"
+            }}
+        })));
+        state.receive_response();
+        assert!(!state.is_quiescent());
+        state.observe_update(&incoming(serde_json::json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "exec-1", "status": "failed"
+            }}
+        })));
+        state.observe_update(&incoming(serde_json::json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "exec-1", "title": "final output"
+            }}
+        })));
+        assert!(state.is_quiescent());
+    }
+
+    #[test]
+    fn acp_prompt_waits_for_every_prompt_owned_tool() {
+        let mut state = PromptQuiescence::default();
+        for tool_id in ["exec-1", "exec-2"] {
+            state.observe_update(&incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "tool_call", "toolCallId": tool_id, "status": "in_progress"
+                }}
+            })));
+        }
+        state.receive_response();
+        for (tool_id, quiescent) in [("exec-1", false), ("exec-2", true)] {
+            state.observe_update(&incoming(serde_json::json!({
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": tool_id, "status": "completed"
+                }}
+            })));
+            assert_eq!(state.is_quiescent(), quiescent);
+        }
+    }
+
+    #[test]
+    fn acp_prompt_without_tools_is_quiescent_at_response() {
+        let mut state = PromptQuiescence::default();
+        state.receive_response();
+        assert!(state.is_quiescent());
     }
 
     #[test]
