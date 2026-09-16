@@ -29,7 +29,7 @@ url = "2.5.8"
 oauth2 = { version = "5", default-features = false }
 # Multi-draft JSON Schema validator for MCP tool `inputSchema` (rows 18-21).
 jsonschema = { version = "0.46", default-features = false }
-rmcp = { version = "1.7", default-features = false, features = [
+rmcp = { version = "2.0", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",

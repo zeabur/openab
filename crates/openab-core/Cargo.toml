@@ -52,7 +52,7 @@ http = { version = "1", optional = true }
 # Browser tool definitions for the facade's capability source. Only `rmcp::model` is used now —
 # the loopback MCP server that needed the server + streamable-http transport features (and its own
 # axum listener) was removed with the per-session proxy.
-rmcp = { version = "1.7", default-features = false, optional = true }
+rmcp = { version = "2.0", default-features = false, optional = true }
 tokio-util = { version = "0.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
