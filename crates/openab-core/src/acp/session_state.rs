@@ -74,27 +74,47 @@ impl SessionState {
     /// Stamp provenance at the native reader, before prompt/idle routes can change.
     pub fn observe_and_stamp(&self, params: Option<&mut Value>) {
         let Some(params) = params else { return };
+        let previous = params
+            .pointer("/update/toolCallId")
+            .and_then(Value::as_str)
+            .map(|id| self.snapshot()["tools"][id].clone());
         self.observe(Some(params));
         let Some(update) = params.get_mut("update") else {
             return;
         };
-        if !matches!(
-            update["sessionUpdate"].as_str(),
-            Some("async_task_spawned" | "async_task_state_update")
-        ) {
-            return;
-        }
-        let token = update["asyncTaskId"].as_str().and_then(|id| {
-            self.snapshot()["asyncTasks"][id]["ownershipToken"]
-                .as_str()
-                .map(str::to_owned)
-        });
-        // Never trust a token supplied by the subprocess itself.
+        let snapshot = self.snapshot();
+        let (record, background) = match update["sessionUpdate"].as_str() {
+            Some("async_task_spawned" | "async_task_state_update") => {
+                let Some(id) = update["asyncTaskId"].as_str() else {
+                    return;
+                };
+                (snapshot["asyncTasks"][id].clone(), false)
+            }
+            Some("tool_call" | "tool_call_update") => {
+                let Some(id) = update["toolCallId"].as_str() else {
+                    return;
+                };
+                let current = &snapshot["tools"][id];
+                let record = if current.is_null() {
+                    previous.unwrap_or(Value::Null)
+                } else {
+                    current.clone()
+                };
+                let explicit_task = snapshot["asyncTasks"]
+                    .as_object()
+                    .is_some_and(|tasks| tasks.values().any(|task| task["toolCallId"] == id));
+                let background = record["background"] == true && !explicit_task;
+                (record, background)
+            }
+            _ => return,
+        };
+        // Never trust provenance supplied by the subprocess itself.
         if !update["_meta"].is_object() {
             update["_meta"] = json!({});
         }
-        update["_meta"]["dev.openab/taskToken"] = token.map(Value::String).unwrap_or(Value::Null);
-        update["_meta"]["dev.openab/taskEpoch"] = self.snapshot()["epoch"].clone();
+        update["_meta"]["dev.openab/taskToken"] = record["ownershipToken"].clone();
+        update["_meta"]["dev.openab/taskEpoch"] = snapshot["epoch"].clone();
+        update["_meta"]["dev.openab/backgroundTool"] = json!(background);
     }
 
     pub fn observe(&self, params: Option<&Value>) {
@@ -117,6 +137,11 @@ impl SessionState {
                     if let Some(provider) = provider {
                         // Preserve unfamiliar provider states instead of silently hiding them.
                         snapshot["providerState"] = json!(provider);
+                        if provider == "idle" {
+                            for tool in snapshot["tools"].as_object_mut().unwrap().values_mut() {
+                                tool["background"] = json!(true);
+                            }
+                        }
                         if provider == "idle" && snapshot["operation"] == "cancelling" {
                             snapshot["operation"] = json!("none");
                         }
@@ -161,7 +186,7 @@ impl SessionState {
                             if update["sessionUpdate"] == "tool_call" || tools.contains_key(id) {
                                 let tool = tools
                                     .entry(id)
-                                    .or_insert_with(|| json!({"id": id, "status": "pending"}));
+                                    .or_insert_with(|| json!({"id": id, "status": "pending", "ownershipToken":uuid::Uuid::new_v4().to_string()}));
                                 for field in ["status", "title", "kind"] {
                                     if let Some(value) = update[field].as_str() {
                                         tool[field] = json!(value);
@@ -245,5 +270,23 @@ mod tests {
         let mut unknown = json!({"update":{"sessionUpdate":"async_task_state_update","asyncTaskId":"unknown","state":"completed","_meta":{"dev.openab/taskToken":"forged"}}});
         state.observe_and_stamp(Some(&mut unknown));
         assert!(unknown["update"]["_meta"]["dev.openab/taskToken"].is_null());
+    }
+    #[test]
+    fn native_background_tool_completion_keeps_provenance_after_removal() {
+        let state = SessionState::default();
+        let mut start = json!({"update":{"sessionUpdate":"tool_call","toolCallId":"exec","status":"in_progress"}});
+        state.observe_and_stamp(Some(&mut start));
+        let token = start["update"]["_meta"]["dev.openab/taskToken"].clone();
+        assert!(token.is_string());
+        state.observe(Some(&json!({"update":{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"idle"}}}}})));
+        state.operation("prompt");
+        let mut done = json!({"update":{"sessionUpdate":"tool_call_update","toolCallId":"exec","status":"completed"}});
+        state.observe_and_stamp(Some(&mut done));
+        assert_eq!(done["update"]["_meta"]["dev.openab/taskToken"], token);
+        assert_eq!(done["update"]["_meta"]["dev.openab/backgroundTool"], true);
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+        state.observe_and_stamp(Some(&mut done));
+        assert!(done["update"]["_meta"]["dev.openab/taskToken"].is_null());
+        assert_eq!(done["update"]["_meta"]["dev.openab/backgroundTool"], false);
     }
 }

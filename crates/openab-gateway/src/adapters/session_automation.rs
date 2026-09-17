@@ -72,6 +72,11 @@ impl SessionAutomation {
         if let Some(entry) = all.get_mut(channel) {
             entry.cancelled = true;
             entry.pending.clear();
+            entry
+                .observed
+                .extend(entry.tasks.iter().map(|(id, (origin, token))| {
+                    format!("{id}:{}", token.as_deref().unwrap_or(origin))
+                }));
             entry.tasks.clear();
             entry.blocked_on = None;
             entry.generation += 1;
@@ -124,7 +129,24 @@ impl SessionAutomation {
         if accepted.channel != channel {
             return None;
         }
-        let id = update["asyncTaskId"].as_str()?;
+        let tool = matches!(
+            update["sessionUpdate"].as_str(),
+            Some("tool_call" | "tool_call_update")
+        );
+        let id = if tool {
+            format!("tool:{}", update["toolCallId"].as_str()?)
+        } else {
+            update["asyncTaskId"].as_str()?.to_owned()
+        };
+        let status = if tool {
+            &update["status"]
+        } else {
+            &update["state"]
+        };
+        let terminal = matches!(
+            status.as_str(),
+            Some("completed" | "failed" | "cancelled" | "stopped")
+        );
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let entry = all.get_mut(channel)?;
         if entry.cancelled || !entry.origins.contains(&accepted.origin) {
@@ -141,22 +163,27 @@ impl SessionAutomation {
         {
             return None;
         }
-        if update["sessionUpdate"] == "async_task_spawned" {
+        if tool && token.is_none() {
+            return None;
+        }
+        if update["sessionUpdate"] == "async_task_spawned" || (tool && !terminal) {
             entry.tasks.insert(
-                id.into(),
+                id.clone(),
                 (accepted.origin.clone(), token.map(str::to_owned)),
             );
             return None;
         }
-        let owned = entry.tasks.get(id).is_some_and(|(origin, spawned_token)| {
+        let owned = entry.tasks.get(&id).is_some_and(|(origin, spawned_token)| {
             if let Some(spawned_token) = spawned_token {
                 token == Some(spawned_token.as_str())
             } else {
                 *origin == accepted.origin
             }
         });
-        if update["sessionUpdate"] != "async_task_state_update"
-            || !matches!(update["state"].as_str(), Some("completed" | "failed"))
+        if (!tool && update["sessionUpdate"] != "async_task_state_update")
+            || (tool
+                && update.pointer("/_meta/dev.openab~1backgroundTool") != Some(&Value::Bool(true)))
+            || !matches!(status.as_str(), Some("completed" | "failed"))
             || !owned
             || !entry
                 .observed
@@ -166,7 +193,7 @@ impl SessionAutomation {
         }
         entry
             .pending
-            .insert(format!("{id}:{}", update["state"].as_str().unwrap()));
+            .insert(format!("{id}:{}", status.as_str().unwrap()));
         entry.error = None;
         if entry.worker {
             return None;
@@ -537,5 +564,40 @@ mod tests {
         assert_eq!(automation.observe("s", &native_done, &second), None);
         native_done["_meta"] = json!({"dev.openab/taskToken":"native-reader-token","dev.openab/taskEpoch":"native-epoch"});
         assert_eq!(automation.observe("s", &native_done, &second), Some(0));
+    }
+    #[test]
+    fn only_native_tools_that_outlive_the_foreground_turn_schedule_continuation() {
+        let automation = SessionAutomation::default();
+        automation.configure("s", vec![], None);
+        automation.observe_provider_epoch("s", Some("native"));
+        let meta = json!({"dev.openab/taskToken":"instance","dev.openab/taskEpoch":"native"});
+        let start = json!({"sessionUpdate":"tool_call","toolCallId":"exec","status":"in_progress","_meta":meta});
+        automation.observe("s", &start, &accepted("s"));
+        let mut done = json!({"sessionUpdate":"tool_call_update","toolCallId":"exec","status":"completed","_meta":meta});
+        assert_eq!(automation.observe("s", &done, &accepted("s")), None);
+        done["_meta"]["dev.openab/backgroundTool"] = json!(true);
+        assert_eq!(automation.observe("s", &done, &accepted("s")), Some(0));
+        assert_eq!(automation.observe("s", &done, &accepted("s")), None);
+    }
+    #[test]
+    fn cancelled_background_task_cannot_be_reintroduced_by_late_progress() {
+        let automation = SessionAutomation::default();
+        automation.configure("s", vec![], None);
+        automation.observe_provider_epoch("s", Some("native"));
+        let meta = json!({"dev.openab/taskToken":"cancelled-instance","dev.openab/taskEpoch":"native","dev.openab/backgroundTool":true});
+        let progress = json!({"sessionUpdate":"tool_call","toolCallId":"exec","status":"in_progress","_meta":meta});
+        automation.observe("s", &progress, &accepted("s"));
+        automation.cancel("s");
+        automation
+            .dispatch("s", None, Some((vec![], None)), "second-turn", || Ok(()))
+            .unwrap();
+        let next = AcceptedReply {
+            channel: "s".into(),
+            origin: "second-turn".into(),
+        };
+        automation.observe("s", &progress, &next);
+        let done = json!({"sessionUpdate":"tool_call_update","toolCallId":"exec","status":"completed","_meta":meta});
+        assert_eq!(automation.observe("s", &done, &next), None);
+        assert_eq!(automation.snapshot("s")["pending"], json!([]));
     }
 }
