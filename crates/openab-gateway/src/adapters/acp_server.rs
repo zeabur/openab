@@ -3062,7 +3062,10 @@ async fn handle_session_config(
             "Session configuration requires the unified runtime",
         );
     };
-    let _operation = state.acp_session_operations.configuration(channel.clone());
+    // Cached model-option reads observe the session; only an explicit setting
+    // change or restore performs work that belongs in its execution snapshot.
+    let _operation = (write || restore.is_some())
+        .then(|| state.acp_session_operations.configuration(channel.clone()));
     let (reply, response) = tokio::sync::oneshot::channel();
     if tx
         .try_send(crate::AcpPoolConfigRequest {
@@ -9894,11 +9897,17 @@ mod session_config_tests {
         .await;
         assert_eq!(bad_value.error.unwrap().code, -32602);
         assert!(rx.try_recv().is_err());
-        let expected_channel = format!("acp:{}", derive_channel_id(&sid).unwrap());
+        let channel = derive_channel_id(&sid).unwrap();
+        let expected_channel = format!("acp:{channel}");
+        let operations = state.acp_session_operations.clone();
         let worker = tokio::spawn(async move {
             let read = rx.recv().await.unwrap();
             assert_eq!(read.thread_key, expected_channel);
             assert!(read.selection.is_none());
+            assert!(
+                !operations.pending(&channel),
+                "read must not create execution state"
+            );
             read.reply
                 .send(Ok(
                     json!({"configOptions": [{"id":"model","currentValue":"before"}]}),
@@ -9906,6 +9915,7 @@ mod session_config_tests {
                 .unwrap();
             let write = rx.recv().await.unwrap();
             assert_eq!(write.selection, Some(("model".into(), "gpt-test".into())));
+            assert!(operations.pending(&channel), "write remains runtime work");
             write.reply.send(Err((-32005, "busy".into()))).unwrap();
         });
         let read = handle_session_config(&state, json!(2), Some(&params), false, false).await;
@@ -9944,8 +9954,14 @@ mod session_config_tests {
                 "incomplete restore cannot mutate saved tools"
             );
         }
+        let operations = state.acp_session_operations.clone();
+        let channel = derive_channel_id(&sid).unwrap();
         let worker = tokio::spawn(async move {
             let request = rx.recv().await.unwrap();
+            assert!(
+                operations.pending(&channel),
+                "explicit restore remains runtime work"
+            );
             assert_eq!(
                 request.restore,
                 Some(("/saved".into(), vec![], Some(json!({"owner":"fresh"}))))
