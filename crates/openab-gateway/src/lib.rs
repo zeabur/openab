@@ -56,6 +56,17 @@ pub type AcpSessionSnapshot = Arc<
 >;
 
 #[cfg(feature = "acp")]
+pub type AcpSessionSteer = Arc<
+    dyn Fn(
+            String,
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, (i32, String)>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+#[cfg(feature = "acp")]
 pub type AcpSessionCancel = Arc<
     dyn Fn(
             String,
@@ -152,6 +163,8 @@ pub struct AppState {
     #[cfg(feature = "acp")]
     pub acp_session_cancel: Option<AcpSessionCancel>,
     #[cfg(feature = "acp")]
+    pub acp_session_steer: Option<AcpSessionSteer>,
+    #[cfg(feature = "acp")]
     pub acp_session_inventory: Option<AcpSessionInventory>,
     #[cfg(feature = "acp")]
     pub acp_session_automation: adapters::acp_server::SessionAutomation,
@@ -237,6 +250,8 @@ impl AppState {
             acp_session_snapshot: None,
             #[cfg(feature = "acp")]
             acp_session_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_session_steer: None,
             #[cfg(feature = "acp")]
             acp_session_inventory: None,
             #[cfg(feature = "acp")]
@@ -385,6 +400,8 @@ impl AppState {
             acp_session_snapshot: None,
             #[cfg(feature = "acp")]
             acp_session_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_session_steer: None,
             #[cfg(feature = "acp")]
             acp_session_inventory: None,
             #[cfg(feature = "acp")]
@@ -1010,6 +1027,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp_session_snapshot: None,
         #[cfg(feature = "acp")]
         acp_session_cancel: None,
+        #[cfg(feature = "acp")]
+        acp_session_steer: None,
         #[cfg(feature = "acp")]
         acp_session_inventory: None,
         #[cfg(feature = "acp")]

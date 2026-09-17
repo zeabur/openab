@@ -1916,6 +1916,7 @@ async fn handle_acp_connection(
                     | "session/prompt"
                     | "session/set_config_option"
                     | "_openab/session/config_options"
+                    | "_openab/session/steer"
                     | "_openab/session/state"
                     | "_openab/runtime/state"
                     | "_openab/session/requests"
@@ -2294,6 +2295,93 @@ async fn handle_acp_connection(
                     JsonRpcResponse::error(id, -32602, "Missing params")
                 };
                 let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            "_openab/session/steer" => {
+                let state = state.clone();
+                let out_tx = out_tx.clone();
+                let params = req.params.clone();
+                tokio::spawn(async move {
+                    let response = if !runtime_control {
+                        JsonRpcResponse::error(id, -32003, "Runtime operator credential required")
+                    } else if !initialized {
+                        JsonRpcResponse::error(id, -32002, "Not initialized")
+                    } else if let Some(params) = params.as_ref() {
+                        let message_id = params["messageId"]
+                            .as_str()
+                            .filter(|id| Uuid::parse_str(id).is_ok());
+                        let channel = params["sessionId"].as_str().and_then(derive_channel_id);
+                        let prompt = params["prompt"].as_array().filter(|blocks| {
+                            !blocks.is_empty()
+                                && blocks.iter().all(|b| {
+                                    b["type"] == "text"
+                                        && b["text"].as_str().is_some_and(|s| !s.trim().is_empty())
+                                })
+                        });
+                        if let (Some(channel), Some(prompt), Some(steer), Some(message_id)) = (
+                            channel,
+                            prompt,
+                            state.acp_session_steer.as_ref(),
+                            message_id,
+                        ) {
+                            let snapshot = read_runtime_snapshot(&state, &channel).await;
+                            if !snapshot
+                                .as_ref()
+                                .is_some_and(|s| s["actions"]["steer"] == true)
+                            {
+                                JsonRpcResponse::error(
+                                    id,
+                                    -32004,
+                                    "Runtime cannot accept steering now",
+                                )
+                            } else {
+                                let _steering =
+                                    state.acp_session_operations.steering(channel.clone());
+                                publish_runtime_snapshot(&state, &channel).await;
+                                match steer(channel.clone(), Value::Array(prompt.clone())).await {
+                                    Ok(result) => {
+                                        if result["outcome"] == "injected" {
+                                            let route = state.acp_reply_registry.as_ref().and_then(
+                                                |registry| {
+                                                    registry
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner())
+                                                        .get(&channel)
+                                                        .map(|sink| {
+                                                            (
+                                                                sink.session_id.clone(),
+                                                                sink.out_tx.clone(),
+                                                            )
+                                                        })
+                                                },
+                                            );
+                                            if let Some((session_id, output)) = route {
+                                                let text = prompt
+                                                    .iter()
+                                                    .filter_map(|part| part["text"].as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
+                                                let _ = output.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"sessionUpdate":"steering_message","id":message_id,"text":text}}}).to_string());
+                                            }
+                                        }
+                                        JsonRpcResponse::success(id, result)
+                                    }
+                                    Err((code, message)) => {
+                                        JsonRpcResponse::error(id, code, message)
+                                    }
+                                }
+                            }
+                        } else {
+                            JsonRpcResponse::error(
+                                id,
+                                -32602,
+                                "Invalid or unsupported steering request",
+                            )
+                        }
+                    } else {
+                        JsonRpcResponse::error(id, -32602, "Missing params")
+                    };
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                });
             }
             "_openab/session/state" => {
                 if !initialized {
@@ -3445,6 +3533,11 @@ async fn handle_session_prompt(
             }
         }
     }
+
+    state
+        .acp_session_operations
+        .wait_for_steering(&channel_id)
+        .await;
 
     // On timeout, tell the pool to cancel the agent process so it stops the
     // in-flight tool call. The gateway-side cancel (above) only stops the
@@ -6976,6 +7069,72 @@ mod acp_ws_integration {
             let _ = axum::serve(listener, app).await;
         });
         (format!("ws://{addr}/acp"), registry, reply_registry, rx)
+    }
+
+    #[tokio::test]
+    async fn native_steering_requires_operator_and_never_dispatches_another_prompt() {
+        let (tx, mut events) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(tx);
+        state.acp = Some(AcpConfig {
+            auth_key: None,
+            control_key: Some("operator-fixture-key".into()),
+            allowed_origins: vec![],
+        });
+        state.acp_session_snapshot = Some(Arc::new(|_| {
+            Box::pin(async { json!({"state":"active","steeringSupported":true}) })
+        }));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider_release = release.clone();
+        state.acp_session_steer = Some(Arc::new(move |channel, prompt| {
+            let count = count.clone();
+            let release = provider_release.clone();
+            Box::pin(async move {
+                assert_eq!(channel, "acp_173201f5-7973-4186-ae78-e63c2988d1b9");
+                assert_eq!(prompt, json!([{"type":"text","text":"Focus on tests"}]));
+                count.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok(json!({"outcome":"injected"}))
+            })
+        }));
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        for operator in [false, true] {
+            let mut request = format!("ws://{addr}/acp").into_client_request().unwrap();
+            if operator {
+                request.headers_mut().insert(
+                    "Authorization",
+                    "Bearer operator-fixture-key".parse().unwrap(),
+                );
+            }
+            let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            send(&mut ws, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"dev.openab/sessionSnapshots":true}}}})).await;
+            let _ = recv(&mut ws).await;
+            send(&mut ws, json!({"jsonrpc":"2.0","id":2,"method":"_openab/session/steer","params":{"sessionId":"sess_173201f5-7973-4186-ae78-e63c2988d1b9","messageId":"173201f5-7973-4186-ae78-e63c2988d1b8","prompt":[{"type":"text","text":"Focus on tests"}]}})).await;
+            if operator {
+                send(&mut ws, json!({"jsonrpc":"2.0","id":3,"method":"_openab/session/state","params":{"sessionId":"sess_173201f5-7973-4186-ae78-e63c2988d1b9"}})).await;
+                let state = tokio::time::timeout(std::time::Duration::from_secs(1), recv(&mut ws))
+                    .await
+                    .expect("steering must not block socket reads");
+                assert_eq!(state["id"], 3);
+                release.notify_one();
+                let result = recv(&mut ws).await;
+                assert_eq!(result["result"]["outcome"], "injected");
+            } else {
+                let result = recv(&mut ws).await;
+                assert_eq!(result["error"]["code"], -32003);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
