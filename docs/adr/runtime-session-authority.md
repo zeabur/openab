@@ -29,7 +29,12 @@ process replacement. Transport/index caches cannot resurrect them.
 
 Background completion continuations run inside OpenAB. Their pending, running,
 failed and cancelled lifecycle belongs to the snapshot. Native late output does
-not itself reopen a model turn. Provider idle does not terminate a gateway turn
+not itself reopen a model turn. Native tool calls that remain open when the
+provider reports idle are marked as background work by the native reader. Their
+terminal events carry the same task-instance provenance as explicit async tasks;
+only those background completions may schedule a continuation. Ordinary tools
+completed within a foreground turn never schedule another prompt. Explicit async
+task correlation takes precedence to avoid two continuations for one command. Provider idle does not terminate a gateway turn
 that still owns output. The runtime publishes lifecycle before content so fast
 autonomous turns do not lose their first or final output.
 
