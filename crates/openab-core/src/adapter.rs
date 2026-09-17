@@ -1470,20 +1470,11 @@ impl AdapterRouter {
                                     );
                                 }
                             }
-                            // The receiver ends only when the connection behind it
-                            // is gone: suspended by the pool, force-evicted, or the
-                            // agent process died. An agent-initiated turn carries no
-                            // client request id, so its consumer has no other way to
-                            // learn the turn will never finish — the agent's own
-                            // terminal update died with the process. Say so once,
-                            // explicitly, instead of leaving the consumer attached to
-                            // a stream that already ended.
-                            //
-                            // Advisory: consumers must ignore it when no
-                            // agent-initiated turn is open, because a session whose
-                            // last relayed turn completed normally still reaches this
-                            // line when it is later suspended.
-                            if relay_saw_traffic {
+                            // prompt_done replaces the idle subscriber after every
+                            // client turn. Closing that old receiver is a normal
+                            // handoff, not evidence the provider connection died.
+                            // Report interruption only from actual runtime liveness.
+                            if relay_saw_traffic && idle_activity.connection_ended() {
                                 if let Err(error) = idle_adapter
                                     .forward_agent_update(
                                         &idle_channel,

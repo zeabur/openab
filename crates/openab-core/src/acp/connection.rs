@@ -124,6 +124,7 @@ impl ContentBlock {
 /// Lock-free view of session activity, readable without the connection mutex.
 pub struct SessionActivity {
     pub execution: super::session_state::SessionState,
+    connection_ended: AtomicBool,
     /// Milliseconds since process boot (monotonic) of the last observed activity.
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
@@ -163,12 +164,23 @@ impl SessionActivity {
     pub fn new() -> Self {
         Self {
             execution: Default::default(),
+            connection_ended: AtomicBool::new(false),
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
             prompt_permission_wait_ms: AtomicU64::new(0),
             agent_relay_ms: AtomicU64::new(0),
             agent_permission_wait_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Subscriber replacement is not process termination. Shared with idle relays.
+    pub fn connection_ended(&self) -> bool {
+        self.connection_ended.load(Ordering::Acquire)
+    }
+
+    fn mark_connection_ended(&self) {
+        self.connection_ended.store(true, Ordering::Release);
+        self.execution.set("interrupted");
     }
 
     /// Monotonic milliseconds since first use (process boot). SystemTime is
@@ -462,7 +474,7 @@ pub(crate) async fn run_reader_loop_with_state<R>(
     }
 
     if let Some(activity) = &execution {
-        activity.execution.set("interrupted");
+        activity.mark_connection_ended();
     }
     // Connection closed — resolve all pending with error
     let mut map = pending.lock().await;
@@ -1135,6 +1147,7 @@ fn session_load_params(
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
+        self.activity.mark_connection_ended();
         if let Some(handle) = self._stderr_handle.take() {
             handle.abort();
         }
@@ -1705,6 +1718,37 @@ mod reader_loop_tests {
         activity.begin_prompt_permission_wait();
         activity.set_in_flight(false);
         assert!(activity.prompt_permission_wait_age().is_none());
+    }
+    #[tokio::test]
+    async fn replacing_idle_receiver_does_not_report_a_connection_failure() {
+        let (mut writer, reader) = duplex(8192);
+        let activity = Arc::new(super::SessionActivity::new());
+        let (old_tx, mut old_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
+        let notify: NotificationSender = Arc::new(Mutex::new(Some(old_tx.clone())));
+        let idle: NotificationSender = Arc::new(Mutex::new(Some(old_tx)));
+        let handle = tokio::spawn(super::run_reader_loop_with_state(
+            reader,
+            Arc::new(Mutex::new(HashMap::new())),
+            notify.clone(),
+            idle.clone(),
+            Some(activity.clone()),
+        ));
+        let frame = b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"working\"}}}}\n";
+        writer.write_all(frame).await.unwrap();
+        assert!(old_rx.recv().await.is_some());
+        // The exact prompt_done handoff drops the old relay's final senders.
+        let (next_tx, mut next_rx) = mpsc::channel(ACP_NOTIFICATION_CAPACITY);
+        *idle.lock().await = Some(next_tx.clone());
+        *notify.lock().await = Some(next_tx);
+        assert!(old_rx.recv().await.is_none());
+        assert!(!activity.connection_ended());
+        writer.write_all(frame).await.unwrap();
+        assert!(next_rx.recv().await.is_some());
+        // A real EOF still ends the replacement relay with a failure signal.
+        drop(writer);
+        handle.await.unwrap();
+        assert!(next_rx.recv().await.is_none());
+        assert!(activity.connection_ended());
     }
 }
 
