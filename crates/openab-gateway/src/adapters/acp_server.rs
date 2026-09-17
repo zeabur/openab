@@ -208,6 +208,8 @@ fn is_ws_subprotocol_token_char(b: u8) -> bool {
 
 pub struct AcpConfig {
     pub auth_key: Option<String>,
+    /// Independent operator credential. Never exposed to ordinary ACP clients.
+    pub control_key: Option<String>,
     /// Browser `Origin`s allowed to drive `/acp` in keyless loopback mode (from
     /// `OPENAB_ACP_ALLOWED_ORIGINS`, comma-separated). Empty by default → every
     /// browser-set `Origin` is rejected; non-browser clients (no `Origin`) are unaffected.
@@ -253,8 +255,12 @@ impl AcpConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let control_key = std::env::var("OPENAB_ACP_CONTROL_KEY")
+            .ok()
+            .filter(|key| key.len() >= 32 && Some(key) != auth_key.as_ref());
         Some(Self {
             auth_key,
+            control_key,
             allowed_origins,
         })
     }
@@ -822,8 +828,16 @@ pub async fn ws_upgrade(
     // the legacy `?token=` query fallback was dropped in R17-F2. See `ws_bearer_token`.
     let token = ws_bearer_token(&headers);
 
+    let runtime_control = token
+        .zip(state.acp.as_ref().and_then(|c| c.control_key.as_ref()))
+        .is_some_and(|(token, key)| {
+            use subtle::ConstantTimeEq;
+            bool::from(token.as_bytes().ct_eq(key.as_bytes()))
+        });
     let expected = state.acp.as_ref().and_then(|c| c.auth_key.as_ref());
-    if let Some(expected) = expected {
+    if runtime_control {
+        // The operator credential delegates all-session control to a trusted broker.
+    } else if let Some(expected) = expected {
         let valid = match token {
             Some(t) => {
                 // Constant-time comparison to prevent timing attacks
@@ -861,7 +875,7 @@ pub async fn ws_upgrade(
     // `openab.bearer.<token>` entry) completes the handshake. Clients that offer no
     // subprotocol are unaffected.
     ws.protocols([ACP_SUBPROTOCOL])
-        .on_upgrade(move |socket| handle_acp_connection(state, socket))
+        .on_upgrade(move |socket| handle_acp_connection(state, socket, runtime_control))
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,6 +1625,9 @@ fn spawn_acp_tunnels(
 async fn read_runtime_snapshot(state: &crate::AppState, channel: &str) -> Option<Value> {
     let read = state.acp_session_snapshot.as_ref()?;
     let mut provider = read(channel.to_string()).await;
+    state
+        .acp_session_automation
+        .observe_provider_epoch(channel, provider["epoch"].as_str());
     provider["gateway"] = state.acp_session_operations.snapshot(channel);
     if provider["state"] == "active"
         && provider["operation"] == "none"
@@ -1670,7 +1687,11 @@ pub async fn publish_runtime_snapshot(state: &crate::AppState, channel: &str) {
     }
 }
 
-async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
+async fn handle_acp_connection(
+    state: Arc<crate::AppState>,
+    socket: WebSocket,
+    runtime_control: bool,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
     // Age of this connection, from the same counter that orders attaches. A resume's authority to
@@ -2215,7 +2236,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 }
             }
             "_openab/runtime/state" => {
-                let response = if !initialized {
+                let response = if !runtime_control {
+                    JsonRpcResponse::error(id, -32003, "Runtime operator credential required")
+                } else if !initialized {
                     JsonRpcResponse::error(id, -32002, "Not initialized")
                 } else if let Some(inventory) = &state.acp_session_inventory {
                     let mut channels = inventory().await;
@@ -2235,7 +2258,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let _ = out_tx.send(serde_json::to_string(&response).unwrap());
             }
             "_openab/session/requests" => {
-                let response = if !initialized {
+                let response = if !runtime_control {
+                    JsonRpcResponse::error(id, -32003, "Runtime operator credential required")
+                } else if !initialized {
                     JsonRpcResponse::error(id, -32002, "Not initialized")
                 } else if let Some(params) = req.params.as_ref() {
                     if let Some(channel) = params["sessionId"].as_str().and_then(derive_channel_id)
@@ -2275,6 +2300,21 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(Value::as_str);
+                if snapshots_enabled.load(Ordering::Acquire)
+                    && !runtime_control
+                    && !sessions
+                        .lock()
+                        .await
+                        .contains_key(session_id.unwrap_or_default())
+                {
+                    let response = JsonRpcResponse::error(
+                        id,
+                        -32003,
+                        "Session is not attached to this connection",
+                    );
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
                 let channel = session_id
                     .and_then(|s| s.strip_prefix("sess_"))
                     .and_then(|s| Uuid::parse_str(s).ok())
@@ -2423,6 +2463,24 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 }));
             }
             "session/cancel" => {
+                if !runtime_control {
+                    let session_id = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p["sessionId"].as_str())
+                        .unwrap_or_default();
+                    if !sessions.lock().await.contains_key(session_id) {
+                        if !is_notification {
+                            let response = JsonRpcResponse::error(
+                                id,
+                                -32003,
+                                "Session is not attached to this connection",
+                            );
+                            let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                        }
+                        continue;
+                    }
+                }
                 // Notification form forwards runtime control (no response); a request-shaped
                 // cancel is rejected -32600 rather than acked with empty success (R17-F3c).
                 if let Some(resp) = handle_session_cancel(
@@ -3247,6 +3305,7 @@ async fn handle_session_prompt(
         &channel_id,
         resume_generation,
         automation_context,
+        &turn_id,
         || {
             if state.acp_session_operations.snapshot(&channel_id)["cancelling"] == true {
                 return Err("Runtime session is busy".into());
@@ -3497,16 +3556,24 @@ fn extract_prompt_params(params: Option<&Value>) -> Result<(String, String), Str
 
 /// Process a GatewayReply destined for an ACP session.
 /// Called from the unified bridge's reply dispatch logic.
-pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
+pub struct AcceptedReply {
+    channel: String,
+    origin: String,
+}
+
+pub async fn handle_reply(
+    reply: &GatewayReply,
+    registry: &AcpReplyRegistry,
+) -> Option<AcceptedReply> {
     let key = reply.channel.id.as_str();
     if !key.starts_with("acp_") {
-        return;
+        return None;
     }
 
     let full_text = reply.content.text.clone();
     // Skip placeholder/draft messages
     if full_text == "…" || full_text == "draft" {
-        return;
+        return None;
     }
 
     enum Destination {
@@ -3539,11 +3606,9 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                         channel = key,
                         "ACP dropping stale reply from a superseded turn"
                     );
-                    return;
+                    return None;
                 }
-                let Some(tx) = sink.tx.clone() else {
-                    return;
-                };
+                let tx = sink.tx.clone()?;
                 Destination::Turn {
                     tx,
                     turn_id: sink.turn_id.clone().expect("checked above"),
@@ -3560,19 +3625,27 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                     channel = key,
                     "ACP dropping stale reply from a superseded turn"
                 );
-                return;
+                return None;
             }
-            None => return,
+            None => return None,
         }
     };
 
+    let origin = match &destination {
+        Destination::Turn { turn_id, .. } => turn_id.clone(),
+        Destination::Session { .. } => reply.reply_to.clone(),
+    };
+    let accepted = || AcceptedReply {
+        channel: key.into(),
+        origin: origin.clone(),
+    };
     let tx = match destination {
         Destination::Turn { tx, turn_id } => {
             match reply.command.as_deref() {
                 Some("agent_error") => {
                     let _ = tx.send(ReplyChunk::Error(full_text));
                     remove_reply_sink_if_owner(registry, key, &turn_id);
-                    return;
+                    return None;
                 }
                 None | Some("send_message") => {
                     let _ = tx.send(ReplyChunk::Text(full_text));
@@ -3582,7 +3655,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                     // session updates, so removing the whole entry here drops
                     // every update emitted between prompts.
                     remove_reply_sink_if_owner(registry, key, &turn_id);
-                    return;
+                    return None;
                 }
                 Some(command) if command.starts_with("finish_turn:") => {
                     let reason = command
@@ -3591,7 +3664,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                     let _ = tx.send(ReplyChunk::Text(full_text));
                     let _ = tx.send(ReplyChunk::Done(reason));
                     remove_reply_sink_if_owner(registry, key, &turn_id);
-                    return;
+                    return None;
                 }
                 _ => tx,
             }
@@ -3603,9 +3676,12 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                     method: "session/update".into(),
                     params: json!({ "sessionId": session_id, "update": update }),
                 };
-                let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+                return out_tx
+                    .send(serde_json::to_string(&notification).unwrap())
+                    .ok()
+                    .map(|_| accepted());
             }
-            return;
+            return None;
         }
     };
 
@@ -3628,7 +3704,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
         Some("agent_update") => {
             // Raw agent-side session/update payload (JSON in the text field).
             if let Ok(update) = serde_json::from_str::<serde_json::Value>(&full_text) {
-                let _ = tx.send(ReplyChunk::Update(update));
+                return tx.send(ReplyChunk::Update(update)).ok().map(|_| accepted());
             }
         }
         None | Some("send_message") => unreachable!("terminal replies return above"),
@@ -3640,6 +3716,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
         }
         _ => {}
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5701,11 +5778,15 @@ mod acp_review_fixes {
         );
 
         // Stale reply (previous turn's event id) → dropped.
-        handle_reply(
-            &reply("acp_chan", "evt_stale", "leaked", Some("edit_message")),
-            &registry,
-        )
-        .await;
+        assert!(
+            handle_reply(
+                &reply("acp_chan", "evt_stale", "leaked", Some("agent_update")),
+                &registry,
+            )
+            .await
+            .is_none(),
+            "a rejected event cannot authorize continuation observation"
+        );
         assert!(
             rx.try_recv().is_err(),
             "stale reply must not reach the active turn"
@@ -6869,6 +6950,7 @@ mod acp_ws_integration {
             // Keyless loopback: no bearer. A client sending no `Origin` is accepted, which is
             // what a non-browser client (this test, and the real extension's native host) is.
             auth_key: None,
+            control_key: None,
             allowed_origins: vec![],
         });
         let reply_registry = new_reply_registry();
@@ -6893,6 +6975,7 @@ mod acp_ws_integration {
         let mut state = crate::AppState::test_default(tx);
         state.acp = Some(AcpConfig {
             auth_key: None,
+            control_key: Some("operator-fixture-key".into()),
             allowed_origins: vec![],
         });
         let registry = new_reply_registry();
@@ -6911,9 +6994,13 @@ mod acp_ws_integration {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/acp"))
-            .await
-            .unwrap();
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}/acp").into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            "Bearer operator-fixture-key".parse().unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         send(
             &mut ws,
             json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"dev.openab/sessionSnapshots":true}}}}),
@@ -6932,6 +7019,63 @@ mod acp_ws_integration {
             events.try_recv().is_err(),
             "a state read must not dispatch work"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_client_cannot_control_foreign_runtime_requests() {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(events);
+        state.acp = Some(AcpConfig {
+            auth_key: Some("ordinary-fixture".into()),
+            control_key: Some("independent-operator-fixture".into()),
+            allowed_origins: vec![],
+        });
+        state.acp_session_snapshot = Some(Arc::new(|_| {
+            Box::pin(async { json!({"epoch":"provider","state":"active","operation":"prompt"}) })
+        }));
+        state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        for (key, operator) in [
+            ("ordinary-fixture", false),
+            ("independent-operator-fixture", true),
+        ] {
+            let mut request = format!("ws://{address}/acp").into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert("Authorization", format!("Bearer {key}").parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            send(&mut ws, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"dev.openab/sessionSnapshots":true}}}})).await;
+            let _ = recv(&mut ws).await;
+            let session = "sess_173201f5-7973-4186-ae78-e63c2988d1b9";
+            let register = json!({"sessionId":session,"operation":"register","userId":"victim","waitId":"w","wait":{"userId":"victim","waitId":"w","kind":"plan","sessionId":session}});
+            let resolve = json!({"sessionId":session,"operation":"resolve","userId":"victim","waitId":"w","decision":{"approved":true}});
+            for (method, params) in [
+                ("_openab/runtime/state", json!({})),
+                ("_openab/session/state", json!({"sessionId":session})),
+                ("_openab/session/requests", register),
+                ("_openab/session/requests", resolve),
+            ] {
+                send(
+                    &mut ws,
+                    json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
+                )
+                .await;
+                let response = recv(&mut ws).await;
+                if operator {
+                    assert!(response.get("result").is_some(), "{response}");
+                } else {
+                    assert_eq!(response["error"]["code"], -32003, "{response}");
+                }
+            }
+        }
     }
 
     async fn serve() -> (String, AcpTunnelRegistry) {

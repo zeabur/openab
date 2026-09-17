@@ -113,11 +113,15 @@ impl UnifiedGatewayAdapter {
                         &reply.channel.id,
                     )
                     .await;
-                    openab_gateway::adapters::acp_server::handle_reply(reply, registry).await;
-                    openab_gateway::adapters::acp_server::observe_runtime_reply(
-                        &self.gw_state,
-                        reply,
-                    );
+                    if let Some(accepted) =
+                        openab_gateway::adapters::acp_server::handle_reply(reply, registry).await
+                    {
+                        openab_gateway::adapters::acp_server::observe_runtime_reply(
+                            &self.gw_state,
+                            reply,
+                            accepted,
+                        );
+                    }
                 }
             }
             other => {

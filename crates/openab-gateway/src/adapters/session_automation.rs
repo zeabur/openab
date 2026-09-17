@@ -9,11 +9,14 @@ struct Automation {
     context: Option<(Vec<Value>, Option<Value>)>,
     pending: BTreeSet<String>,
     observed: BTreeSet<String>,
+    origins: BTreeSet<String>,
+    tasks: HashMap<String, String>,
     generation: u64,
     worker: bool,
     running: bool,
     cancelled: bool,
     blocked_on: Option<String>,
+    provider_epoch: Option<String>,
     error: Option<String>,
 }
 impl SessionAutomation {
@@ -28,7 +31,9 @@ impl SessionAutomation {
     #[cfg(test)]
     pub(super) fn configure(&self, channel: &str, servers: Vec<Value>, meta: Option<Value>) {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        all.entry(channel.into()).or_default().context = Some((servers, meta));
+        let entry = all.entry(channel.into()).or_default();
+        entry.context = Some((servers, meta));
+        entry.origins.insert("fixture-turn".into());
     }
     /// Serialize automatic dispatch with cancellation, through the broadcast write.
     pub(super) fn dispatch<T>(
@@ -36,6 +41,7 @@ impl SessionAutomation {
         channel: &str,
         generation: Option<u64>,
         context: Option<(Vec<Value>, Option<Value>)>,
+        origin: &str,
         action: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -51,6 +57,7 @@ impl SessionAutomation {
         if let Some(context) = context {
             let entry = all.entry(channel.into()).or_default();
             entry.context = Some(context);
+            entry.origins.insert(origin.into());
             if generation.is_none() {
                 entry.cancelled = false;
             }
@@ -65,12 +72,38 @@ impl SessionAutomation {
         if let Some(entry) = all.get_mut(channel) {
             entry.cancelled = true;
             entry.pending.clear();
+            entry.tasks.clear();
             entry.blocked_on = None;
             entry.generation += 1;
             entry.worker = false;
             entry.running = false;
         }
         action()
+    }
+    pub fn observe_provider_epoch(&self, channel: &str, epoch: Option<&str>) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = all.get_mut(channel) else {
+            return;
+        };
+        if entry
+            .provider_epoch
+            .as_deref()
+            .is_some_and(|previous| previous != epoch)
+        {
+            if !entry.pending.is_empty() {
+                entry.error = Some("Provider replaced before automatic continuation".into());
+            }
+            entry.pending.clear();
+            entry.tasks.clear();
+            entry.observed.clear();
+            entry.worker = false;
+            entry.running = false;
+            entry.generation += 1;
+        }
+        entry.provider_epoch = Some(epoch.into());
     }
     fn blocked_on(&self, channel: &str, generation: u64, reason: Option<&str>) {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -87,19 +120,25 @@ impl SessionAutomation {
             None => json!({"pending":[],"running":false,"error":null}),
         }
     }
-    fn observe(&self, channel: &str, update: &Value) -> Option<u64> {
-        if update["sessionUpdate"] != "async_task_state_update"
-            || !matches!(update["state"].as_str(), Some("completed" | "failed"))
-        {
+    fn observe(&self, channel: &str, update: &Value, accepted: &AcceptedReply) -> Option<u64> {
+        if accepted.channel != channel {
             return None;
         }
         let id = update["asyncTaskId"].as_str()?;
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let entry = all.get_mut(channel)?;
-        if entry.cancelled {
+        if entry.cancelled || !entry.origins.contains(&accepted.origin) {
             return None;
-        } // Explicit opt-in during session/prompt.
-        if !entry.observed.insert(id.into()) {
+        }
+        if update["sessionUpdate"] == "async_task_spawned" {
+            entry.tasks.insert(id.into(), accepted.origin.clone());
+            return None;
+        }
+        if update["sessionUpdate"] != "async_task_state_update"
+            || !matches!(update["state"].as_str(), Some("completed" | "failed"))
+            || !entry.tasks.contains_key(id)
+            || !entry.observed.insert(id.into())
+        {
             return None;
         }
         entry
@@ -114,7 +153,11 @@ impl SessionAutomation {
     }
 }
 
-pub fn observe_runtime_reply(state: &Arc<crate::AppState>, reply: &GatewayReply) {
+pub fn observe_runtime_reply(
+    state: &Arc<crate::AppState>,
+    reply: &GatewayReply,
+    accepted: AcceptedReply,
+) {
     if reply.command.as_deref() != Some("agent_update") {
         return;
     }
@@ -122,7 +165,10 @@ pub fn observe_runtime_reply(state: &Arc<crate::AppState>, reply: &GatewayReply)
         return;
     };
     let channel = reply.channel.id.clone();
-    let Some(generation) = state.acp_session_automation.observe(&channel, &update) else {
+    let Some(generation) = state
+        .acp_session_automation
+        .observe(&channel, &update, &accepted)
+    else {
         return;
     };
     let state = state.clone();
@@ -295,6 +341,19 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn accepted(channel: &str) -> AcceptedReply {
+        AcceptedReply {
+            channel: channel.into(),
+            origin: "fixture-turn".into(),
+        }
+    }
+    fn spawn_task(automation: &SessionAutomation, channel: &str, id: &str) {
+        automation.observe(
+            channel,
+            &json!({"sessionUpdate":"async_task_spawned","asyncTaskId":id}),
+            &accepted(channel),
+        );
+    }
     #[tokio::test]
     async fn runtime_starts_one_continuation_without_a_backend_prompt() {
         let (events, mut incoming) = tokio::sync::broadcast::channel(16);
@@ -327,13 +386,14 @@ mod tests {
             Some(json!({"ai.nuphos/runtimeAuthority":2})),
         );
         let update = json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"});
+        spawn_task(&state.acp_session_automation, channel, "t");
         let generation = state
             .acp_session_automation
-            .observe(channel, &update)
+            .observe(channel, &update, &accepted(channel))
             .unwrap();
         assert!(state
             .acp_session_automation
-            .observe(channel, &update)
+            .observe(channel, &update, &accepted(channel))
             .is_none());
         assert_eq!(
             read_runtime_snapshot(&state, channel).await.unwrap()["phase"],
@@ -381,9 +441,10 @@ mod tests {
     fn cancellation_fences_an_automatic_dispatch_already_waiting_for_admission() {
         let automation = SessionAutomation::default();
         automation.configure("s", vec![], None);
-        let generation = automation.observe("s", &json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"})).unwrap();
+        spawn_task(&automation, "s", "t");
+        let generation = automation.observe("s", &json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"}), &accepted("s")).unwrap();
         automation.cancel("s");
-        let result = automation.dispatch("s", Some(generation), None, || {
+        let result = automation.dispatch("s", Some(generation), None, "fixture-turn", || {
             panic!("cancelled continuation must never dispatch")
         });
         assert_eq!(
@@ -396,13 +457,38 @@ mod tests {
     fn opt_in_deduplicates_completion_and_cancel_fences_worker() {
         let automation = SessionAutomation::default();
         let update = json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"});
-        assert_eq!(automation.observe("s", &update), None);
+        assert_eq!(automation.observe("s", &update, &accepted("s")), None);
         automation.configure("s", vec![], None);
-        assert_eq!(automation.observe("s", &update), Some(0));
-        assert_eq!(automation.observe("s", &update), None);
+        spawn_task(&automation, "s", "t");
+        assert_eq!(automation.observe("s", &update, &accepted("s")), Some(0));
+        assert_eq!(automation.observe("s", &update, &accepted("s")), None);
         assert_eq!(automation.snapshot("s")["pending"], json!(["t:completed"]));
         automation.cancel("s");
         assert_eq!(automation.snapshot("s")["pending"], json!([]));
-        assert_eq!(automation.observe("s", &update), None);
+        assert_eq!(automation.observe("s", &update, &accepted("s")), None);
+    }
+    #[test]
+    fn unknown_foreign_and_replaced_tasks_cannot_resume() {
+        let automation = SessionAutomation::default();
+        automation.configure("s", vec![], None);
+        automation.observe_provider_epoch("s", Some("first"));
+        let done = json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"});
+        assert_eq!(automation.observe("s", &done, &accepted("s")), None);
+        let foreign = AcceptedReply {
+            channel: "s".into(),
+            origin: "foreign-turn".into(),
+        };
+        automation.observe(
+            "s",
+            &json!({"sessionUpdate":"async_task_spawned","asyncTaskId":"t"}),
+            &foreign,
+        );
+        assert_eq!(automation.observe("s", &done, &accepted("s")), None);
+        spawn_task(&automation, "s", "t");
+        assert_eq!(automation.observe("s", &done, &foreign), None);
+        assert_eq!(automation.observe("s", &done, &accepted("other")), None);
+        automation.observe_provider_epoch("s", Some("replacement"));
+        assert_eq!(automation.observe("s", &done, &accepted("s")), None);
+        assert_eq!(automation.snapshot("s")["pending"], json!([]));
     }
 }

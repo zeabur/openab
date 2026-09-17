@@ -39,12 +39,36 @@ persist a competing execution state. Observation freshness/disconnection is a
 transport property, not a synthesized idle/active transition. Unknown provider
 states and flags remain visible and do not grant send capability.
 
+## Operator boundary and accepted events
+
+`OPENAB_ACP_CONTROL_KEY` is a separate, at least 32-character credential, distinct
+from `OPENAB_ACP_AUTH_KEY`. Only this operator credential authorizes runtime-wide
+inventory, blocking-request RPCs and cross-connection snapshot/cancel operations.
+Ordinary ACP authentication never grants this role. The application backend is
+the trusted operator: it authenticates end users and delegates their principal in
+`userId`; that field alone is not authentication. Protect the operator key as a
+backend secret and never distribute it to an untrusted ACP client.
+
+Continuation observation occurs only after reply routing accepts the event.
+Accepted prompt origins and observed task-spawn identities fence unknown and
+foreign task completions; replacement provider epochs invalidate task ownership.
+
 ## Compatibility and migration
 
 Snapshot pushes require initialize capability
 `clientCapabilities._meta["dev.openab/sessionSnapshots"] = true`.
 Runtime continuations require session `_meta["ai.nuphos/runtimeAuthority"] = 2`.
 Defaults preserve existing clients' continuation ownership.
+A prompt can separately opt in with `_meta["ai.nuphos/acknowledgePrompt"] = true`.
+After admission and before provider dispatch, the runtime emits notification
+`_openab/session/prompt_accepted` with `{sessionId, requestId}`. Clients use this
+acknowledgement to bind command-local output and principal context only to the
+accepted command. A refused prompt receives its JSON-RPC error without this
+notification. Clients without the opt-in retain the standard ACP response flow.
+
+Provision the separate operator key before migrating backend control queries.
+Ordinary clients may read v2 snapshots only for sessions attached to their own
+connection; inventory and request-store RPCs require the operator credential.
 
 Deploy the unified runtime first, then clients that require schemaVersion 2.
 Disable backend/client continuation timers when enabling runtime authority.

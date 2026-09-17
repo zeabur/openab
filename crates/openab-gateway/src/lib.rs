@@ -1272,11 +1272,15 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                         &reply.channel.id,
                                     )
                                     .await;
-                                    adapters::acp_server::handle_reply(&reply, registry).await;
-                                    adapters::acp_server::observe_runtime_reply(
-                                        &state_for_recv,
-                                        &reply,
-                                    );
+                                    if let Some(accepted) =
+                                        adapters::acp_server::handle_reply(&reply, registry).await
+                                    {
+                                        adapters::acp_server::observe_runtime_reply(
+                                            &state_for_recv,
+                                            &reply,
+                                            accepted,
+                                        );
+                                    }
                                 }
                             }
                             #[cfg(feature = "lineworks")]
