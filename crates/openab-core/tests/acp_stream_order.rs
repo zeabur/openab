@@ -282,26 +282,66 @@ async fn setup_complete(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn acp_turn_waits_for_tool_that_finishes_after_prompt_response() {
+async fn acp_turn_completes_without_waiting_for_background_tool() {
+    let _guard = env_lock();
+    // The tool never supplies a terminal update. Neither this turn nor the
+    // next prompt on the same session may be held by its card's status.
+    let agent = LATE_TOOL_AGENT
+        .lines()
+        .filter(|line| !line.contains("tool_call_update"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fx = setup_with_agent("acp", "acp:unfinished-tool", &agent).await;
+    let recorder = Arc::new(RecordingAdapter::new(false));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    for _ in 0..2 {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_turn(&fx, &adapter, "acp:unfinished-tool"),
+        )
+        .await
+        .expect("provider completion must release admission for the next prompt");
+    }
+    assert_eq!(recorder.calls().iter().filter(|call|
+        matches!(call, Call::Terminal { stop_reason: Some(reason), .. } if reason == "end_turn")
+    ).count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_late_background_tool_update_survives_prompt_completion() {
     let _guard = env_lock();
     let fx = setup_with_agent("acp", "acp:late-tool", LATE_TOOL_AGENT).await;
     let recorder = Arc::new(RecordingAdapter::new(false));
     let adapter: Arc<dyn ChatAdapter> = recorder.clone();
-    run_turn(&fx, &adapter, "acp:late-tool").await;
-
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_turn(&fx, &adapter, "acp:late-tool"),
+    )
+    .await
+    .expect("provider completion must not wait for a background tool");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !recorder
+            .calls()
+            .contains(&Call::Update("tool_call_update".into()))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late tool result must reach the background relay");
+    let calls = recorder.calls();
     assert_eq!(
-        recorder.calls(),
-        vec![
-            Call::Edit { message_id: "draft".into(), content: "before".into() },
-            Call::Update("tool_call".into()),
-            Call::Update("tool_call_update".into()),
-            Call::Terminal {
-                content: "before".into(),
-                stop_reason: Some("end_turn".into()),
-            },
-        ],
-        "the model response must not split a still-running prompt-owned tool into an autonomous turn"
+        calls
+            .iter()
+            .filter(|call| matches!(call, Call::Terminal { .. }))
+            .count(),
+        1
     );
+    assert!(calls.contains(&Call::Update("tool_call".into())));
+    assert!(calls.contains(&Call::Terminal {
+        content: "before".into(),
+        stop_reason: Some("end_turn".into()),
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread")]

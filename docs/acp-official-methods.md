@@ -123,6 +123,18 @@ background-tool updates, output sinks, and pending tool counts cannot change
 this snapshot. Existing adapters that do not publish lifecycle remain unknown;
 this extension does not fabricate an idle or active state for them.
 
+### Prompt completion and background tool results
+
+The provider's response to the matching `session/prompt` ends that prompt,
+including when tools still have nonterminal cards. OpenAB releases its prompt
+lock and returns the provider's `stopReason`; it does not wait for tool-count
+quiescence. Results arriving afterward remain session updates, including frames
+already buffered during the handoff to the idle subscriber.
+
+**Migration:** clients must keep observing session updates after a prompt response
+if they want background tool results. A late tool result is not itself evidence
+of another active model turn; use the native execution snapshot for that.
+
 ### Unified runtime session configuration
 
 The unified binary advertises `agentCapabilities._meta["dev.openab/sessionConfig"]`
