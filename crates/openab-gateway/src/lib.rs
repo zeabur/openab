@@ -55,6 +55,23 @@ pub type AcpSessionSnapshot = Arc<
         + Sync,
 >;
 
+#[cfg(feature = "acp")]
+pub type AcpSessionCancel = Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(feature = "acp")]
+pub type AcpSessionInventory = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Coalesced pool-cancel queue: inserts are deduplicated by thread key,
 /// so every distinct session's cancel is retained even if one client
 /// sends many cancels. Memory is bounded by the number of live sessions.
@@ -133,6 +150,18 @@ pub struct AppState {
     #[cfg(feature = "acp")]
     pub acp_session_snapshot: Option<AcpSessionSnapshot>,
     #[cfg(feature = "acp")]
+    pub acp_session_cancel: Option<AcpSessionCancel>,
+    #[cfg(feature = "acp")]
+    pub acp_session_inventory: Option<AcpSessionInventory>,
+    #[cfg(feature = "acp")]
+    pub acp_session_automation: adapters::acp_server::SessionAutomation,
+    #[cfg(feature = "acp")]
+    pub acp_session_operations: Arc<adapters::session_operations::SessionOperations>,
+    #[cfg(feature = "acp")]
+    pub acp_session_states: adapters::session_snapshot::SessionSnapshots,
+    #[cfg(feature = "acp")]
+    pub acp_session_requests: adapters::session_requests::SessionRequests,
+    #[cfg(feature = "acp")]
     pub acp_reply_registry: Option<adapters::acp_server::AcpReplyRegistry>,
     #[cfg(feature = "acp")]
     pub acp_tunnel_registry: Option<adapters::acp_server::AcpTunnelRegistry>,
@@ -206,6 +235,18 @@ impl AppState {
             acp: None,
             #[cfg(feature = "acp")]
             acp_session_snapshot: None,
+            #[cfg(feature = "acp")]
+            acp_session_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_session_inventory: None,
+            #[cfg(feature = "acp")]
+            acp_session_automation: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_session_operations: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_session_states: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_session_requests: Default::default(),
             #[cfg(feature = "acp")]
             acp_reply_registry: None,
             #[cfg(feature = "acp")]
@@ -342,6 +383,18 @@ impl AppState {
             acp,
             #[cfg(feature = "acp")]
             acp_session_snapshot: None,
+            #[cfg(feature = "acp")]
+            acp_session_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_session_inventory: None,
+            #[cfg(feature = "acp")]
+            acp_session_automation: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_session_operations: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_session_states: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_session_requests: Default::default(),
             #[cfg(feature = "acp")]
             acp_reply_registry,
             #[cfg(feature = "acp")]
@@ -956,6 +1009,18 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         #[cfg(feature = "acp")]
         acp_session_snapshot: None,
         #[cfg(feature = "acp")]
+        acp_session_cancel: None,
+        #[cfg(feature = "acp")]
+        acp_session_inventory: None,
+        #[cfg(feature = "acp")]
+        acp_session_automation: Default::default(),
+        #[cfg(feature = "acp")]
+        acp_session_operations: Default::default(),
+        #[cfg(feature = "acp")]
+        acp_session_states: Default::default(),
+        #[cfg(feature = "acp")]
+        acp_session_requests: Default::default(),
+        #[cfg(feature = "acp")]
         acp_reply_registry,
         #[cfg(feature = "acp")]
         acp_tunnel_registry,
@@ -1202,7 +1267,16 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             #[cfg(feature = "acp")]
                             "acp" => {
                                 if let Some(ref registry) = state_for_recv.acp_reply_registry {
+                                    adapters::acp_server::publish_runtime_snapshot(
+                                        &state_for_recv,
+                                        &reply.channel.id,
+                                    )
+                                    .await;
                                     adapters::acp_server::handle_reply(&reply, registry).await;
+                                    adapters::acp_server::observe_runtime_reply(
+                                        &state_for_recv,
+                                        &reply,
+                                    );
                                 }
                             }
                             #[cfg(feature = "lineworks")]

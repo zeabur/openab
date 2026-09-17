@@ -108,7 +108,16 @@ impl UnifiedGatewayAdapter {
             #[cfg(feature = "acp")]
             "acp" => {
                 if let Some(ref registry) = self.gw_state.acp_reply_registry {
+                    openab_gateway::adapters::acp_server::publish_runtime_snapshot(
+                        &self.gw_state,
+                        &reply.channel.id,
+                    )
+                    .await;
                     openab_gateway::adapters::acp_server::handle_reply(reply, registry).await;
+                    openab_gateway::adapters::acp_server::observe_runtime_reply(
+                        &self.gw_state,
+                        reply,
+                    );
                 }
             }
             other => {

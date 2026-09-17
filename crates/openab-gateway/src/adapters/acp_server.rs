@@ -12,6 +12,10 @@
 //! existing event pipeline. Replies (`GatewayReply`) are translated back into ACP
 //! notifications and streamed to the client.
 
+#[path = "session_automation.rs"]
+mod automation;
+pub use automation::{observe_runtime_reply, SessionAutomation};
+
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -1604,6 +1608,68 @@ fn spawn_acp_tunnels(
     }
 }
 
+async fn read_runtime_snapshot(state: &crate::AppState, channel: &str) -> Option<Value> {
+    let read = state.acp_session_snapshot.as_ref()?;
+    let mut provider = read(channel.to_string()).await;
+    provider["gateway"] = state.acp_session_operations.snapshot(channel);
+    if provider["state"] == "active"
+        && provider["operation"] == "none"
+        && provider["gateway"]["cancelling"] != true
+    {
+        state.acp_session_requests.open(channel);
+    }
+    if matches!(provider["state"].as_str(), Some("interrupted" | "dormant"))
+        && !state.acp_session_requests.pending(channel).is_empty()
+    {
+        state.acp_session_requests.cancel_pending(channel);
+    }
+    provider["automation"] = state.acp_session_automation.snapshot(channel);
+    provider["requests"] = json!(state.acp_session_requests.pending(channel));
+    let pending = state.acp_session_operations.pending(channel)
+        || state.acp_reply_registry.as_ref().is_some_and(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(channel)
+                .is_some_and(|sink| sink.turn_id.is_some())
+        });
+    Some(state.acp_session_states.project(channel, provider, pending))
+}
+
+/// Publish lifecycle before native content: even a sub-tick autonomous turn must
+/// open its transcript before its first token. Native idle cannot close the
+/// transcript while the gateway is still delivering the final response.
+pub async fn publish_runtime_snapshot(state: &crate::AppState, channel: &str) {
+    if !state.acp_session_automation.enabled(channel) {
+        return;
+    }
+    let Some(snapshot) = read_runtime_snapshot(state, channel).await else {
+        return;
+    };
+    let route = state.acp_reply_registry.as_ref().and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(channel)
+            .map(|sink| {
+                (
+                    sink.session_id.clone(),
+                    sink.out_tx.clone(),
+                    sink.owner.clone(),
+                )
+            })
+    });
+    if let Some((session, output, owner)) = route {
+        if !state
+            .acp_session_states
+            .should_publish(channel, &snapshot, &owner)
+        {
+            return;
+        }
+        let _ = output.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"runtime_state","snapshot":snapshot}}}).to_string());
+    }
+}
+
 async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
@@ -1644,6 +1710,44 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
     // Channel for sending messages back to the client
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+
+    // Runtime-owned snapshots are pushed independently of text/tool output.
+    // This also reports permission waits when the model has emitted no new tokens.
+    let snapshots_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let snapshot_task = {
+        let enabled = snapshots_enabled.clone();
+        let state = state.clone();
+        let sessions = sessions.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let mut sent: HashMap<String, Value> = HashMap::new();
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                tick.tick().await;
+                if !enabled.load(Ordering::Acquire) {
+                    continue;
+                }
+                let channels: Vec<_> = sessions
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(id, session)| (id.clone(), session.channel_id.clone()))
+                    .collect();
+                for (id, channel) in channels {
+                    if let Some(snapshot) = read_runtime_snapshot(&state, &channel).await {
+                        if sent.get(&id) == Some(&snapshot) {
+                            continue;
+                        }
+                        sent.insert(id.clone(), snapshot.clone());
+                        let notification = json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":id,"update":{"sessionUpdate":"runtime_state","snapshot":snapshot}}});
+                        if out_tx.send(notification.to_string()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+    };
 
     // Forward outbound messages to WebSocket. Single choke point for every outbound
     // frame, so trace here rather than at each send site.
@@ -1791,6 +1895,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     | "session/prompt"
                     | "session/set_config_option"
                     | "_openab/session/config_options"
+                    | "_openab/session/state"
+                    | "_openab/runtime/state"
+                    | "_openab/session/requests"
             )
         {
             debug!(method = %req.method, "ACP request-only method sent without id (notification) — ignored");
@@ -1814,6 +1921,16 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 if negotiated_ok {
                     initialized = true;
+                    snapshots_enabled.store(
+                        req.params
+                            .as_ref()
+                            .and_then(|p| {
+                                p.pointer("/clientCapabilities/_meta/dev.openab~1sessionSnapshots")
+                            })
+                            .and_then(Value::as_bool)
+                            == Some(true),
+                        Ordering::Release,
+                    );
                 }
             }
             "session/new" => {
@@ -2097,6 +2214,56 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     );
                 }
             }
+            "_openab/runtime/state" => {
+                let response = if !initialized {
+                    JsonRpcResponse::error(id, -32002, "Not initialized")
+                } else if let Some(inventory) = &state.acp_session_inventory {
+                    let mut channels = inventory().await;
+                    channels.extend(state.acp_session_operations.channels());
+                    channels.sort();
+                    channels.dedup();
+                    let mut snapshots = Vec::new();
+                    for channel in channels {
+                        if let Some(snapshot) = read_runtime_snapshot(&state, &channel).await {
+                            snapshots.push(snapshot);
+                        }
+                    }
+                    JsonRpcResponse::success(id, json!({"sessions":snapshots}))
+                } else {
+                    JsonRpcResponse::error(id, -32601, "Runtime inventory unavailable")
+                };
+                let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            "_openab/session/requests" => {
+                let response = if !initialized {
+                    JsonRpcResponse::error(id, -32002, "Not initialized")
+                } else if let Some(params) = req.params.as_ref() {
+                    if let Some(channel) = params["sessionId"].as_str().and_then(derive_channel_id)
+                    {
+                        let snapshot = read_runtime_snapshot(&state, &channel).await;
+                        if params["operation"] == "register"
+                            && !snapshot.as_ref().is_some_and(|s| s["state"] == "active")
+                        {
+                            let response = JsonRpcResponse::error(
+                                id,
+                                -32001,
+                                "No active runtime operation owns this request",
+                            );
+                            let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                        match state.acp_session_requests.handle(&channel, params) {
+                            Ok(result) => JsonRpcResponse::success(id, result),
+                            Err(error) => JsonRpcResponse::error(id, -32602, error),
+                        }
+                    } else {
+                        JsonRpcResponse::error(id, -32602, "Invalid sessionId")
+                    }
+                } else {
+                    JsonRpcResponse::error(id, -32602, "Missing params")
+                };
+                let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+            }
             "_openab/session/state" => {
                 if !initialized {
                     let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
@@ -2116,12 +2283,27 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     (None, _) => JsonRpcResponse::error(id, -32602, "Invalid sessionId"),
                     (_, None) => JsonRpcResponse::error(id, -32601, "Runtime state unavailable"),
                     (Some(channel), Some(read)) => {
-                        JsonRpcResponse::success(id, read(channel).await)
+                        let snapshot = if snapshots_enabled.load(Ordering::Acquire) {
+                            read_runtime_snapshot(&state, &channel).await.unwrap()
+                        } else {
+                            read(channel).await
+                        };
+                        JsonRpcResponse::success(id, snapshot)
                     }
                 };
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             }
             "session/prompt" => {
+                if req
+                    .params
+                    .as_ref()
+                    .is_some_and(|p| p.get("_runtimeResumeGeneration").is_some())
+                {
+                    let response = JsonRpcResponse::error(id, -32602, "Reserved runtime parameter");
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
                 if !initialized {
                     let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -2157,6 +2339,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         continue;
                     }
                 };
+                let operation = derive_channel_id(&session_id)
+                    .map(|channel| state.acp_session_operations.prompt(channel));
                 let cancel = Arc::new(tokio::sync::Notify::new());
                 {
                     let mut guard = sessions.lock().await;
@@ -2194,6 +2378,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 let out_tx_clone = out_tx.clone();
                 let conn_for_prompt = connection_id.clone();
                 let handle = tokio::spawn(async move {
+                    let _operation = operation;
                     handle_session_prompt(
                         &state_clone,
                         &sessions_clone,
@@ -2282,6 +2467,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     // Announce the close BEFORE anything is torn down. An establish that is past its last await
     // point cannot be aborted, so the flag — not `abort()` — is what stops it installing a handle
     // for a connection that no longer exists.
+    snapshot_task.abort();
     connection_closed.store(true, std::sync::atomic::Ordering::Release);
     // Abort any in-flight tasks to prevent registry leaks. Establishes are aborted too: a task
     // still waiting on `mcp/connect` would otherwise insert a handle into the registry AFTER the
@@ -2630,8 +2816,49 @@ async fn handle_session_cancel(
             .lock()
             .await
             .get(k)
-            .map(|session| session.channel_id.clone());
+            .map(|session| session.channel_id.clone())
+            .or_else(|| derive_channel_id(k));
         if let Some(channel_id) = channel_id.clone() {
+            if let Some(cancel_native) = state.acp_session_cancel.clone() {
+                let cancellation = state.acp_session_automation.cancel_with(&channel_id, || {
+                    state.acp_session_requests.cancel_pending(&channel_id);
+                    state
+                        .acp_session_operations
+                        .start_cancellation(channel_id.clone())
+                });
+                if let Some((operation, generation)) = cancellation {
+                    let state = state.clone();
+                    let channel = channel_id.clone();
+                    tokio::spawn(async move {
+                        let _operation = operation;
+                        while let Some(read) = &state.acp_session_snapshot {
+                            let provider = read(channel.clone()).await;
+                            if !state
+                                .acp_session_operations
+                                .cancelling(&channel, generation)
+                            {
+                                break;
+                            }
+                            if state.acp_session_operations.pending_count(&channel) <= 1
+                                && provider["state"] != "active"
+                                && provider["operation"].as_str().is_none_or(|op| op == "none")
+                            {
+                                state
+                                    .acp_session_operations
+                                    .finish_cancellation(&channel, generation);
+                                break;
+                            }
+                            // Await delivery to native stdin. The cancellation guard blocks
+                            // successors until this await and the native prompt both settle.
+                            let _ = cancel_native(channel.clone()).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    });
+                }
+                return None;
+            }
+            state.acp_session_requests.cancel_pending(&channel_id);
+            state.acp_session_automation.cancel(&channel_id);
             let mut event = GatewayEvent::new(
                 "acp",
                 ChannelInfo {
@@ -2771,6 +2998,7 @@ async fn handle_session_config(
             "Session configuration requires the unified runtime",
         );
     };
+    let _operation = state.acp_session_operations.configuration(channel.clone());
     let (reply, response) = tokio::sync::oneshot::channel();
     if tx
         .try_send(crate::AcpPoolConfigRequest {
@@ -2944,6 +3172,36 @@ async fn handle_session_prompt(
             }
         };
 
+    let _operation = state.acp_session_operations.prompt(channel_id.clone());
+    if let Some(read) = &state.acp_session_snapshot {
+        let provider = read(channel_id.clone()).await;
+        if state.acp_session_operations.snapshot(&channel_id)["cancelling"] == true
+            || state.acp_session_operations.snapshot(&channel_id)["configuring"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+            || !matches!(
+                provider["state"].as_str(),
+                Some("idle" | "dormant" | "interrupted")
+            )
+            || provider["operation"]
+                .as_str()
+                .is_some_and(|op| op != "none")
+            || !state.acp_session_requests.pending(&channel_id).is_empty()
+            || (params
+                .and_then(|p| p.get("_runtimeResumeGeneration"))
+                .is_none()
+                && state.acp_session_automation.snapshot(&channel_id)["pending"]
+                    .as_array()
+                    .is_some_and(|pending| !pending.is_empty()))
+        {
+            let response = JsonRpcResponse::error(id, -32001, "Runtime session is busy");
+            let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+            release_prompt(sessions, &session_id).await;
+            return;
+        }
+    }
+
     // Convert to GatewayEvent and dispatch. Build it first so its `event_id` can fence
     // this turn's replies (round-tripped as `GatewayReply.reply_to`).
     let event = GatewayEvent::new(
@@ -2970,50 +3228,71 @@ async fn handle_session_prompt(
     // Create reply channel for this prompt and register it, keyed by channel_id with the
     // turn's event id so `handle_reply` can drop a stale reply after timeout/cancel reuse.
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<ReplyChunk>();
-    if let Some(ref registry) = state.acp_reply_registry {
-        if !activate_reply_sink(
-            registry,
-            &channel_id,
-            ReplySink {
-                turn_id: Some(turn_id.clone()),
-                tx: Some(reply_tx),
-                session_id: session_id.clone(),
-                out_tx: out_tx.clone(),
-                owner: connection_id.to_string(),
-                generation: connection_generation,
-                permission_relay,
-            },
-        ) {
-            let resp = JsonRpcResponse::error(id, -32603, "ACP session output sink is unavailable");
-            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            release_prompt(sessions, &session_id).await;
-            return;
-        }
-    }
-
-    // Send event through the broadcast channel
-    match serde_json::to_string(&event) {
-        Ok(json) => {
-            if state.event_tx.send(json).is_err() {
-                // No receivers — agent/core not connected
-                warn!("ACP: event_tx send failed — no agent connected");
-                let resp = JsonRpcResponse::error(id, -32603, "No agent backend connected");
-                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                release_prompt(sessions, &session_id).await;
-                // Cleanup registry — only this turn's own sink (F4).
-                if let Some(ref registry) = state.acp_reply_registry {
-                    remove_reply_sink_if_owner(registry, &channel_id, &turn_id);
-                }
-                return;
+    let resume_generation = params
+        .and_then(|p| p.get("_runtimeResumeGeneration"))
+        .and_then(Value::as_u64);
+    let automation_context = event
+        .channel
+        .session_meta
+        .as_ref()
+        .is_some_and(|meta| meta["ai.nuphos/runtimeAuthority"] == 2)
+        .then(|| {
+            (
+                event.channel.mcp_servers.clone(),
+                event.channel.session_meta.clone(),
+            )
+        });
+    let mut admitted = false;
+    let dispatch = state.acp_session_automation.dispatch(
+        &channel_id,
+        resume_generation,
+        automation_context,
+        || {
+            if state.acp_session_operations.snapshot(&channel_id)["cancelling"] == true {
+                return Err("Runtime session is busy".into());
             }
+            if let Some(registry) = &state.acp_reply_registry {
+                if !activate_reply_sink(
+                    registry,
+                    &channel_id,
+                    ReplySink {
+                        turn_id: Some(turn_id.clone()),
+                        tx: Some(reply_tx),
+                        session_id: session_id.clone(),
+                        out_tx: out_tx.clone(),
+                        owner: connection_id.to_string(),
+                        generation: connection_generation,
+                        permission_relay,
+                    },
+                ) {
+                    return Err("ACP session output sink is unavailable".into());
+                }
+            }
+            admitted = true;
+            state.acp_session_requests.open(&channel_id);
+            state.acp_session_operations.accepted(&channel_id);
+            let payload =
+                serde_json::to_string(&event).map_err(|_| "Internal error".to_string())?;
+            state
+                .event_tx
+                .send(payload)
+                .map_err(|_| "No agent backend connected".to_string())?;
+            Ok(())
+        },
+    );
+    if let Err(error) = dispatch {
+        let response = JsonRpcResponse::error(id, -32603, error);
+        if admitted {
+            state
+                .acp_session_operations
+                .outcome(&channel_id, serde_json::to_value(&response).unwrap());
         }
-        Err(e) => {
-            warn!("ACP: failed to serialize event: {e}");
-            let resp = JsonRpcResponse::error(id, -32603, "Internal error");
-            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-            release_prompt(sessions, &session_id).await;
-            return;
+        let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+        release_prompt(sessions, &session_id).await;
+        if let Some(registry) = &state.acp_reply_registry {
+            remove_reply_sink_if_owner(registry, &channel_id, &turn_id);
         }
+        return;
     }
 
     debug!(session = %redact_id(&session_id), channel = %redact_id(&channel_id), "ACP: prompt dispatched");
@@ -3132,6 +3411,10 @@ async fn handle_session_prompt(
         };
         JsonRpcResponse::success(id, serde_json::to_value(&pr).unwrap())
     };
+    state.acp_session_operations.outcome(
+        &channel_id,
+        json!({"result":resp.result,"error":resp.error}),
+    );
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 }
 
@@ -6626,14 +6909,17 @@ mod acp_ws_integration {
             .unwrap();
         send(
             &mut ws,
-            json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"dev.openab/sessionSnapshots":true}}}}),
         )
         .await;
         let _ = recv(&mut ws).await;
         send(&mut ws, json!({"jsonrpc":"2.0", "id":2, "method":"_openab/session/state", "params":{"sessionId":"sess_173201f5-7973-4186-ae78-e63c2988d1b9"}})).await;
         let snapshot = recv(&mut ws).await;
         assert_eq!(snapshot["result"]["state"], "idle");
-        assert_eq!(snapshot["result"]["revision"], 4);
+        assert_eq!(snapshot["result"]["revision"], 0);
+        assert_eq!(snapshot["result"]["providerEpoch"], "provider-process");
+        assert_ne!(snapshot["result"]["epoch"], "provider-process");
+        assert_eq!(snapshot["result"]["actions"]["send"], true);
         assert!(registry.lock().unwrap().is_empty());
         assert!(
             events.try_recv().is_err(),
@@ -9519,5 +9805,98 @@ mod session_config_tests {
                 .is_none()
         );
         worker.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod runtime_authority_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancel_during_creation_is_delivered_before_a_successor_can_start() {
+        let (events, mut observed_events) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(events);
+        let provider = Arc::new(std::sync::Mutex::new(
+            json!({"state":"unknown","operation":"loading"}),
+        ));
+        let read_provider = provider.clone();
+        state.acp_session_snapshot = Some(Arc::new(move |_| {
+            let provider = read_provider.clone();
+            Box::pin(async move { provider.lock().unwrap().clone() })
+        }));
+        let channel = "acp_173201f5-7973-4186-ae78-e63c2988d1b9";
+        let session = "sess_173201f5-7973-4186-ae78-e63c2988d1b9";
+        let pending = Arc::new(std::sync::Mutex::new(Some(
+            state.acp_session_operations.prompt(channel.into()),
+        )));
+        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delivered = deliveries.clone();
+        let cancel_provider = provider.clone();
+        state.acp_session_cancel = Some(Arc::new(move |_| {
+            let pending = pending.clone();
+            let provider = cancel_provider.clone();
+            let delivered = delivered.clone();
+            Box::pin(async move {
+                if provider.lock().unwrap()["state"] != "active" {
+                    return Err("still creating".into());
+                }
+                delivered.fetch_add(1, Ordering::SeqCst);
+                *provider.lock().unwrap() = json!({"state":"idle","operation":"none"});
+                pending.lock().unwrap().take();
+                Ok(())
+            })
+        }));
+        let state = Arc::new(state);
+        let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let params = json!({"sessionId":session});
+        handle_session_cancel(
+            &state,
+            &sessions,
+            &state.event_tx,
+            Value::Null,
+            Some(&params),
+            true,
+        )
+        .await;
+        handle_session_cancel(
+            &state,
+            &sessions,
+            &state.event_tx,
+            Value::Null,
+            Some(&params),
+            true,
+        )
+        .await;
+        assert_eq!(
+            state.acp_session_operations.pending_count(channel),
+            2,
+            "duplicate cancels share one pending command"
+        );
+        let stopping = read_runtime_snapshot(&state, channel).await.unwrap();
+        assert_eq!(stopping["phase"], "cancelling");
+        assert_eq!(stopping["actions"]["send"], false);
+        *provider.lock().unwrap() = json!({"state":"active","operation":"prompt"});
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.acp_session_operations.pending(channel) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let stopped = read_runtime_snapshot(&state, channel).await.unwrap();
+        assert_eq!(stopped["phase"], "cancelled");
+        assert_eq!(stopped["actions"]["send"], true);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        state.acp_session_operations.accepted(channel);
+        *provider.lock().unwrap() = json!({"state":"active","operation":"prompt"});
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            deliveries.load(Ordering::SeqCst),
+            1,
+            "no old cancel reaches the successor"
+        );
+        assert!(
+            observed_events.try_recv().is_err(),
+            "control delivery is acknowledged, never queued twice"
+        );
     }
 }

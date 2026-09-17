@@ -1187,6 +1187,27 @@ async fn main() -> anyhow::Result<()> {
                     )
                 }));
 
+                let inventory_pool = pool.clone();
+                gw_state_inner.acp_session_inventory = Some(Arc::new(move || {
+                    let pool = inventory_pool.clone();
+                    Box::pin(async move {
+                        pool.execution_session_keys()
+                            .await
+                            .into_iter()
+                            .filter_map(|key| key.strip_prefix("acp:").map(str::to_owned))
+                            .collect()
+                    })
+                }));
+                let direct_cancel_pool = pool.clone();
+                gw_state_inner.acp_session_cancel = Some(Arc::new(move |channel: String| {
+                    let pool = direct_cancel_pool.clone();
+                    Box::pin(async move {
+                        pool.cancel_session(&format!("acp:{channel}"))
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }));
+
                 // Bridge ACP session/cancel to the pool: the gateway inserts
                 // thread keys into a coalesced set, the receiver drains and
                 // calls pool.cancel_session(). Dedup guarantees every distinct
