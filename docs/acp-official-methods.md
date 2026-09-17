@@ -122,3 +122,35 @@ provider's native lifecycle, including its turn-ordering fences. Text, usage,
 background-tool updates, output sinks, and pending tool counts cannot change
 this snapshot. Existing adapters that do not publish lifecycle remain unknown;
 this extension does not fabricate an idle or active state for them.
+
+### Unified runtime session configuration
+
+The unified binary advertises `agentCapabilities._meta["dev.openab/sessionConfig"]`
+when the session configuration bridge is installed. Clients can read an **existing,
+idle inner session** with `_openab/session/config_options` (`{sessionId}`), and set a
+runtime-advertised string selection using ACP `session/set_config_option`
+(`{sessionId, configId, value}`). Both return `{configOptions}` from the inner agent.
+The session ID is the same opaque resume capability; it can be used on a control-only
+connection after `initialize`, without taking over that session's output sink.
+
+Without the explicit restore context below, neither method creates/resumes an inner
+session or starts a model turn. A dormant
+session returns `-32004`, a busy session `-32005`, an invalid selection `-32602`, and
+an unconfirmed agent write `-32603`. The standalone gateway without the bridge returns
+`-32601`. Notification-shaped requests are ignored. Unlike interactive slash-command
+handling, API writes never fall back to prompts or synthesize a successful selection.
+Only select/string options are exposed (the inner initialize does not advertise boolean
+configuration support). Available options and effort/Fast support remain agent-owned.
+
+### Restoring configuration after idle eviction or restart
+
+`_openab/session/config_options` accepts an optional `restore` object containing
+`cwd`, `mcpServers`, and `_meta`. All three fields are required; `mcpServers` must
+be an explicit array (use `[]` only to intentionally select no tools). Missing or
+non-array MCP declarations are rejected before any saved context can change.
+With ACP passthrough enabled this loads only a
+known, persisted native session before returning its configuration. It never
+creates a new conversation, sends a prompt, or installs an output sink. Unknown
+sessions and rejected native loads fail without replacing the saved mapping.
+Supply fresh session-scoped context; clients must authorize the session owner
+before requesting restoration. Ordinary reads retain their existing behavior.
