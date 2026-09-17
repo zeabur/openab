@@ -37,7 +37,8 @@ impl SteeringHandle {
             .map_err(|_| (-32603, "Invalid steering request".into()))?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
+        // Never cancel a partially written JSON-RPC line on shared provider stdin.
+        let write_result: Result<(), (i32, String)> = async {
             let mut stdin = self.stdin.lock().await;
             stdin
                 .write_all(&data)
@@ -51,7 +52,14 @@ impl SteeringHandle {
                 .flush()
                 .await
                 .map_err(|_| (-32603, "Runtime input closed".into()))?;
-            drop(stdin);
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             let response = rx
                 .await
                 .map_err(|_| (-32603, "Runtime response closed".into()))?;
