@@ -382,10 +382,34 @@ async fn send_session_cancel(
 impl SessionPool {
     /// Read without taking the per-session mutex held throughout a prompt.
     /// This neither loads a session nor claims its output/permission routes.
+    pub async fn execution_session_keys(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        let mut keys: Vec<_> = state
+            .activity
+            .keys()
+            .chain(state.creating.keys())
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     pub async fn execution_snapshot(&self, thread_id: &str) -> serde_json::Value {
         let state = self.state.read().await;
+        let loading = state
+            .creating
+            .get(thread_id)
+            .is_some_and(|gate| gate.try_lock().is_err());
         match state.activity.get(thread_id) {
-            Some(activity) => activity.execution.snapshot(),
+            Some(activity) => {
+                let mut snapshot = activity.execution.snapshot();
+                if loading && !activity.in_flight() {
+                    snapshot["operation"] = serde_json::json!("loading");
+                }
+                snapshot
+            }
+            None if loading => serde_json::json!({"state": "unknown", "operation": "loading"}),
             None => serde_json::json!({"state": "dormant"}),
         }
     }
@@ -1177,6 +1201,11 @@ impl SessionPool {
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
         let (stdin, session_id) = {
             let state = self.state.read().await;
+            if let Some(activity) = state.activity.get(thread_id) {
+                if activity.in_flight() || activity.execution.snapshot()["state"] == "active" {
+                    activity.execution.operation("cancelling");
+                }
+            }
             state
                 .cancel_handles
                 .get(thread_id)

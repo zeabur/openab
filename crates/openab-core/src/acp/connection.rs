@@ -188,8 +188,10 @@ impl SessionActivity {
 
     pub fn set_in_flight(&self, in_flight: bool) {
         self.prompt_in_flight.store(in_flight, Ordering::Release);
-        if !in_flight {
-            self.prompt_permission_wait_ms.store(0, Ordering::Release);
+        self.execution
+            .operation(if in_flight { "prompt" } else { "none" });
+        if !in_flight && self.prompt_permission_wait_ms.swap(0, Ordering::AcqRel) != 0 {
+            self.execution.permission_wait(false);
         }
     }
 
@@ -209,16 +211,21 @@ impl SessionActivity {
     }
 
     pub fn begin_prompt_permission_wait(&self) {
-        let _ = self.prompt_permission_wait_ms.compare_exchange(
+        let opened = self.prompt_permission_wait_ms.compare_exchange(
             0,
             Self::now_ms().max(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        if opened.is_ok() {
+            self.execution.permission_wait(true);
+        }
     }
 
     pub fn end_prompt_permission_wait(&self) {
-        self.prompt_permission_wait_ms.store(0, Ordering::Release);
+        if self.prompt_permission_wait_ms.swap(0, Ordering::AcqRel) != 0 {
+            self.execution.permission_wait(false);
+        }
     }
 
     pub fn prompt_permission_wait_age(&self) -> Option<std::time::Duration> {
@@ -251,17 +258,22 @@ impl SessionActivity {
     /// permission decision. Idempotent: a re-entry keeps the original start, so
     /// the age readers see is the age of the wait, not of the last call.
     pub fn begin_agent_permission_wait(&self) {
-        let _ = self.agent_permission_wait_ms.compare_exchange(
+        let opened = self.agent_permission_wait_ms.compare_exchange(
             0,
             Self::now_ms().max(1),
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        if opened.is_ok() {
+            self.execution.permission_wait(true);
+        }
     }
 
     /// Record that the decision arrived (or the request failed): no wait is open.
     pub fn end_agent_permission_wait(&self) {
-        self.agent_permission_wait_ms.store(0, Ordering::Release);
+        if self.agent_permission_wait_ms.swap(0, Ordering::AcqRel) != 0 {
+            self.execution.permission_wait(false);
+        }
     }
 
     /// How long the open permission wait has lasted, or `None` when the relay
@@ -380,12 +392,12 @@ pub(crate) async fn run_reader_loop_with_state<R>(
                 break;
             }
         }
-        let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
+        let mut msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
             Ok(m) => m,
             Err(_) => continue,
         };
         if let Some(activity) = &execution {
-            activity.execution.observe(msg.params.as_ref());
+            activity.execution.observe_and_stamp(msg.params.as_mut());
         }
         debug!(line = line.trim(), "acp_recv");
 
@@ -774,6 +786,7 @@ impl AcpConnection {
                 info!(count = self.config_options.len(), "parsed configOptions");
             }
         }
+        self.activity.execution.initialized();
         Ok(session_id)
     }
 
@@ -1057,6 +1070,7 @@ impl AcpConnection {
         if let Some(result) = resp.result.as_ref() {
             self.config_options = parse_config_options(result);
         }
+        self.activity.execution.initialized();
         Ok(())
     }
 
