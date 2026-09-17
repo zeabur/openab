@@ -3271,6 +3271,9 @@ async fn handle_session_prompt(
             admitted = true;
             state.acp_session_requests.open(&channel_id);
             state.acp_session_operations.accepted(&channel_id);
+            if params.and_then(|p| p.pointer("/_meta/ai.nuphos~1acknowledgePrompt")).and_then(Value::as_bool) == Some(true) {
+                let _ = out_tx.send(json!({"jsonrpc":"2.0","method":"_openab/session/prompt_accepted","params":{"sessionId":session_id,"requestId":id}}).to_string());
+            }
             let payload =
                 serde_json::to_string(&event).map_err(|_| "Internal error".to_string())?;
             state
@@ -6203,8 +6206,8 @@ mod acp_review_fixes {
         }
         cancel.notify_one();
 
-        let (out_tx, _out_rx) = mpsc::unbounded_channel::<String>();
-        let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}], "_meta":{"ai.nuphos/acknowledgePrompt":true}});
         handle_session_prompt(
             &state,
             &sessions,
@@ -6218,6 +6221,10 @@ mod acp_review_fixes {
         )
         .await;
 
+        let acknowledgement: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(acknowledgement["method"], "_openab/session/prompt_accepted");
+        assert_eq!(acknowledgement["params"]["requestId"], 7);
+        assert_eq!(acknowledgement["params"]["sessionId"], sid);
         let event_json = event_rx
             .try_recv()
             .expect("prompt must dispatch a GatewayEvent");
