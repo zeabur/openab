@@ -98,3 +98,59 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 - **Still unverified** — field-level exactness of `agentCapabilities` /
   `clientCapabilities` sub-objects against a *third-party* ACP client (e.g. Zed), and
   `ContentBlock` variants beyond `text` (image / audio / resource).
+
+
+## Runtime execution snapshot extension
+
+`_openab/session/state` accepts `{ "sessionId": "sess_<uuid>" }` on an
+initialized, authenticated ACP connection. It does not resume a session, claim
+its output sink, load a provider, or dispatch a prompt. The unified gateway reads
+the pool's provider-process lifecycle handle without taking the connection mutex
+held by prompts. Standalone gateways without the pool callback reject the method.
+
+An attached process returns `{ "state": "active|idle|unknown|interrupted",
+"epoch": "<process-instance-uuid>", "revision": 0 }`. Revisions increase on
+state changes within an epoch. A session absent from the pool returns
+`{ "state": "dormant" }`. A new provider process starts unknown with a new
+epoch. EOF records interrupted. Transport consumers must represent failed reads
+as unknown/disconnected, never assume the last active snapshot remains current.
+
+The reader records only native `session_info_update` lifecycle metadata:
+Codex `_meta.codex.threadStatus.type`, or a provider adapter's
+`_meta["ai.nuphos/sessionState"].state`. The latter must be emitted from the
+provider's native lifecycle, including its turn-ordering fences. Text, usage,
+background-tool updates, output sinks, and pending tool counts cannot change
+this snapshot. Existing adapters that do not publish lifecycle remain unknown;
+this extension does not fabricate an idle or active state for them.
+
+### Unified runtime session configuration
+
+The unified binary advertises `agentCapabilities._meta["dev.openab/sessionConfig"]`
+when the session configuration bridge is installed. Clients can read an **existing,
+idle inner session** with `_openab/session/config_options` (`{sessionId}`), and set a
+runtime-advertised string selection using ACP `session/set_config_option`
+(`{sessionId, configId, value}`). Both return `{configOptions}` from the inner agent.
+The session ID is the same opaque resume capability; it can be used on a control-only
+connection after `initialize`, without taking over that session's output sink.
+
+Without the explicit restore context below, neither method creates/resumes an inner
+session or starts a model turn. A dormant
+session returns `-32004`, a busy session `-32005`, an invalid selection `-32602`, and
+an unconfirmed agent write `-32603`. The standalone gateway without the bridge returns
+`-32601`. Notification-shaped requests are ignored. Unlike interactive slash-command
+handling, API writes never fall back to prompts or synthesize a successful selection.
+Only select/string options are exposed (the inner initialize does not advertise boolean
+configuration support). Available options and effort/Fast support remain agent-owned.
+
+### Restoring configuration after idle eviction or restart
+
+`_openab/session/config_options` accepts an optional `restore` object containing
+`cwd`, `mcpServers`, and `_meta`. All three fields are required; `mcpServers` must
+be an explicit array (use `[]` only to intentionally select no tools). Missing or
+non-array MCP declarations are rejected before any saved context can change.
+With ACP passthrough enabled this loads only a
+known, persisted native session before returning its configuration. It never
+creates a new conversation, sends a prompt, or installs an output sink. Unknown
+sessions and rejected native loads fail without replacing the saved mapping.
+Supply fresh session-scoped context; clients must authorize the session owner
+before requesting restoration. Ordinary reads retain their existing behavior.

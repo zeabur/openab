@@ -9,7 +9,9 @@ use crate::acp::connection::{
     build_permission_response, PermissionResponder, SessionActivity, ACP_NOTIFICATION_CAPACITY,
 };
 use crate::acp::protocol::JsonRpcMessage;
-use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
+use crate::acp::{
+    classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult,
+};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -58,7 +60,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -442,6 +449,19 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Finish a failed ACP turn without reporting a successful prompt response.
+    /// Other adapters keep the historical text-only error presentation.
+    async fn fail_agent_turn(
+        &self,
+        channel: &ChannelRef,
+        partial: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.send_message(channel, &format!("{partial}\n\n⚠️ {error}"))
+            .await?;
+        Ok(())
+    }
+
     /// Snapshot whether this turn requires a relayed permission decision.
     /// The router captures this once at turn start so reconnects cannot
     /// silently downgrade an in-flight turn to the legacy auto-approve path.
@@ -546,11 +566,7 @@ async fn handle_permission_request(
     true
 }
 
-fn is_current_prompt_activity(
-    message: &JsonRpcMessage,
-    request_id: u64,
-    session_id: &str,
-) -> bool {
+fn is_current_prompt_activity(message: &JsonRpcMessage, request_id: u64, session_id: &str) -> bool {
     if message.method.as_deref() == Some("session/request_permission") {
         return is_permission_for_session(message, session_id);
     }
@@ -584,7 +600,11 @@ struct PromptQuiescence {
 
 impl PromptQuiescence {
     fn observe_update(&mut self, message: &JsonRpcMessage) {
-        let Some(update) = message.params.as_ref().and_then(|params| params.get("update")) else {
+        let Some(update) = message
+            .params
+            .as_ref()
+            .and_then(|params| params.get("update"))
+        else {
             return;
         };
         let Some(kind) = update.get("sessionUpdate").and_then(|value| value.as_str()) else {
@@ -704,9 +724,7 @@ impl AdapterRouter {
             pool,
             reactions_config,
             table_mode,
-            prompt_inactivity_timeout: std::time::Duration::from_secs(
-                prompt_hard_timeout_secs,
-            ),
+            prompt_inactivity_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             workspace_aliases,
             bot_home,
@@ -962,8 +980,7 @@ impl AdapterRouter {
         // The prompt receiver below owns delivery while the request is active.
         // At prompt_done it is atomically replaced with this idle receiver, so
         // agent-initiated turns are not dropped between client prompts.
-        let (idle_tx, mut idle_rx) =
-            tokio::sync::mpsc::channel(ACP_NOTIFICATION_CAPACITY);
+        let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel(ACP_NOTIFICATION_CAPACITY);
         let idle_adapter = adapter.clone();
         let idle_channel = thread_channel.clone();
         let result = self.pool
@@ -1177,6 +1194,25 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
+                                // Agent is alive with a prompt in flight but silent (e.g. a
+                                // long-running tool call). Emit a schema-valid
+                                // `session_info_update` carrying only `updatedAt` — ACP v1
+                                // defines it as an "ISO 8601 timestamp of last activity" with
+                                // no required fields — so the gateway's per-chunk idle timer
+                                // (ACP_PROMPT_IDLE_TIMEOUT_SECS) resets while the agent lives,
+                                // and a dead agent still times out (no heartbeat without
+                                // `conn.alive()`).
+                                if platform_is_acp {
+                                    let _ = adapter
+                                        .forward_agent_update(
+                                            &thread_channel,
+                                            serde_json::json!({
+                                                "sessionUpdate": "session_info_update",
+                                                "updatedAt": chrono::Utc::now().to_rfc3339(),
+                                            }),
+                                        )
+                                        .await;
+                                }
                                 continue;
                             }
                         };
@@ -1226,7 +1262,7 @@ impl AdapterRouter {
                                 turn_result = parse_turn_result(result);
                             }
                             prompt_quiescence.receive_response();
-                            if !platform_is_acp || prompt_quiescence.is_quiescent() {
+                            if response_error.is_some() || !platform_is_acp || prompt_quiescence.is_quiescent() {
                                 break;
                             }
                             continue;
@@ -1409,8 +1445,11 @@ impl AdapterRouter {
                     // because this relay holds no connection mutex and runs after
                     // `prompt_done` has already cleared the in-flight flag.
                     let idle_activity = conn.activity_handle();
-                    conn.prompt_done(platform_is_acp.then_some(idle_tx)).await;
-                    if platform_is_acp {
+                    // Cancellation emits late tool updates. They belong to this failed
+                    // prompt, not a new autonomous turn, and must not acquire an idle sink.
+                    let observe_idle = platform_is_acp && response_error.is_none();
+                    conn.prompt_done(observe_idle.then_some(idle_tx)).await;
+                    if observe_idle {
                         let idle_permission_responder = permission_responder.clone();
                         tokio::spawn(async move {
                             let mut relay_saw_traffic = false;
@@ -1540,15 +1579,16 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
-                    // ACP direct relay: the raw buffer is exactly what the inline
-                    // snapshots carried; the terminal send below repeats it verbatim
+                    // ACP failures retain the raw partial text in every streaming mode,
+                    // without the display-only warning or send-once answer trimming.
+                    // Direct relay also repeats this snapshot at successful completion
                     // so the gateway's snapshot diff yields no duplicate chunk.
-                    let acp_streamed = if acp_direct {
+                    let acp_streamed = if platform_is_acp {
                         text_buf.clone()
                     } else {
                         String::new()
                     };
-                    let acp_error = if acp_direct {
+                    let acp_error = if platform_is_acp {
                         response_error.clone()
                     } else {
                         None
@@ -1603,7 +1643,12 @@ impl AdapterRouter {
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
                     }
-                    if native {
+                    if let Some(ref error) = acp_error {
+                        if let Err(e) = adapter.fail_agent_turn(&thread_channel, &acp_streamed, error).await {
+                            tracing::warn!(error = ?e, "acp terminal error send failed");
+                            delivery_failed = true;
+                        }
+                    } else if native {
                         if let Some(msg) = &native_msg {
                             if !native_pending.is_empty() {
                                 if let Err(e) =
@@ -1668,8 +1713,6 @@ impl AdapterRouter {
                         // empty streamed buffer selects the complete final content.
                         let terminal = if acp_streamed.is_empty() {
                             final_content.clone()
-                        } else if let Some(ref err) = acp_error {
-                            format!("{acp_streamed}\n\n⚠️ {err}")
                         } else {
                             acp_streamed
                         };
@@ -1845,16 +1888,17 @@ fn contains_bot_mention(content: &str) -> bool {
     while i + 2 < bytes.len() {
         if bytes[i] == b'<' && bytes[i + 1] == b'@' {
             // Skip optional '!' (nickname mention) or '&' (role mention)
-            let start = if i + 2 < bytes.len()
-                && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
-            {
+            let start = if i + 2 < bytes.len() && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&') {
                 i + 3
             } else {
                 i + 2
             };
             if start < bytes.len() && bytes[start].is_ascii_digit() {
                 if let Some(end) = content[start..].find('>') {
-                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                    if content[start..start + end]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    {
                         return true;
                     }
                 }
@@ -2083,8 +2127,7 @@ fn compose_display(
                         // matches the sibling finished-fallback summary and
                         // the pre-PR raw-count behaviour that users are used
                         // to. A hidden group of `a×2` contributes 2, not 1.
-                        let hidden_groups =
-                            running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
+                        let hidden_groups = running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
                         let hidden_calls: usize = running_groups
                             .iter()
                             .take(hidden_groups)
@@ -2193,7 +2236,11 @@ fn propagate_mentions_to_chunks(
             } else {
                 let footer = format!(
                     "\n{}",
-                    missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
+                    missing
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
                 if chunk.chars().count() + footer.chars().count() <= limit {
                     format!("{chunk}{footer}")
@@ -2378,10 +2425,7 @@ mod tests {
         assert!(is_permission_for_session(&current, "session-1"));
         assert!(!is_permission_for_session(&cross_session, "session-1"));
         assert!(!is_permission_for_session(&missing_session, "session-1"));
-        assert!(!is_permission_for_session(
-            &malformed_session,
-            "session-1"
-        ));
+        assert!(!is_permission_for_session(&malformed_session, "session-1"));
     }
 
     #[test]
@@ -2443,7 +2487,10 @@ mod tests {
         assert_eq!(reply_message_limit("slack", 4096), 4096);
         // and a long reply under the ACP limit is a single chunk (delivered whole)
         let long = "x".repeat(50_000);
-        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+        assert_eq!(
+            crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(),
+            1
+        );
     }
 
     #[test]
@@ -2769,7 +2816,10 @@ mod tests {
             tool("3", "grep", ToolState::Completed),
         ];
         let out = compose_display(&tools, "done", false, ToolDisplay::Full);
-        assert!(!out.contains("(×"), "should not collapse across order: {out}");
+        assert!(
+            !out.contains("(×"),
+            "should not collapse across order: {out}"
+        );
         assert_eq!(out.matches("`grep`").count(), 2, "output: {out}");
         assert_eq!(out.matches("`curl`").count(), 1, "output: {out}");
     }

@@ -112,7 +112,10 @@ impl UnifiedGatewayAdapter {
                 }
             }
             other => {
-                tracing::warn!(platform = other, "unified adapter: unknown platform, cannot route reply");
+                tracing::warn!(
+                    platform = other,
+                    "unified adapter: unknown platform, cannot route reply"
+                );
             }
         }
     }
@@ -160,8 +163,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         self.dispatch_reply(&reply).await;
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id: format!(
+                "unified_{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         })
     }
 
@@ -209,6 +217,19 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    async fn fail_agent_turn(
+        &self,
+        channel: &ChannelRef,
+        partial: &str,
+        error: &str,
+    ) -> Result<()> {
+        let snapshot = self.build_reply(channel, partial, Some("edit_message"), None);
+        self.dispatch_reply(&snapshot).await;
+        let failure = self.build_reply(channel, error, Some("agent_error"), None);
+        self.dispatch_reply(&failure).await;
+        Ok(())
+    }
+
     fn agent_permission_relay_required(&self, channel: &ChannelRef) -> Result<bool> {
         if channel.platform != "acp" {
             return Ok(false);
@@ -232,11 +253,10 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         if channel.platform == "acp" {
-            let registry = self
-                .gw_state
-                .acp_reply_registry
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("ACP permission relay registry is unavailable"))?;
+            let registry =
+                self.gw_state.acp_reply_registry.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("ACP permission relay registry is unavailable")
+                })?;
             if let Some(outcome) = openab_gateway::adapters::acp_server::request_permission(
                 registry,
                 &channel.channel_id,
@@ -273,8 +293,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         self.dispatch_reply(&reply).await;
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id: format!(
+                "unified_{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         })
     }
 

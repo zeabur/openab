@@ -25,9 +25,19 @@ fn env_lock() -> MutexGuard<'static, ()> {
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
     Send(String),
-    Terminal { content: String, stop_reason: Option<String> },
-    Edit { message_id: String, content: String },
+    Terminal {
+        content: String,
+        stop_reason: Option<String>,
+    },
+    Edit {
+        message_id: String,
+        content: String,
+    },
     Update(String),
+    Failure {
+        partial: String,
+        error: String,
+    },
 }
 
 struct RecordingAdapter {
@@ -56,7 +66,10 @@ impl ChatAdapter for RecordingAdapter {
         4096
     }
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        self.calls.lock().unwrap().push(Call::Send(content.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Send(content.to_string()));
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: "m1".into(),
@@ -77,12 +90,7 @@ impl ChatAdapter for RecordingAdapter {
             message_id: "m1".into(),
         })
     }
-    async fn create_thread(
-        &self,
-        _: &ChannelRef,
-        _: &MessageRef,
-        _: &str,
-    ) -> Result<ChannelRef> {
+    async fn create_thread(&self, _: &ChannelRef, _: &MessageRef, _: &str) -> Result<ChannelRef> {
         unimplemented!()
     }
     async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
@@ -98,17 +106,20 @@ impl ChatAdapter for RecordingAdapter {
         });
         Ok(())
     }
-    async fn forward_agent_update(
-        &self,
-        _: &ChannelRef,
-        update: serde_json::Value,
-    ) -> Result<()> {
+    async fn forward_agent_update(&self, _: &ChannelRef, update: serde_json::Value) -> Result<()> {
         let kind = update
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         self.calls.lock().unwrap().push(Call::Update(kind));
+        Ok(())
+    }
+    async fn fail_agent_turn(&self, _: &ChannelRef, partial: &str, error: &str) -> Result<()> {
+        self.calls.lock().unwrap().push(Call::Failure {
+            partial: partial.into(),
+            error: error.into(),
+        });
         Ok(())
     }
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
@@ -193,12 +204,28 @@ async fn setup(platform: &str, thread_key: &str) -> Fixture {
 async fn setup_with_agent(platform: &str, thread_key: &str, fake_agent: &str) -> Fixture {
     setup_with_agent_and_streaming(platform, thread_key, fake_agent, true).await
 }
-
 async fn setup_with_agent_and_streaming(
     platform: &str,
     thread_key: &str,
     fake_agent: &str,
     streaming: bool,
+) -> Fixture {
+    setup_complete(platform, thread_key, fake_agent, streaming, 30).await
+}
+async fn setup_with_timeout(
+    platform: &str,
+    thread_key: &str,
+    fake_agent: &str,
+    timeout: u64,
+) -> Fixture {
+    setup_complete(platform, thread_key, fake_agent, true, timeout).await
+}
+async fn setup_complete(
+    platform: &str,
+    thread_key: &str,
+    fake_agent: &str,
+    streaming: bool,
+    timeout: u64,
 ) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Isolate ~/.openab persistence (thread_map.json / session_meta.json).
@@ -235,7 +262,7 @@ async fn setup_with_agent_and_streaming(
         pool,
         ReactionsConfig::default(),
         TableMode::Code,
-        30,
+        timeout,
         1,
         HashMap::new(),
         tmp.path().to_path_buf(),
@@ -280,13 +307,9 @@ async fn acp_turn_waits_for_tool_that_finishes_after_prompt_response() {
 #[tokio::test(flavor = "multi_thread")]
 async fn acp_send_once_preserves_the_runtime_stop_reason() {
     let _guard = env_lock();
-    let fx = setup_with_agent_and_streaming(
-        "acp",
-        "acp:send-once-cancelled",
-        CANCELLED_AGENT,
-        false,
-    )
-    .await;
+    let fx =
+        setup_with_agent_and_streaming("acp", "acp:send-once-cancelled", CANCELLED_AGENT, false)
+            .await;
     let recorder = Arc::new(RecordingAdapter::new(false));
     let adapter: Arc<dyn ChatAdapter> = recorder.clone();
 
@@ -401,4 +424,150 @@ async fn non_acp_streaming_keeps_paced_edit_loop() {
         ),
         _ => unreachable!(),
     }
+}
+
+/// A fake agent that stays silent for 3s after `session/prompt` — long enough
+/// for the router's 1s liveness tick to fire several times — then completes.
+const SLOW_AGENT: &str = r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"fake","version":"0"},"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_fake"}}\n' "$id"
+      ;;
+    *'"session/prompt"'*)
+      sleep 3
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"##;
+
+// ACP: while the agent is alive but silent (a long tool call), each liveness
+// tick must emit a schema-valid `session_info_update` heartbeat so the
+// gateway's per-chunk idle timer keeps resetting instead of killing the turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_liveness_tick_emits_session_info_heartbeat() {
+    let _guard = env_lock();
+    let fx = setup_with_agent("acp", "acp:heartbeat", SLOW_AGENT).await;
+    let recorder = Arc::new(RecordingAdapter::new(false));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    run_turn(&fx, &adapter, "acp:heartbeat").await;
+
+    let calls = recorder.calls();
+    let heartbeats = calls
+        .iter()
+        .filter(|c| matches!(c, Call::Update(k) if k == "session_info_update"))
+        .count();
+    assert!(
+        heartbeats >= 1,
+        "expected at least one session_info_update heartbeat during the \
+         3s-silent prompt (1s liveness interval): {calls:?}"
+    );
+}
+
+// Non-ACP platforms must not receive heartbeats — the idle-timer problem the
+// heartbeat solves only exists on the ACP gateway path.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_acp_liveness_tick_emits_no_heartbeat() {
+    let _guard = env_lock();
+    let fx = setup_with_agent("gateway", "gateway:heartbeat", SLOW_AGENT).await;
+    let recorder = Arc::new(RecordingAdapter::new(true));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    run_turn(&fx, &adapter, "gateway:heartbeat").await;
+
+    let calls = recorder.calls();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Update(_))),
+        "no agent updates (heartbeats included) may leave the ACP path: {calls:?}"
+    );
+}
+
+// These failures must reach ACP as terminal errors even after partial text.
+// The cancel path deliberately emits a late tool update: it must never wake
+// an autonomous turn after the failed prompt has been closed.
+const FAILING_AGENT: &str = r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"fake","version":"0"},"agentCapabilities":{}}}\n' "$id" ;;
+    *'"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_fake"}}\n' "$id" ;;
+    *'"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Working"}}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"tool_call","toolCallId":"pending","status":"pending","title":"test"}}}\n'
+      # FAILURE
+      ;;
+    *'"session/cancel"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_fake","update":{"sessionUpdate":"tool_call_update","toolCallId":"pending","status":"failed"}}}\n' ;;
+  esac
+done
+"##;
+
+async fn assert_failed_turn(script: &str, expected: &str, timeout: u64) {
+    for streaming in [None, Some("0"), Some("1")] {
+        assert_failed_turn_in_mode(script, expected, timeout, streaming).await;
+    }
+}
+
+async fn assert_failed_turn_in_mode(
+    script: &str,
+    expected: &str,
+    timeout: u64,
+    streaming: Option<&str>,
+) {
+    let fx = setup_with_timeout("acp", "acp:failure", script, timeout).await;
+    match streaming {
+        Some(value) => std::env::set_var("OPENAB_ACP_STREAMING", value),
+        None => std::env::remove_var("OPENAB_ACP_STREAMING"),
+    }
+    let recorder = Arc::new(RecordingAdapter::new(false));
+    let adapter: Arc<dyn ChatAdapter> = recorder.clone();
+    run_turn(&fx, &adapter, "acp:failure").await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let calls = recorder.calls();
+    assert!(
+        matches!(calls.last(), Some(Call::Failure { partial, error })
+        if partial == "Working" && error.contains(expected)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Send(_))),
+        "must not send success: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::Update(k) if k == "tool_call_update")),
+        "cancelled tool must not become an autonomous turn: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_disk_full_is_a_terminal_error_with_partial_output() {
+    let _guard = env_lock();
+    let script = FAILING_AGENT.replace("# FAILURE", r#"printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"ENOSPC: no space left on device"}}\n' "$id""#);
+    assert_failed_turn(&script, "ENOSPC", 30).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_process_exit_is_a_terminal_error_with_partial_output() {
+    let _guard = env_lock();
+    assert_failed_turn(
+        &FAILING_AGENT.replace("# FAILURE", "exit 1"),
+        "exited unexpectedly",
+        30,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acp_inactivity_timeout_drops_late_cancel_updates() {
+    let _guard = env_lock();
+    assert_failed_turn(FAILING_AGENT, "inactivity timeout", 1).await;
 }

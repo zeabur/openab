@@ -48,6 +48,59 @@ fn l1_unenforceable(active: bool, l1_configured: bool) -> bool {
     active && !l1_configured
 }
 
+#[cfg(feature = "acp")]
+pub type AcpSessionSnapshot = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Coalesced pool-cancel queue: inserts are deduplicated by thread key,
+/// so every distinct session's cancel is retained even if one client
+/// sends many cancels. Memory is bounded by the number of live sessions.
+#[cfg(feature = "acp")]
+#[derive(Clone)]
+pub struct AcpPoolCancel {
+    pending: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "acp")]
+impl AcpPoolCancel {
+    pub fn new() -> (Self, Self) {
+        let inner = Self {
+            pending: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        (inner.clone(), inner)
+    }
+
+    pub fn send(&self, thread_key: String) {
+        self.pending.lock().unwrap().insert(thread_key);
+        self.notify.notify_one();
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        let mut set = self.pending.lock().unwrap();
+        set.drain().collect()
+    }
+
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// Config control bridge; requests carry only a capability session key and
+/// typed selection. Optional restore context can load a saved native session;
+/// it never claims output, starts a prompt, or creates a fresh conversation.
+#[cfg(feature = "acp")]
+pub struct AcpPoolConfigRequest {
+    pub thread_key: String,
+    pub selection: Option<(String, String)>,
+    pub restore: Option<(String, Vec<serde_json::Value>, Option<serde_json::Value>)>,
+    pub reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, (i32, String)>>,
+}
+
 pub struct AppState {
     pub telegram_bot_token: Option<String>,
     pub telegram_secret_token: Option<String>,
@@ -78,6 +131,8 @@ pub struct AppState {
     #[cfg(feature = "acp")]
     pub acp: Option<adapters::acp_server::AcpConfig>,
     #[cfg(feature = "acp")]
+    pub acp_session_snapshot: Option<AcpSessionSnapshot>,
+    #[cfg(feature = "acp")]
     pub acp_reply_registry: Option<adapters::acp_server::AcpReplyRegistry>,
     #[cfg(feature = "acp")]
     pub acp_tunnel_registry: Option<adapters::acp_server::AcpTunnelRegistry>,
@@ -95,8 +150,26 @@ pub struct AppState {
     /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
     pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
+    /// Pool-side session cancel. The ACP server inserts thread keys here;
+    /// a receiver task drains the set and calls `pool.cancel_session()`.
+    /// Coalesced per session: duplicates are absorbed, so every distinct
+    /// session's cancel is retained even under load.
+    #[cfg(feature = "acp")]
+    pub acp_pool_cancel: Option<AcpPoolCancel>,
+    /// Pool-side session liveness query. `session/resume` sends a thread key
+    /// plus a oneshot; a receiver task answers `pool.has_active_session()`,
+    /// letting the resume response report whether the inner agent session
+    /// actually survived (`_meta["dev.openab/sessionAlive"]`).
+    #[cfg(feature = "acp")]
+    pub acp_pool_liveness: Option<AcpPoolLivenessTx>,
+    #[cfg(feature = "acp")]
+    pub acp_pool_config: Option<tokio::sync::mpsc::Sender<AcpPoolConfigRequest>>,
 }
 
+/// Sender half of the pool-liveness query bridge: `(thread_key, reply)`.
+#[cfg(feature = "acp")]
+pub type AcpPoolLivenessTx =
+    tokio::sync::mpsc::Sender<(String, tokio::sync::oneshot::Sender<bool>)>;
 
 impl AppState {
     /// Create a minimal AppState for testing. Only requires an `event_tx` sender;
@@ -132,18 +205,28 @@ impl AppState {
             #[cfg(feature = "acp")]
             acp: None,
             #[cfg(feature = "acp")]
+            acp_session_snapshot: None,
+            #[cfg(feature = "acp")]
             acp_reply_registry: None,
             #[cfg(feature = "acp")]
             acp_tunnel_registry: None,
+            #[cfg(feature = "acp")]
+            acp_pool_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_pool_liveness: None,
+            #[cfg(feature = "acp")]
+            acp_pool_config: None,
             #[cfg(feature = "lineworks")]
             lineworks: None,
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
-        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
-        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
-        trust_probe: None,
+            lineworks_webhook_semaphore: Arc::new(Semaphore::new(
+                LINEWORKS_WEBHOOK_CONCURRENCY_MAX,
+            )),
+            lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+            trust_probe: None,
             client: reqwest::Client::new(),
         }
     }
@@ -184,8 +267,8 @@ impl AppState {
 
         // Feishu
         #[cfg(feature = "feishu")]
-        let feishu = adapters::feishu::FeishuConfig::from_env()
-            .map(adapters::feishu::FeishuAdapter::new);
+        let feishu =
+            adapters::feishu::FeishuConfig::from_env().map(adapters::feishu::FeishuAdapter::new);
 
         // Google Chat
         #[cfg(feature = "googlechat")]
@@ -209,16 +292,20 @@ impl AppState {
 
         // WeCom
         #[cfg(feature = "wecom")]
-        let wecom = adapters::wecom::WecomConfig::from_env()
-            .map(adapters::wecom::WecomAdapter::new);
+        let wecom =
+            adapters::wecom::WecomConfig::from_env().map(adapters::wecom::WecomAdapter::new);
 
         // ACP Server
         #[cfg(feature = "acp")]
         let acp = adapters::acp_server::AcpConfig::from_env();
         #[cfg(feature = "acp")]
-        let acp_reply_registry = acp.as_ref().map(|_| adapters::acp_server::new_reply_registry());
+        let acp_reply_registry = acp
+            .as_ref()
+            .map(|_| adapters::acp_server::new_reply_registry());
         #[cfg(feature = "acp")]
-        let acp_tunnel_registry = acp.as_ref().map(|_| adapters::acp_server::new_tunnel_registry());
+        let acp_tunnel_registry = acp
+            .as_ref()
+            .map(|_| adapters::acp_server::new_tunnel_registry());
         // LINE WORKS
         #[cfg(feature = "lineworks")]
         let lineworks = adapters::lineworks::LineWorksConfig::from_env().map(|config| {
@@ -254,18 +341,28 @@ impl AppState {
             #[cfg(feature = "acp")]
             acp,
             #[cfg(feature = "acp")]
+            acp_session_snapshot: None,
+            #[cfg(feature = "acp")]
             acp_reply_registry,
             #[cfg(feature = "acp")]
             acp_tunnel_registry,
+            #[cfg(feature = "acp")]
+            acp_pool_cancel: None,
+            #[cfg(feature = "acp")]
+            acp_pool_liveness: None,
+            #[cfg(feature = "acp")]
+            acp_pool_config: None,
             #[cfg(feature = "lineworks")]
             lineworks,
             ws_token,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
-        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
-        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
-        trust_probe: None,
+            lineworks_webhook_semaphore: Arc::new(Semaphore::new(
+                LINEWORKS_WEBHOOK_CONCURRENCY_MAX,
+            )),
+            lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+            trust_probe: None,
             client,
         }
     }
@@ -425,7 +522,12 @@ impl AppState {
     /// no adapter, matching env-only semantics.
     #[cfg(feature = "wecom")]
     pub fn apply_wecom_config(&mut self, cfg: GatewayWecomConfig) {
-        let streaming = if cfg.streaming_enabled { "true" } else { "false" }.to_string();
+        let streaming = if cfg.streaming_enabled {
+            "true"
+        } else {
+            "false"
+        }
+        .to_string();
         let debounce = cfg.debounce_secs.to_string();
         self.wecom = adapters::wecom::WecomConfig::from_reader(|k| match k {
             "WECOM_CORP_ID" => cfg.corp_id.clone(),
@@ -598,10 +700,16 @@ impl Default for ServeConfig {
 /// Start the standalone gateway server. This is the main entry point extracted
 /// from the gateway binary — the binary becomes a thin wrapper around this.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
-    use axum::{routing::{get, post}, Router};
+    use axum::{
+        routing::{get, post},
+        Router,
+    };
     use tracing::{info, warn};
 
-    let ServeConfig { listen_addr, ws_token } = config;
+    let ServeConfig {
+        listen_addr,
+        ws_token,
+    } = config;
 
     if ws_token.is_none() {
         warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
@@ -617,7 +725,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     // ACP Server adapter. Fail-open (no transport key) is only allowed on a loopback
     // bind; a non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
     #[cfg(feature = "acp")]
-    if std::env::var("OPENAB_ACP_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false) {
+    if std::env::var("OPENAB_ACP_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
         let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
         match adapters::acp_server::acp_auth_ok_for_bind(acp_key.as_deref(), &listen_addr) {
             Ok(()) => {
@@ -729,7 +840,11 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             let api_base = f.config.api_base();
             let idle_ms = f.config.card_idle_finalize_ms;
             tokio::spawn(adapters::feishu::run_idle_reaper(
-                sessions, token_cache, client, api_base, idle_ms,
+                sessions,
+                token_cache,
+                client,
+                api_base,
+                idle_ms,
             ));
             info!(idle_ms, "feishu card-streaming idle reaper started");
         }
@@ -737,8 +852,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
 
     // Google Chat adapter
     #[cfg(feature = "googlechat")]
-    let googlechat_webhook_path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
-        .unwrap_or_else(|_| "/webhook/googlechat".into());
+    let googlechat_webhook_path =
+        std::env::var("GOOGLE_CHAT_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/googlechat".into());
     #[cfg(feature = "googlechat")]
     let google_chat = {
         let enabled = std::env::var("GOOGLE_CHAT_ENABLED")
@@ -746,7 +861,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             .unwrap_or(false);
         if enabled {
             info!(path = %googlechat_webhook_path, "googlechat adapter enabled");
-            app = app.route(&googlechat_webhook_path, post(adapters::googlechat::webhook));
+            app = app.route(
+                &googlechat_webhook_path,
+                post(adapters::googlechat::webhook),
+            );
             Some(adapters::googlechat::GoogleChatAdapter::from_parts(
                 std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
                 std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
@@ -836,9 +954,17 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         #[cfg(feature = "acp")]
         acp,
         #[cfg(feature = "acp")]
+        acp_session_snapshot: None,
+        #[cfg(feature = "acp")]
         acp_reply_registry,
         #[cfg(feature = "acp")]
         acp_tunnel_registry,
+        #[cfg(feature = "acp")]
+        acp_pool_cancel: None,
+        #[cfg(feature = "acp")]
+        acp_pool_liveness: None,
+        #[cfg(feature = "acp")]
+        acp_pool_config: None,
         #[cfg(feature = "lineworks")]
         lineworks,
         ws_token,
@@ -879,7 +1005,11 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 cache.retain(|_, (_, t)| t.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS);
                 let after = cache.len();
                 if before != after {
-                    info!(removed = before - after, remaining = after, "reply token cache sweep");
+                    info!(
+                        removed = before - after,
+                        remaining = after,
+                        "reply token cache sweep"
+                    );
                 }
             }
         });
@@ -896,7 +1026,11 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 urls.retain(|_, (_, t)| t.elapsed().as_secs() < 4 * 3600);
                 let after = urls.len();
                 if before != after {
-                    info!(removed = before - after, remaining = after, "teams service_url cache cleanup");
+                    info!(
+                        removed = before - after,
+                        remaining = after,
+                        "teams service_url cache cleanup"
+                    );
                 }
             }
         });
@@ -1075,9 +1209,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             "lineworks" => {
                                 if let Some(ref lineworks) = state_for_recv.lineworks {
                                     let ok = adapters::lineworks::dispatch_lineworks_reply(
-                                        &client,
-                                        lineworks,
-                                        &reply,
+                                        &client, lineworks, &reply,
                                     )
                                     .await;
                                     if !ok {

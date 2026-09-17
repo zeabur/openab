@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -19,6 +19,9 @@ const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"
 struct PoolState {
     /// Active connections: thread_key → AcpConnection handle.
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
+    /// Pool-wide capacity permits held by active sessions. A permit is acquired
+    /// before spawning, then transferred here only after initialization succeeds.
+    admission_permits: HashMap<String, OwnedSemaphorePermit>,
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
@@ -62,6 +65,9 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Bounds active plus initializing sessions. Per-thread `creating` gates
+    /// prevent duplicate work for one key; this semaphore covers different keys.
+    admission: Arc<Semaphore>,
     /// Force-evict sessions with no prompt activity longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
@@ -79,7 +85,11 @@ type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 /// Active connections paired with their lock-free activity handles, as read by
 /// the pool-full eviction scan. A handle is `None` only for an entry torn down
 /// between the two map reads.
-type ActiveWithActivity = Vec<(String, Arc<Mutex<AcpConnection>>, Option<Arc<SessionActivity>>)>;
+type ActiveWithActivity = Vec<(
+    String,
+    Arc<Mutex<AcpConnection>>,
+    Option<Arc<SessionActivity>>,
+)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 fn remove_if_same_handle<T>(
@@ -136,7 +146,12 @@ fn classify_hung(
 /// either resumes the session, so both are credentials. Extracted from the loop in `cleanup_idle`
 /// so the redaction can be exercised by a test for real — R1 redacted the sites it enumerated and
 /// this force-evict site was outside that list, logging both ids raw.
-fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, threshold_secs: u64) {
+fn warn_force_evicting_hung(
+    key: &str,
+    session_id: Option<&str>,
+    age_secs: u64,
+    threshold_secs: u64,
+) {
     warn!(
         thread_id = %crate::redact::redact_session_ids(key),
         session_id = %session_id.map(crate::redact::redact_session_ids).unwrap_or_default(),
@@ -243,6 +258,7 @@ async fn setup_facade_session(
 /// stayed in `suspended`/`persisted`, the next message would `session/load` the same session while
 /// the old process still owns an in-flight turn.
 fn purge_session_entries(state: &mut PoolState, key: &str) {
+    state.admission_permits.remove(key);
     state.cancel_handles.remove(key);
     state.activity.remove(key);
     state.pgids.remove(key);
@@ -364,6 +380,16 @@ async fn send_session_cancel(
 }
 
 impl SessionPool {
+    /// Read without taking the per-session mutex held throughout a prompt.
+    /// This neither loads a session nor claims its output/permission routes.
+    pub async fn execution_snapshot(&self, thread_id: &str) -> serde_json::Value {
+        let state = self.state.read().await;
+        match state.activity.get(thread_id) {
+            Some(activity) => activity.execution.snapshot(),
+            None => serde_json::json!({"state": "dormant"}),
+        }
+    }
+
     pub fn new(
         config: AgentConfig,
         max_sessions: usize,
@@ -382,6 +408,7 @@ impl SessionPool {
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
+                admission_permits: HashMap::new(),
                 cancel_handles: HashMap::new(),
                 #[cfg(feature = "acp-mcp")]
                 facade_tokens: HashMap::new(),
@@ -396,6 +423,7 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            admission: Arc::new(Semaphore::new(max_sessions)),
             hung_threshold_secs,
             mapping_path,
             meta_path,
@@ -470,6 +498,85 @@ impl SessionPool {
         }
     }
 
+    /// Reserve one pool slot before any ACP process is spawned.
+    ///
+    /// A dead connection being rebuilt keeps its existing slot. Otherwise a
+    /// full pool may suspend the oldest idle connection to make room. The
+    /// returned permit remains local while initialization is in flight, so a
+    /// failed or cancelled creation releases capacity automatically.
+    async fn reserve_admission(
+        &self,
+        thread_id: &str,
+        eviction_candidate: Option<EvictionCandidate>,
+        skipped_locked_candidates: usize,
+    ) -> Result<OwnedSemaphorePermit> {
+        let mut state = self.state.write().await;
+
+        // Rebuilding a dead connection consumes the same logical slot. Move
+        // its permit out of the active map and hold it across initialization.
+        if let Some(permit) = state.admission_permits.remove(thread_id) {
+            return Ok(permit);
+        }
+
+        if let Ok(permit) = Arc::clone(&self.admission).try_acquire_owned() {
+            return Ok(permit);
+        }
+
+        if let Some((key, expected_conn, _, sid)) = eviction_candidate {
+            // The candidate was idle when scanned, but it may have started a
+            // turn since then. Never evict a connection that is busy now.
+            let Ok(_idle_guard) = expected_conn.try_lock() else {
+                warn!(
+                    max_sessions = self.max_sessions,
+                    "pool full but the idle eviction candidate became busy"
+                );
+                return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+            };
+
+            let activity = state.activity.get(&key).map(Arc::as_ref);
+            if candidate_in_flight(activity)
+                || candidate_relaying(
+                    activity,
+                    std::time::Duration::from_secs(AGENT_RELAY_GRACE_SECS),
+                )
+                || candidate_awaiting_permission(
+                    activity,
+                    std::time::Duration::from_secs(self.hung_threshold_secs),
+                )
+            {
+                return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+            }
+            if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                state.admission_permits.remove(&key);
+                state.cancel_handles.remove(&key);
+                state.activity.remove(&key);
+                state.pgids.remove(&key);
+                #[cfg(feature = "acp-mcp")]
+                revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
+                info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session before replacement spawn");
+                if let Some(sid) = sid {
+                    state.persisted.insert(key.clone(), sid.clone());
+                    state.suspended.insert(key, sid);
+                } else {
+                    state.persisted.remove(&key);
+                }
+                self.save_mapping(&state.persisted);
+            } else {
+                warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
+            }
+        } else if skipped_locked_candidates > 0 {
+            warn!(
+                max_sessions = self.max_sessions,
+                skipped_locked_candidates,
+                "pool full but all other sessions were busy during eviction scan"
+            );
+        }
+
+        Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("pool exhausted ({} sessions)", self.max_sessions))
+    }
+
     /// Check if session state exists for this thread (active, suspended, or persisted).
     #[allow(dead_code)]
     pub async fn has_active_session(&self, thread_id: &str) -> bool {
@@ -494,21 +601,61 @@ impl SessionPool {
         mcp_servers: &[serde_json::Value],
         session_meta: Option<&serde_json::Value>,
     ) -> Result<bool> {
+        self.get_or_restore(
+            thread_id,
+            working_dir_override,
+            mcp_servers,
+            session_meta,
+            false,
+        )
+        .await
+    }
+
+    /// Restore only a known native session, without a prompt or output attachment.
+    pub async fn restore_for_config(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+        meta: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.get_or_restore(thread_id, Some(cwd), mcp_servers, meta, true)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_or_restore(
+        &self,
+        thread_id: &str,
+        working_dir_override: Option<&str>,
+        mcp_servers: &[serde_json::Value],
+        session_meta: Option<&serde_json::Value>,
+        restore_only: bool,
+    ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
+            if restore_only
+                && !state.persisted.contains_key(thread_id)
+                && !state.active.contains_key(thread_id)
+            {
+                return Err(anyhow!("No saved native session to restore"));
+            }
             // A non-empty declaration updates the stored set even when a live
             // session short-circuits below: it takes effect on the next spawn,
             // never restarting a live session.
-            if !mcp_servers.is_empty()
+            if !restore_only
+                && !mcp_servers.is_empty()
                 && state.session_mcp_servers.get(thread_id).map(Vec::as_slice) != Some(mcp_servers)
             {
                 state
                     .session_mcp_servers
                     .insert(thread_id.to_string(), mcp_servers.to_vec());
             }
-            if let Some(meta) = session_meta {
+            if let Some(meta) = session_meta.filter(|_| !restore_only) {
                 if state.session_meta.get(thread_id) != Some(meta) {
-                    state.session_meta.insert(thread_id.to_string(), meta.clone());
+                    state
+                        .session_meta
+                        .insert(thread_id.to_string(), meta.clone());
                 }
             }
             get_or_insert_gate(&mut state.creating, thread_id)
@@ -539,6 +686,21 @@ impl SessionPool {
             }
             if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
+            }
+        }
+
+        if restore_only {
+            if saved_session_id.is_none() {
+                return Err(anyhow!("No saved native session to restore"));
+            }
+            let mut state = self.state.write().await;
+            state
+                .session_mcp_servers
+                .insert(thread_id.to_string(), mcp_servers.to_vec());
+            if let Some(meta) = session_meta {
+                state
+                    .session_meta
+                    .insert(thread_id.to_string(), meta.clone());
             }
         }
 
@@ -612,6 +774,17 @@ impl SessionPool {
                 eviction_candidate = Some(candidate);
             }
         }
+
+        let admission_permit = self
+            .reserve_admission(
+                thread_id,
+                eviction_candidate,
+                skipped_locked_candidates
+                    + skipped_in_flight_candidates
+                    + skipped_relaying_candidates
+                    + skipped_permission_candidates,
+            )
+            .await?;
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
@@ -728,6 +901,9 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
+                        if restore_only {
+                            return Err(e.context("Could not restore the saved native session"));
+                        }
                         let err_str = e.to_string();
                         let is_transient =
                             TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
@@ -759,6 +935,11 @@ impl SessionPool {
         }
 
         if !resumed {
+            if restore_only {
+                return Err(anyhow!(
+                    "Agent does not support restoring the saved session"
+                ));
+            }
             new_conn
                 .session_new(
                     &effective_workdir,
@@ -791,10 +972,6 @@ impl SessionPool {
         new_conn.set_facade_token_guard(facade_token_guard);
         let new_conn = Arc::new(Mutex::new(new_conn));
 
-        // Cancel handle of the session we suspend below, if any. Sent after the
-        // state lock is released (lock ordering: never await I/O under `state`).
-        let mut evicted_cancel: Option<CancelHandle> = None;
-
         let mut state = self.state.write().await;
 
         // Another task may have created a healthy connection while we were
@@ -814,44 +991,6 @@ impl SessionPool {
             state.pgids.remove(thread_id);
         }
 
-        if state.active.len() >= self.max_sessions {
-            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    evicted_cancel = state.cancel_handles.remove(&key);
-                    state.activity.remove(&key);
-                    state.pgids.remove(&key);
-                    #[cfg(feature = "acp-mcp")]
-                    revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
-                    info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
-                    if let Some(sid) = sid {
-                        state.persisted.insert(key.clone(), sid.clone());
-                        state.suspended.insert(key, sid);
-                    } else {
-                        state.persisted.remove(&key);
-                    }
-                } else {
-                    warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
-                }
-            } else if skipped_locked_candidates > 0
-                || skipped_in_flight_candidates > 0
-                || skipped_relaying_candidates > 0
-                || skipped_permission_candidates > 0
-            {
-                warn!(
-                    max_sessions = self.max_sessions,
-                    skipped_locked_candidates,
-                    skipped_in_flight_candidates,
-                    skipped_relaying_candidates,
-                    skipped_permission_candidates,
-                    "pool full but all other sessions were busy during eviction scan"
-                );
-            }
-        }
-
-        if state.active.len() >= self.max_sessions {
-            return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
-        }
-
         if cancel_session_id.is_empty() {
             state.persisted.remove(thread_id);
         } else {
@@ -860,6 +999,9 @@ impl SessionPool {
                 .insert(thread_id.to_string(), cancel_session_id.clone());
         }
         state.suspended.remove(thread_id);
+        state
+            .admission_permits
+            .insert(thread_id.to_string(), admission_permit);
         state.active.insert(thread_id.to_string(), new_conn);
         state
             .activity
@@ -876,7 +1018,12 @@ impl SessionPool {
         // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
         #[cfg(feature = "acp-mcp")]
         if let Some(token) = session_token {
-            install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
+            install_facade_token(
+                &mut state,
+                thread_id,
+                token,
+                self.session_registrar.as_ref(),
+            );
         }
         self.save_mapping(&state.persisted);
 
@@ -890,21 +1037,6 @@ impl SessionPool {
         }
 
         drop(state);
-
-        // Tell the suspended session's agent to end whatever it was doing. The
-        // eviction scan skips in-flight sessions, so this is normally a no-op on an
-        // idle agent; when it is not, `session/cancel` makes the turn terminate with
-        // a stop reason instead of disappearing, which is what lets the client close
-        // the turn out rather than showing it as still running.
-        if let Some((stdin, session_id)) = evicted_cancel {
-            if let Err(e) = send_session_cancel(&stdin, &session_id).await {
-                warn!(
-                    session_id = %crate::redact::redact_session_ids(&session_id),
-                    error = %e,
-                    "failed to cancel suspended session"
-                );
-            }
-        }
 
         // Return true only for genuinely new sessions — not resumed or reconnected ones.
         // A session with prior state (saved_session_id or had_existing) is a resume,
@@ -928,11 +1060,12 @@ impl SessionPool {
     {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
 
         let mut conn = conn.lock().await;
@@ -960,14 +1093,66 @@ impl SessionPool {
     ) -> Result<Vec<ConfigOption>> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.set_config_option(config_id, value).await
+    }
+
+    /// Control an existing inner session without attaching an output sink,
+    /// starting a prompt, or changing the session's execution principal.
+    pub async fn session_config_options(
+        &self,
+        thread_id: &str,
+        selection: Option<(&str, &str)>,
+    ) -> std::result::Result<serde_json::Value, (i32, String)> {
+        let handle = self
+            .state
+            .read()
+            .await
+            .active
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    -32004,
+                    "Session is not running; send a message to resume it".into(),
+                )
+            })?;
+        let mut conn = handle.try_lock().map_err(|_| {
+            (
+                -32005,
+                "Session is responding; wait for the current turn to finish".into(),
+            )
+        })?;
+        if !conn.alive() {
+            return Err((
+                -32004,
+                "Session is not running; send a message to resume it".into(),
+            ));
+        }
+        if let Some((id, value)) = selection {
+            let valid = conn.config_options.iter().any(|option| {
+                option.id == id && option.options.iter().any(|choice| choice.value == value)
+            });
+            if !valid {
+                return Err((-32602, "Unknown configuration option or value".into()));
+            }
+            conn.set_config_option_strict(id, value)
+                .await
+                .map_err(|_| {
+                    (
+                        -32603,
+                        "Agent could not confirm the configuration change".into(),
+                    )
+                })?;
+        }
+        Ok(serde_json::json!({ "configOptions": conn.config_options }))
     }
 
     /// Query account-level usage/billing from the backend agent for a session
@@ -976,11 +1161,12 @@ impl SessionPool {
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.get_usage().await
@@ -995,7 +1181,12 @@ impl SessionPool {
                 .cancel_handles
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no session for thread {}",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?
         };
         tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "sending session/cancel");
         send_session_cancel(&stdin, &session_id).await
@@ -1035,7 +1226,10 @@ impl SessionPool {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
-            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
+            Err(anyhow!(
+                "no session for thread {}",
+                crate::redact::redact_session_ids(thread_id)
+            ))
         }
     }
 
@@ -1139,6 +1333,7 @@ impl SessionPool {
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
+                state.admission_permits.remove(&key);
                 state.cancel_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
@@ -1199,6 +1394,7 @@ impl SessionPool {
         self.save_mapping(&state.persisted);
         let count = state.active.len();
         state.active.clear();
+        state.admission_permits.clear();
         state.cancel_handles.clear();
         state.activity.clear();
         state.pgids.clear();
@@ -1210,8 +1406,8 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, candidate_awaiting_permission, candidate_in_flight, candidate_relaying,
-        classify_hung, classify_idle, get_or_insert_gate, purge_session_entries, relay_is_streaming,
-        remove_if_same_handle, AGENT_RELAY_GRACE_SECS, PoolState,
+        classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
+        relay_is_streaming, remove_if_same_handle, PoolState, AGENT_RELAY_GRACE_SECS,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1250,6 +1446,7 @@ mod tests {
     fn empty_pool_state() -> super::PoolState {
         super::PoolState {
             active: HashMap::new(),
+            admission_permits: HashMap::new(),
             cancel_handles: HashMap::new(),
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
@@ -1275,11 +1472,28 @@ mod tests {
         let mut state = empty_pool_state();
 
         // Predecessor registers, then a successor takes over the SAME key.
-        super::install_facade_token(&mut state, "discord:acp_x", "T_pred".into(), Some(&registrar));
-        assert!(reg.revoked().is_empty(), "nothing to revoke on the first install");
-        super::install_facade_token(&mut state, "discord:acp_x", "T_succ".into(), Some(&registrar));
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_pred".into(),
+            Some(&registrar),
+        );
+        assert!(
+            reg.revoked().is_empty(),
+            "nothing to revoke on the first install"
+        );
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_succ".into(),
+            Some(&registrar),
+        );
 
-        assert_eq!(reg.revoked(), vec!["T_pred"], "the predecessor token must be revoked");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_pred"],
+            "the predecessor token must be revoked"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_x").map(String::as_str),
             Some("T_succ"),
@@ -1296,14 +1510,25 @@ mod tests {
         let reg = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
         let mut state = empty_pool_state();
-        state.facade_tokens.insert("discord:acp_x".into(), "T_hung".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_x".into(), "T_hung".into());
         // A different session's token must be untouched.
-        state.facade_tokens.insert("discord:acp_y".into(), "T_other".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_y".into(), "T_other".into());
 
         super::revoke_facade_token_for_key(&mut state, "discord:acp_x", Some(&registrar));
 
-        assert_eq!(reg.revoked(), vec!["T_hung"], "only the evicted session's token is revoked");
-        assert!(!state.facade_tokens.contains_key("discord:acp_x"), "and it is forgotten");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_hung"],
+            "only the evicted session's token is revoked"
+        );
+        assert!(
+            !state.facade_tokens.contains_key("discord:acp_x"),
+            "and it is forgotten"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_y").map(String::as_str),
             Some("T_other"),
@@ -1640,17 +1865,34 @@ mod tests {
         });
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
+        assert!(
+            out.contains("force-evicting hung session"),
+            "the warning must fire: {out}"
+        );
         assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
-        assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");
-        assert!(out.contains('#'), "the redaction tag must be present: {out}");
-        assert!(out.contains("discord"), "the readable platform half must survive: {out}");
+        assert!(
+            !out.contains("acp_") && !out.contains("sess_"),
+            "no raw id prefix either: {out}"
+        );
+        assert!(
+            out.contains('#'),
+            "the redaction tag must be present: {out}"
+        );
+        assert!(
+            out.contains("discord"),
+            "the readable platform half must survive: {out}"
+        );
     }
 
     #[test]
     fn purge_session_entries_drops_all_entries_for_evicted_key_only() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let admission_permit = Arc::clone(&admission)
+            .try_acquire_owned()
+            .expect("test permit");
         let mut state = PoolState {
             active: HashMap::new(),
+            admission_permits: HashMap::from([("hung".to_string(), admission_permit)]),
             cancel_handles: HashMap::new(),
             #[cfg(feature = "acp-mcp")]
             facade_tokens: HashMap::new(),
@@ -1681,6 +1923,11 @@ mod tests {
 
         purge_session_entries(&mut state, "hung");
 
+        assert_eq!(
+            admission.available_permits(),
+            1,
+            "evicting logical session state must release its pool slot"
+        );
         // Evicted key must not be resumable: no suspended/persisted entry left.
         assert!(!state.activity.contains_key("hung"));
         assert!(!state.cancel_handles.contains_key("hung"));
