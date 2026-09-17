@@ -97,6 +97,8 @@ impl SessionSnapshots {
             )
         } else if permissions > 0 {
             ("waiting_for_permission", "Waiting for approval".to_string())
+        } else if provider["gateway"]["steering"].as_u64().unwrap_or(0) > 0 {
+            ("steering", "Sending your message…".to_string())
         } else if resuming {
             (
                 "resuming",
@@ -226,7 +228,7 @@ impl SessionSnapshots {
             "providerDetails": provider["providerDetails"], "asyncTasks": provider["asyncTasks"], "automation": automation,
             "lastOutcome": provider["gateway"]["lastOutcome"],
             "permissionWaits": permissions, "tools": tools, "requests": requests,
-            "actions": {"send": send, "cancel": busy && phase != "cancelling" && phase != "configuring", "steer": false, "reply": phase != "cancelling" && requests.iter().any(|request| request["kind"] != "client-tool")}
+            "actions": {"send": send, "cancel": busy && phase != "cancelling" && phase != "configuring", "steer": provider["steeringSupported"] == true && executing && !matches!(phase, "cancelling" | "configuring" | "loading"), "reply": phase != "cancelling" && requests.iter().any(|request| request["kind"] != "client-tool")}
         });
         let mut registry = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(previous) = registry.get(channel) {
@@ -247,6 +249,32 @@ impl SessionSnapshots {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_steering_capability_is_runtime_owned() {
+        let snapshots = SessionSnapshots::default();
+        assert_eq!(
+            snapshots.project(
+                "s",
+                json!({"state":"active","steeringSupported":true}),
+                true
+            )["actions"]["steer"],
+            true
+        );
+        for provider in [
+            json!({"state":"active"}),
+            json!({"state":"idle","steeringSupported":true}),
+            json!({"state":"active","steeringSupported":true,"operation":"cancelling"}),
+        ] {
+            assert_eq!(
+                snapshots.project("s", provider, true)["actions"]["steer"],
+                false
+            );
+        }
+        assert_eq!(
+            snapshots.project("s", json!({"state":"idle","gateway":{"steering":1}}), true)["phase"],
+            "steering"
+        );
+    }
     #[test]
     fn gateway_wait_is_visible_even_after_provider_idle() {
         let states = SessionSnapshots::default();

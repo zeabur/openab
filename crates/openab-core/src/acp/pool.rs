@@ -25,6 +25,7 @@ struct PoolState {
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
+    steering_handles: HashMap<String, crate::acp::steering::SteeringHandle>,
     /// Lock-free facade tokens: thread_key → the exact `OPENAB_SESSION_TOKEN` minted for the
     /// connection currently under that key. Stored here, not just inside the connection, so hung
     /// eviction can revoke the exact token **synchronously** — the `AcpConnection` DropGuard that
@@ -260,6 +261,7 @@ async fn setup_facade_session(
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.admission_permits.remove(key);
     state.cancel_handles.remove(key);
+    state.steering_handles.remove(key);
     state.activity.remove(key);
     state.pgids.remove(key);
     state.suspended.remove(key);
@@ -395,6 +397,27 @@ impl SessionPool {
         keys
     }
 
+    pub async fn steer_session(
+        &self,
+        thread_id: &str,
+        prompt: serde_json::Value,
+    ) -> Result<serde_json::Value, (i32, String)> {
+        let handle = self
+            .state
+            .read()
+            .await
+            .steering_handles
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    -32004,
+                    "This session does not support native steering".into(),
+                )
+            })?;
+        handle.steer(prompt).await
+    }
+
     pub async fn execution_snapshot(&self, thread_id: &str) -> serde_json::Value {
         let state = self.state.read().await;
         let loading = state
@@ -404,6 +427,8 @@ impl SessionPool {
         match state.activity.get(thread_id) {
             Some(activity) => {
                 let mut snapshot = activity.execution.snapshot();
+                snapshot["steeringSupported"] =
+                    serde_json::json!(state.steering_handles.contains_key(thread_id));
                 if loading && !activity.in_flight() {
                     snapshot["operation"] = serde_json::json!("loading");
                 }
@@ -434,6 +459,7 @@ impl SessionPool {
                 active: HashMap::new(),
                 admission_permits: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                steering_handles: HashMap::new(),
                 #[cfg(feature = "acp-mcp")]
                 facade_tokens: HashMap::new(),
                 activity: HashMap::new(),
@@ -573,6 +599,7 @@ impl SessionPool {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 state.admission_permits.remove(&key);
                 state.cancel_handles.remove(&key);
+                state.steering_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
                 #[cfg(feature = "acp-mcp")]
@@ -989,6 +1016,7 @@ impl SessionPool {
         }
 
         let cancel_handle = new_conn.cancel_handle();
+        let steering_handle = new_conn.steering_handle();
         let activity_handle = new_conn.activity_handle();
         let child_pgid = new_conn.child_pgid();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
@@ -1011,6 +1039,7 @@ impl SessionPool {
             drop(existing);
             state.active.remove(thread_id);
             state.cancel_handles.remove(thread_id);
+            state.steering_handles.remove(thread_id);
             state.activity.remove(thread_id);
             state.pgids.remove(thread_id);
         }
@@ -1027,6 +1056,9 @@ impl SessionPool {
             .admission_permits
             .insert(thread_id.to_string(), admission_permit);
         state.active.insert(thread_id.to_string(), new_conn);
+        if let Some(handle) = steering_handle {
+            state.steering_handles.insert(thread_id.to_string(), handle);
+        }
         state
             .activity
             .insert(thread_id.to_string(), activity_handle);
@@ -1364,6 +1396,7 @@ impl SessionPool {
                 info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
                 state.admission_permits.remove(&key);
                 state.cancel_handles.remove(&key);
+                state.steering_handles.remove(&key);
                 state.activity.remove(&key);
                 state.pgids.remove(&key);
                 #[cfg(feature = "acp-mcp")]
@@ -1425,6 +1458,7 @@ impl SessionPool {
         state.active.clear();
         state.admission_permits.clear();
         state.cancel_handles.clear();
+        state.steering_handles.clear();
         state.activity.clear();
         state.pgids.clear();
         info!(count, "pool shutdown complete");
@@ -1477,6 +1511,7 @@ mod tests {
             active: HashMap::new(),
             admission_permits: HashMap::new(),
             cancel_handles: HashMap::new(),
+            steering_handles: HashMap::new(),
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
             pgids: HashMap::new(),
@@ -1923,6 +1958,7 @@ mod tests {
             active: HashMap::new(),
             admission_permits: HashMap::from([("hung".to_string(), admission_permit)]),
             cancel_handles: HashMap::new(),
+            steering_handles: HashMap::new(),
             #[cfg(feature = "acp-mcp")]
             facade_tokens: HashMap::new(),
             activity: HashMap::from([

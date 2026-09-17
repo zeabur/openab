@@ -1198,6 +1198,15 @@ async fn main() -> anyhow::Result<()> {
                             .collect()
                     })
                 }));
+                let steer_pool = pool.clone();
+                gw_state_inner.acp_session_steer = Some(Arc::new(
+                    move |channel: String, prompt: serde_json::Value| {
+                        let pool = steer_pool.clone();
+                        Box::pin(async move {
+                            pool.steer_session(&format!("acp:{channel}"), prompt).await
+                        })
+                    },
+                ));
                 let direct_cancel_pool = pool.clone();
                 gw_state_inner.acp_session_cancel = Some(Arc::new(move |channel: String| {
                     let pool = direct_cancel_pool.clone();

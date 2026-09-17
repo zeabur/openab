@@ -312,7 +312,7 @@ pub struct AcpConnection {
     /// PID of the direct child, used as the process group ID for cleanup.
     child_pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: NotificationSender,
     /// Session-scoped subscriber for agent-initiated turns, kept apart from
@@ -321,6 +321,7 @@ pub struct AcpConnection {
     idle_notify_tx: NotificationSender,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
+    supports_steering: bool,
     /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
     /// Used to gate agent-specific extension methods.
     pub agent_name: String,
@@ -635,12 +636,13 @@ impl AcpConnection {
             _proc: proc,
             child_pgid,
             stdin,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             pending,
             notify_tx,
             idle_notify_tx,
             acp_session_id: None,
             supports_load_session: false,
+            supports_steering: false,
             agent_name: String::new(),
             config_options: Vec::new(),
             last_active: Instant::now(),
@@ -657,6 +659,17 @@ impl AcpConnection {
     #[cfg(feature = "acp-mcp")]
     pub fn set_facade_token_guard(&mut self, guard: Option<tokio_util::sync::DropGuard>) {
         self.facade_token_guard = guard;
+    }
+
+    /// Independent request handle: steering must not wait for the prompt mutex.
+    pub(crate) fn steering_handle(&self) -> Option<crate::acp::steering::SteeringHandle> {
+        self.supports_steering
+            .then(|| crate::acp::steering::SteeringHandle {
+                stdin: self.stdin.clone(),
+                next_id: self.next_id.clone(),
+                pending: self.pending.clone(),
+                session_id: self.acp_session_id.clone().unwrap_or_default(),
+            })
     }
 
     fn next_id(&self) -> u64 {
@@ -744,6 +757,10 @@ impl AcpConnection {
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
         self.agent_name = agent_name.to_string();
+        self.supports_steering = result
+            .and_then(|r| r.pointer("/_meta/steering/supported"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.supports_load_session = result
             .and_then(|r| r.get("agentCapabilities"))
             .and_then(|c| c.get("loadSession"))
