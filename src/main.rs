@@ -1186,6 +1186,13 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "acp")]
             {
                 gw_state_inner.acp_tunnel_registry = Some(acp_tunnel_registry.clone());
+                let snapshot_pool = pool.clone();
+                gw_state_inner.acp_session_snapshot = Some(Arc::new(move |channel: String| {
+                    let pool = snapshot_pool.clone();
+                    Box::pin(
+                        async move { pool.execution_snapshot(&format!("acp:{channel}")).await },
+                    )
+                }));
             }
 
             // Pre-download identity probe: lets adapters consult the shared

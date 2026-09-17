@@ -1998,6 +1998,30 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     );
                 }
             }
+            "_openab/session/state" => {
+                if !initialized {
+                    let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
+                let session_id = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(Value::as_str);
+                let channel = session_id
+                    .and_then(|s| s.strip_prefix("sess_"))
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .map(|id| format!("acp_{id}"));
+                let resp = match (channel, state.acp_session_snapshot.as_ref()) {
+                    (None, _) => JsonRpcResponse::error(id, -32602, "Invalid sessionId"),
+                    (_, None) => JsonRpcResponse::error(id, -32601, "Runtime state unavailable"),
+                    (Some(channel), Some(read)) => {
+                        JsonRpcResponse::success(id, read(channel).await)
+                    }
+                };
+                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            }
             "session/prompt" => {
                 if !initialized {
                     let resp = JsonRpcResponse::error(id, -32002, "Not initialized");
@@ -2986,12 +3010,20 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
         }
     };
 
+    // The send consumes full_text; keep it in the selected arm, not a fall-through guard.
+    #[allow(clippy::collapsible_match)]
     match reply.command.as_deref() {
         Some("edit_message") => {
             // Streaming update — send as text snapshot
             if tx.send(ReplyChunk::Text(full_text)).is_err() {
-                debug!(channel = key, "ACP reply send failed (client likely disconnected)");
-                registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+                debug!(
+                    channel = key,
+                    "ACP reply send failed (client likely disconnected)"
+                );
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(key);
             }
         }
         Some("agent_update") => {
@@ -5625,6 +5657,50 @@ mod acp_ws_integration {
         (format!("ws://{addr}/acp"), registry, reply_registry, rx)
     }
 
+    #[tokio::test]
+    async fn execution_snapshot_reads_without_resuming_or_claiming_the_session() {
+        let (tx, mut events) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(tx);
+        state.acp = Some(AcpConfig {
+            auth_key: None,
+            allowed_origins: vec![],
+        });
+        let registry = new_reply_registry();
+        state.acp_reply_registry = Some(registry.clone());
+        state.acp_session_snapshot = Some(Arc::new(|channel| {
+            Box::pin(async move {
+                assert_eq!(channel, "acp_173201f5-7973-4186-ae78-e63c2988d1b9");
+                json!({"epoch": "provider-process", "revision": 4, "state": "idle"})
+            })
+        }));
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/acp"))
+            .await
+            .unwrap();
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1}}),
+        )
+        .await;
+        let _ = recv(&mut ws).await;
+        send(&mut ws, json!({"jsonrpc":"2.0", "id":2, "method":"_openab/session/state", "params":{"sessionId":"sess_173201f5-7973-4186-ae78-e63c2988d1b9"}})).await;
+        let snapshot = recv(&mut ws).await;
+        assert_eq!(snapshot["result"]["state"], "idle");
+        assert_eq!(snapshot["result"]["revision"], 4);
+        assert!(registry.lock().unwrap().is_empty());
+        assert!(
+            events.try_recv().is_err(),
+            "a state read must not dispatch work"
+        );
+    }
+
     async fn serve() -> (String, AcpTunnelRegistry) {
         let (url, tunnel_registry, _reply_registry, _event_rx) = serve_with_events().await;
         (url, tunnel_registry)
@@ -5797,6 +5873,43 @@ mod acp_ws_integration {
                 "method": "session/cancel",
                 "params": {"sessionId": session_id}
             }),
+        )
+        .await;
+        let cancelled: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(cancelled["event_type"], "session_cancel");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), first.next())
+                .await
+                .is_err(),
+            "cancel must wait for the native runtime outcome"
+        );
+        let turn_id = reply_registry
+            .lock()
+            .unwrap()
+            .get(&channel_id)
+            .unwrap()
+            .turn_id
+            .clone()
+            .unwrap();
+        handle_reply(
+            &GatewayReply {
+                schema: "openab.gateway.reply.v1".into(),
+                reply_to: turn_id,
+                platform: "acp".into(),
+                channel: ReplyChannel {
+                    id: channel_id,
+                    thread_id: None,
+                },
+                content: Content {
+                    content_type: "text".into(),
+                    text: String::new(),
+                    attachments: Vec::new(),
+                },
+                command: Some("finish_turn:cancelled".into()),
+                request_id: None,
+                quote_message_id: None,
+            },
+            &reply_registry,
         )
         .await;
         let prompt_response = recv(&mut first).await;

@@ -364,6 +364,16 @@ async fn send_session_cancel(
 }
 
 impl SessionPool {
+    /// Read without taking the per-session mutex held throughout a prompt.
+    /// This neither loads a session nor claims its output/permission routes.
+    pub async fn execution_snapshot(&self, thread_id: &str) -> serde_json::Value {
+        let state = self.state.read().await;
+        match state.activity.get(thread_id) {
+            Some(activity) => activity.execution.snapshot(),
+            None => serde_json::json!({"state": "dormant"}),
+        }
+    }
+
     pub fn new(
         config: AgentConfig,
         max_sessions: usize,

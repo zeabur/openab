@@ -98,3 +98,27 @@ The chat subset is **wire-conformant** with ACP Schema v1.19.0:
 - **Still unverified** — field-level exactness of `agentCapabilities` /
   `clientCapabilities` sub-objects against a *third-party* ACP client (e.g. Zed), and
   `ContentBlock` variants beyond `text` (image / audio / resource).
+
+
+## Runtime execution snapshot extension
+
+`_openab/session/state` accepts `{ "sessionId": "sess_<uuid>" }` on an
+initialized, authenticated ACP connection. It does not resume a session, claim
+its output sink, load a provider, or dispatch a prompt. The unified gateway reads
+the pool's provider-process lifecycle handle without taking the connection mutex
+held by prompts. Standalone gateways without the pool callback reject the method.
+
+An attached process returns `{ "state": "active|idle|unknown|interrupted",
+"epoch": "<process-instance-uuid>", "revision": 0 }`. Revisions increase on
+state changes within an epoch. A session absent from the pool returns
+`{ "state": "dormant" }`. A new provider process starts unknown with a new
+epoch. EOF records interrupted. Transport consumers must represent failed reads
+as unknown/disconnected, never assume the last active snapshot remains current.
+
+The reader records only native `session_info_update` lifecycle metadata:
+Codex `_meta.codex.threadStatus.type`, or a provider adapter's
+`_meta["ai.nuphos/sessionState"].state`. The latter must be emitted from the
+provider's native lifecycle, including its turn-ordering fences. Text, usage,
+background-tool updates, output sinks, and pending tool counts cannot change
+this snapshot. Existing adapters that do not publish lifecycle remain unknown;
+this extension does not fabricate an idle or active state for them.

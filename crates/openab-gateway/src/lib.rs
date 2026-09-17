@@ -48,6 +48,13 @@ fn l1_unenforceable(active: bool, l1_configured: bool) -> bool {
     active && !l1_configured
 }
 
+#[cfg(feature = "acp")]
+pub type AcpSessionSnapshot = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct AppState {
     pub telegram_bot_token: Option<String>,
     pub telegram_secret_token: Option<String>,
@@ -77,6 +84,8 @@ pub struct AppState {
     pub wecom: Option<adapters::wecom::WecomAdapter>,
     #[cfg(feature = "acp")]
     pub acp: Option<adapters::acp_server::AcpConfig>,
+    #[cfg(feature = "acp")]
+    pub acp_session_snapshot: Option<AcpSessionSnapshot>,
     #[cfg(feature = "acp")]
     pub acp_reply_registry: Option<adapters::acp_server::AcpReplyRegistry>,
     #[cfg(feature = "acp")]
@@ -131,6 +140,8 @@ impl AppState {
             wecom: None,
             #[cfg(feature = "acp")]
             acp: None,
+            #[cfg(feature = "acp")]
+            acp_session_snapshot: None,
             #[cfg(feature = "acp")]
             acp_reply_registry: None,
             #[cfg(feature = "acp")]
@@ -253,6 +264,8 @@ impl AppState {
             wecom,
             #[cfg(feature = "acp")]
             acp,
+            #[cfg(feature = "acp")]
+            acp_session_snapshot: None,
             #[cfg(feature = "acp")]
             acp_reply_registry,
             #[cfg(feature = "acp")]
@@ -835,6 +848,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         wecom,
         #[cfg(feature = "acp")]
         acp,
+        #[cfg(feature = "acp")]
+        acp_session_snapshot: None,
         #[cfg(feature = "acp")]
         acp_reply_registry,
         #[cfg(feature = "acp")]

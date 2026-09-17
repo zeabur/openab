@@ -123,6 +123,7 @@ impl ContentBlock {
 
 /// Lock-free view of session activity, readable without the connection mutex.
 pub struct SessionActivity {
+    pub execution: super::session_state::SessionState,
     /// Milliseconds since process boot (monotonic) of the last observed activity.
     last_active_ms: AtomicU64,
     /// True while a prompt turn is in flight (mutex likely held).
@@ -161,6 +162,7 @@ impl Default for SessionActivity {
 impl SessionActivity {
     pub fn new() -> Self {
         Self {
+            execution: Default::default(),
             last_active_ms: AtomicU64::new(Self::now_ms()),
             prompt_in_flight: AtomicBool::new(false),
             prompt_permission_wait_ms: AtomicU64::new(0),
@@ -357,11 +359,12 @@ fn build_agent_env(
 /// id-bearing messages to the active subscriber. The subscriber owns policy:
 /// legacy chat surfaces auto-approve permissions, while opted-in ACP clients
 /// can relay the request to their user before responding.
-pub(crate) async fn run_reader_loop<R>(
+pub(crate) async fn run_reader_loop_with_state<R>(
     reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: NotificationSender,
     idle_notify_tx: NotificationSender,
+    execution: Option<Arc<SessionActivity>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -381,6 +384,9 @@ pub(crate) async fn run_reader_loop<R>(
             Ok(m) => m,
             Err(_) => continue,
         };
+        if let Some(activity) = &execution {
+            activity.execution.observe(msg.params.as_ref());
+        }
         debug!(line = line.trim(), "acp_recv");
 
         // Response (has id, no method) → resolve pending AND forward to
@@ -443,6 +449,9 @@ pub(crate) async fn run_reader_loop<R>(
         }
     }
 
+    if let Some(activity) = &execution {
+        activity.execution.set("interrupted");
+    }
     // Connection closed — resolve all pending with error
     let mut map = pending.lock().await;
     for (_, tx) in map.drain() {
@@ -601,14 +610,14 @@ impl AcpConnection {
         let idle_notify_tx: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
-        let reader_handle = tokio::spawn(run_reader_loop(
+        let activity = Arc::new(SessionActivity::new());
+        let reader_handle = tokio::spawn(run_reader_loop_with_state(
             stdout,
             pending.clone(),
             notify_tx.clone(),
             idle_notify_tx.clone(),
+            Some(activity.clone()),
         ));
-
-        let activity = Arc::new(SessionActivity::new());
 
         Ok(Self {
             _proc: proc,
@@ -1620,4 +1629,14 @@ mod reader_loop_tests {
         activity.set_in_flight(false);
         assert!(activity.prompt_permission_wait_age().is_none());
     }
+}
+
+#[cfg(test)]
+async fn run_reader_loop<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    notify_tx: NotificationSender,
+    idle_notify_tx: NotificationSender,
+) {
+    run_reader_loop_with_state(reader, pending, notify_tx, idle_notify_tx, None).await;
 }
