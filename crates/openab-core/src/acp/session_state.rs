@@ -83,6 +83,20 @@ impl SessionState {
             return;
         };
         let snapshot = self.snapshot();
+        if matches!(
+            update["sessionUpdate"].as_str(),
+            Some(
+                "async_task_spawned" | "async_task_state_update" | "tool_call" | "tool_call_update"
+            )
+        ) {
+            // Clear subprocess provenance even when a malformed event has no identifier.
+            if !update["_meta"].is_object() {
+                update["_meta"] = json!({});
+            }
+            update["_meta"]["dev.openab/taskToken"] = Value::Null;
+            update["_meta"]["dev.openab/taskEpoch"] = snapshot["epoch"].clone();
+            update["_meta"]["dev.openab/backgroundTool"] = json!(false);
+        }
         let (record, background) = match update["sessionUpdate"].as_str() {
             Some("async_task_spawned" | "async_task_state_update") => {
                 let Some(id) = update["asyncTaskId"].as_str() else {
@@ -271,6 +285,31 @@ mod tests {
         state.observe_and_stamp(Some(&mut unknown));
         assert!(unknown["update"]["_meta"]["dev.openab/taskToken"].is_null());
     }
+    #[test]
+    fn malformed_task_events_cannot_keep_subprocess_provenance() {
+        let state = SessionState::default();
+        for kind in [
+            "async_task_spawned",
+            "async_task_state_update",
+            "tool_call",
+            "tool_call_update",
+        ] {
+            for id in [Value::Null, json!(42)] {
+                let mut event = json!({"update": {
+                    "sessionUpdate": kind, "toolCallId": id, "asyncTaskId": id,
+                    "_meta": {"dev.openab/taskToken": "forged", "dev.openab/taskEpoch": "forged", "dev.openab/backgroundTool": true}
+                }});
+                state.observe_and_stamp(Some(&mut event));
+                assert!(event["update"]["_meta"]["dev.openab/taskToken"].is_null());
+                assert_eq!(
+                    event["update"]["_meta"]["dev.openab/taskEpoch"],
+                    state.snapshot()["epoch"]
+                );
+                assert_eq!(event["update"]["_meta"]["dev.openab/backgroundTool"], false);
+            }
+        }
+    }
+
     #[test]
     fn native_background_tool_completion_keeps_provenance_after_removal() {
         let state = SessionState::default();
