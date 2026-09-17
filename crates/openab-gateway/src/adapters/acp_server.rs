@@ -1937,6 +1937,12 @@ async fn handle_acp_connection(
                             json!(true);
                     }
                 }
+                if state.acp_session_snapshot.is_some() {
+                    if let Some(result) = resp.result.as_mut() {
+                        result["agentCapabilities"]["_meta"]["dev.openab/sessionAuthority"] =
+                            json!(2);
+                    }
+                }
                 // Only mark the connection initialized when negotiation succeeded.
                 let negotiated_ok = resp.error.is_none();
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());

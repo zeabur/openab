@@ -71,6 +71,32 @@ impl SessionState {
         });
     }
 
+    /// Stamp provenance at the native reader, before prompt/idle routes can change.
+    pub fn observe_and_stamp(&self, params: Option<&mut Value>) {
+        let Some(params) = params else { return };
+        self.observe(Some(params));
+        let Some(update) = params.get_mut("update") else {
+            return;
+        };
+        if !matches!(
+            update["sessionUpdate"].as_str(),
+            Some("async_task_spawned" | "async_task_state_update")
+        ) {
+            return;
+        }
+        let token = update["asyncTaskId"].as_str().and_then(|id| {
+            self.snapshot()["asyncTasks"][id]["ownershipToken"]
+                .as_str()
+                .map(str::to_owned)
+        });
+        // Never trust a token supplied by the subprocess itself.
+        if !update["_meta"].is_object() {
+            update["_meta"] = json!({});
+        }
+        update["_meta"]["dev.openab/taskToken"] = token.map(Value::String).unwrap_or(Value::Null);
+        update["_meta"]["dev.openab/taskEpoch"] = self.snapshot()["epoch"].clone();
+    }
+
     pub fn observe(&self, params: Option<&Value>) {
         let Some(update) = params.and_then(|p| p.get("update")) else {
             return;
@@ -112,6 +138,9 @@ impl SessionState {
                             }
                         }
                         if update["sessionUpdate"] == "async_task_spawned" {
+                            if task["state"] != "running" || !task["ownershipToken"].is_string() {
+                                task["ownershipToken"] = json!(uuid::Uuid::new_v4().to_string());
+                            }
                             task["state"] = json!("running");
                         }
                     }
@@ -198,5 +227,23 @@ mod tests {
         assert_eq!(next["revision"], 1);
         assert_eq!(first["epoch"], next["epoch"]);
         assert_ne!(next["epoch"], SessionState::default().snapshot()["epoch"]);
+    }
+    #[test]
+    fn native_task_provenance_survives_turns_and_changes_on_id_reuse() {
+        let state = SessionState::default();
+        let mut spawned = json!({"update":{"sessionUpdate":"async_task_spawned","asyncTaskId":"t","_meta":{"dev.openab/taskToken":"forged"}}});
+        state.observe_and_stamp(Some(&mut spawned));
+        let token = spawned["update"]["_meta"]["dev.openab/taskToken"].clone();
+        assert!(token.is_string());
+        assert_ne!(token, "forged");
+        state.operation("prompt");
+        let mut done = json!({"update":{"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"}});
+        state.observe_and_stamp(Some(&mut done));
+        assert_eq!(done["update"]["_meta"]["dev.openab/taskToken"], token);
+        state.observe_and_stamp(Some(&mut spawned));
+        assert_ne!(spawned["update"]["_meta"]["dev.openab/taskToken"], token);
+        let mut unknown = json!({"update":{"sessionUpdate":"async_task_state_update","asyncTaskId":"unknown","state":"completed","_meta":{"dev.openab/taskToken":"forged"}}});
+        state.observe_and_stamp(Some(&mut unknown));
+        assert!(unknown["update"]["_meta"]["dev.openab/taskToken"].is_null());
     }
 }

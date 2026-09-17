@@ -10,7 +10,7 @@ struct Automation {
     pending: BTreeSet<String>,
     observed: BTreeSet<String>,
     origins: BTreeSet<String>,
-    tasks: HashMap<String, String>,
+    tasks: HashMap<String, (String, Option<String>)>,
     generation: u64,
     worker: bool,
     running: bool,
@@ -130,14 +130,37 @@ impl SessionAutomation {
         if entry.cancelled || !entry.origins.contains(&accepted.origin) {
             return None;
         }
-        if update["sessionUpdate"] == "async_task_spawned" {
-            entry.tasks.insert(id.into(), accepted.origin.clone());
+        let token = update
+            .pointer("/_meta/dev.openab~1taskToken")
+            .and_then(Value::as_str);
+        if token.is_some()
+            && update
+                .pointer("/_meta/dev.openab~1taskEpoch")
+                .and_then(Value::as_str)
+                != entry.provider_epoch.as_deref()
+        {
             return None;
         }
+        if update["sessionUpdate"] == "async_task_spawned" {
+            entry.tasks.insert(
+                id.into(),
+                (accepted.origin.clone(), token.map(str::to_owned)),
+            );
+            return None;
+        }
+        let owned = entry.tasks.get(id).is_some_and(|(origin, spawned_token)| {
+            if let Some(spawned_token) = spawned_token {
+                token == Some(spawned_token.as_str())
+            } else {
+                *origin == accepted.origin
+            }
+        });
         if update["sessionUpdate"] != "async_task_state_update"
             || !matches!(update["state"].as_str(), Some("completed" | "failed"))
-            || !entry.tasks.contains_key(id)
-            || !entry.observed.insert(id.into())
+            || !owned
+            || !entry
+                .observed
+                .insert(format!("{id}:{}", token.unwrap_or(&accepted.origin)))
         {
             return None;
         }
@@ -490,5 +513,29 @@ mod tests {
         automation.observe_provider_epoch("s", Some("replacement"));
         assert_eq!(automation.observe("s", &done, &accepted("s")), None);
         assert_eq!(automation.snapshot("s")["pending"], json!([]));
+    }
+    #[test]
+    fn another_admitted_turn_needs_native_task_provenance() {
+        let automation = SessionAutomation::default();
+        automation.configure("s", vec![], None);
+        automation.observe_provider_epoch("s", Some("native-epoch"));
+        automation
+            .dispatch("s", None, Some((vec![], None)), "second-turn", || Ok(()))
+            .unwrap();
+        let second = AcceptedReply {
+            channel: "s".into(),
+            origin: "second-turn".into(),
+        };
+        spawn_task(&automation, "s", "t");
+        let done = json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"});
+        assert_eq!(automation.observe("s", &done, &second), None);
+        automation.observe("s", &json!({"sessionUpdate":"async_task_spawned","asyncTaskId":"native","_meta":{"dev.openab/taskToken":"native-reader-token","dev.openab/taskEpoch":"native-epoch"}}), &accepted("s"));
+        let mut native_done = json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"native","state":"completed"});
+        assert_eq!(automation.observe("s", &native_done, &second), None);
+        native_done["_meta"] =
+            json!({"dev.openab/taskToken":"wrong-token","dev.openab/taskEpoch":"native-epoch"});
+        assert_eq!(automation.observe("s", &native_done, &second), None);
+        native_done["_meta"] = json!({"dev.openab/taskToken":"native-reader-token","dev.openab/taskEpoch":"native-epoch"});
+        assert_eq!(automation.observe("s", &native_done, &second), Some(0));
     }
 }

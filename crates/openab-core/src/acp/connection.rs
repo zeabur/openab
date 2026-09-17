@@ -392,12 +392,12 @@ pub(crate) async fn run_reader_loop_with_state<R>(
                 break;
             }
         }
-        let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
+        let mut msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
             Ok(m) => m,
             Err(_) => continue,
         };
         if let Some(activity) = &execution {
-            activity.execution.observe(msg.params.as_ref());
+            activity.execution.observe_and_stamp(msg.params.as_mut());
         }
         debug!(line = line.trim(), "acp_recv");
 

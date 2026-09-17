@@ -52,10 +52,18 @@ backend secret and never distribute it to an untrusted ACP client.
 Continuation observation occurs only after reply routing accepts the event.
 Accepted prompt origins and observed task-spawn identities fence unknown and
 foreign task completions; replacement provider epochs invalidate task ownership.
+Native task spawns receive a random ownership token in the provider reader. The
+reader stamps subsequent task updates before routing changes between turns and
+replaces any subprocess-supplied token. Cross-turn completion requires that same
+spawn token; without native provenance, completion must match the spawning
+prompt origin. This preserves real background completions during a later turn
+without treating membership in the session's past origins as task ownership.
 
 ## Compatibility and migration
 
-Snapshot pushes require initialize capability
+A unified runtime advertises `agentCapabilities._meta["dev.openab/sessionAuthority"] = 2`
+on initialize so ordinary chat clients can verify support without cross-session
+operator queries. Snapshot pushes require initialize capability
 `clientCapabilities._meta["dev.openab/sessionSnapshots"] = true`.
 Runtime continuations require session `_meta["ai.nuphos/runtimeAuthority"] = 2`.
 Defaults preserve existing clients' continuation ownership.
