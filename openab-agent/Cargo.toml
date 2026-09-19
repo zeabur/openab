@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22.1"
 url = "2.5.8"
 # rmcp model/service types still surface in the ACP layer (sampling bridge).
-rmcp = { version = "1.7", default-features = false, features = ["client"] }
+rmcp = { version = "2.1", default-features = false, features = ["client"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
