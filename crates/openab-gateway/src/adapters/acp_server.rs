@@ -494,6 +494,27 @@ fn parse_session_meta(params: Option<&Value>) -> Option<serde_json::Value> {
     Some(meta.clone())
 }
 
+/// `session/prompt` `_meta` keys that carry a replacement for the session's
+/// stored passthrough values, with the same semantics as `session/resume`
+/// `_meta` / `mcpServers`: only an object (resp. array) replaces. Clients use
+/// them to hand a live session short-lived credentials without re-resuming.
+const PROMPT_SESSION_META_KEY: &str = "dev.openab/sessionMeta";
+const PROMPT_MCP_SERVERS_KEY: &str = "dev.openab/mcpServers";
+
+fn refresh_session_passthrough(session: &mut AcpSession, params: Option<&Value>) {
+    let Some(meta) = params.and_then(|p| p.get("_meta")) else {
+        return;
+    };
+    if let Some(servers) = meta.get(PROMPT_MCP_SERVERS_KEY).filter(|v| v.is_array()) {
+        session.mcp_servers = parse_http_mcp_servers(Some(&json!({ "mcpServers": servers })));
+    }
+    if let Some(next) = meta.get(PROMPT_SESSION_META_KEY).filter(|v| v.is_object()) {
+        if let Some(next) = parse_session_meta(Some(&json!({ "_meta": next }))) {
+            session.session_meta = Some(next);
+        }
+    }
+}
+
 const PERMISSION_POLICY_META_KEY: &str = "dev.openab/permissionPolicy";
 const PERMISSION_RELAY_TIMEOUT_SECS: u64 = 900;
 
@@ -2502,6 +2523,9 @@ async fn handle_acp_connection(
                         Some(s) => {
                             s.busy = true;
                             s.cancel = Some(cancel.clone());
+                            if mcp_enabled {
+                                refresh_session_passthrough(s, req.params.as_ref());
+                            }
                         }
                     }
                 }
@@ -5064,8 +5088,9 @@ mod acp_requests {
 mod acp_handlers {
     use super::{
         handle_initialize, handle_session_new, handle_session_resume, parse_acp_mcp_servers,
-        parse_http_mcp_servers, parse_session_meta, permission_relay_requested, AcpMcpServer,
-        AcpSession, JsonRpcRequest, MAX_ACP_SERVERS_PER_SESSION, MAX_SESSION_META_BYTES,
+        parse_http_mcp_servers, parse_session_meta, permission_relay_requested,
+        refresh_session_passthrough, AcpMcpServer, AcpSession, JsonRpcRequest,
+        MAX_ACP_SERVERS_PER_SESSION, MAX_SESSION_META_BYTES,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -5411,6 +5436,51 @@ mod acp_handlers {
             sessions.lock().await.get(&sid).unwrap().session_meta,
             Some(json!({}))
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_meta_refreshes_the_live_session_passthrough() {
+        let sessions = new_sessions();
+        let stale = json!({"dev.openab/credentials": {"NUPHOS_TOKEN": "old"}});
+        let v = serde_json::to_value(
+            handle_session_new(&sessions, json!(1), Vec::new(), Some(stale.clone()))
+                .await
+                .0,
+        )
+        .unwrap();
+        let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+        let mut guard = sessions.lock().await;
+        let session = guard.get_mut(&sid).unwrap();
+
+        refresh_session_passthrough(session, Some(&json!({"sessionId": sid, "prompt": []})));
+        refresh_session_passthrough(
+            session,
+            Some(&json!({"_meta": {"dev.openab/sessionMeta": null, "dev.openab/mcpServers": {}}})),
+        );
+        assert_eq!(session.session_meta, Some(stale.clone()));
+        assert!(session.mcp_servers.is_empty());
+
+        let too_big = json!({"x": "y".repeat(MAX_SESSION_META_BYTES + 1)});
+        refresh_session_passthrough(
+            session,
+            Some(&json!({"_meta": {"dev.openab/sessionMeta": too_big}})),
+        );
+        assert_eq!(session.session_meta, Some(stale));
+
+        let fresh = json!({"dev.openab/credentials": {"NUPHOS_TOKEN": "new"}});
+        let http = json!({"type": "http", "name": "tools", "url": "http://b/mcp", "headers": [
+            {"name": "Authorization", "value": "Bearer new"}
+        ]});
+        refresh_session_passthrough(
+            session,
+            Some(&json!({"_meta": {
+                "ai.nuphos/acknowledgePrompt": true,
+                "dev.openab/sessionMeta": fresh,
+                "dev.openab/mcpServers": [http, {"type": "stdio", "name": "x", "command": "sh"}],
+            }})),
+        );
+        assert_eq!(session.session_meta, Some(fresh));
+        assert_eq!(session.mcp_servers, vec![http]);
     }
 
     #[tokio::test]
