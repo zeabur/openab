@@ -4,6 +4,7 @@ pub mod connection;
 pub mod pool;
 pub mod protocol;
 pub mod session_state;
+mod startup;
 mod steering;
 
 pub use connection::ContentBlock;
