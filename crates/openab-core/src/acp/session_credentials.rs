@@ -61,18 +61,26 @@ fn write_private(dir: &Path, name: &str, value: &str) -> std::io::Result<()> {
     result
 }
 
-/// Writes the meta's credentials into the session's private directory and
-/// returns it, or `None` when the meta carries none. Values are never logged.
+/// Makes the session's private directory hold exactly the meta's credentials
+/// and returns it, or `None` when the meta carries none. A meta that omits a
+/// credential revokes its file; `None` meta leaves the directory untouched.
+/// Values are never logged.
 pub fn write_session_credentials(
     root: &Path,
     thread_id: &str,
     meta: Option<&serde_json::Value>,
 ) -> Option<PathBuf> {
+    meta?;
     let entries = credentials(meta);
+    let dir = session_credentials_dir(root, thread_id);
     if entries.is_empty() {
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(%error, "could not remove session credentials directory");
+            }
+        }
         return None;
     }
-    let dir = session_credentials_dir(root, thread_id);
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -86,12 +94,30 @@ pub fn write_session_credentials(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    for (name, value) in entries {
+    for (name, value) in &entries {
         if let Err(error) = write_private(&dir, name, value) {
             warn!(credential = name, %error, "could not write session credential");
         }
     }
+    remove_obsolete(&dir, &entries);
     Some(dir)
+}
+
+/// In-flight temp files start with `.` and belong to a concurrent writer.
+fn remove_obsolete(dir: &Path, keep: &[(&str, &str)]) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in listing.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || keep.iter().any(|(kept, _)| *kept == name) {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(entry.path()) {
+            warn!(credential = %name, %error, "could not revoke session credential");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,9 +146,13 @@ mod tests {
         names.sort();
         assert_eq!(names, ["TOKEN", "_OK_2"]);
 
-        let meta = json!({SESSION_CREDENTIALS_META_KEY: {"TOKEN": "v2"}});
+        let meta = json!({SESSION_CREDENTIALS_META_KEY: {"TOKEN": "v2", "_OK_2": 7}});
         write_session_credentials(root.path(), "acp:a", Some(&meta)).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("TOKEN")).unwrap(), "v2");
+        assert!(
+            !dir.join("_OK_2").exists(),
+            "a credential the replacement omits (or invalidates) is revoked"
+        );
 
         #[cfg(unix)]
         {
@@ -131,5 +161,23 @@ mod tests {
             assert_eq!(mode(&dir), 0o700);
             assert_eq!(mode(&dir.join("TOKEN")), 0o600);
         }
+
+        assert!(write_session_credentials(root.path(), "acp:a", None).is_none());
+        assert!(
+            dir.join("TOKEN").exists(),
+            "no meta leaves the directory untouched"
+        );
+        let empty = json!({SESSION_CREDENTIALS_META_KEY: {}});
+        assert!(write_session_credentials(root.path(), "acp:a", Some(&empty)).is_none());
+        assert!(
+            !dir.exists(),
+            "an empty replacement revokes every credential"
+        );
+        write_session_credentials(root.path(), "acp:a", Some(&meta)).unwrap();
+        assert!(write_session_credentials(root.path(), "acp:a", Some(&json!({}))).is_none());
+        assert!(
+            !dir.exists(),
+            "meta without credentials revokes every credential"
+        );
     }
 }
