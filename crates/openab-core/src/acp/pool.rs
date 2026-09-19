@@ -1,5 +1,6 @@
 use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
+use crate::acp::session_credentials::{write_session_credentials, SESSION_CREDENTIALS_DIR_ENV};
 use crate::acp::startup::{spawn_initialized, AgentCommand, LOCKED_STATE_RETRY_DELAYS};
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -75,6 +76,7 @@ pub struct SessionPool {
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    credentials_root: PathBuf,
     default_config_options: HashMap<String, String>,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
@@ -453,6 +455,7 @@ impl SessionPool {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
+        let credentials_root = openab_dir.join("credentials");
         let suspended = Self::load_mapping(&mapping_path);
         let session_workdirs = Self::load_mapping(&meta_path);
         Self {
@@ -478,6 +481,7 @@ impl SessionPool {
             hung_threshold_secs,
             mapping_path,
             meta_path,
+            credentials_root,
             default_config_options,
             #[cfg(feature = "acp-mcp")]
             session_registrar: None,
@@ -712,6 +716,9 @@ impl SessionPool {
             }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
+        // A live agent keeps its spawn-time env; credentials reach it through
+        // these files, refreshed on every prompt.
+        write_session_credentials(&self.credentials_root, thread_id, session_meta);
         let _create_guard = create_gate.lock().await;
 
         let (existing, saved_session_id) = {
@@ -908,9 +915,18 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
+        let mut base_env = self.config.env.clone();
+        if let Some(dir) =
+            write_session_credentials(&self.credentials_root, thread_id, session_meta.as_ref())
+        {
+            base_env.insert(
+                SESSION_CREDENTIALS_DIR_ENV.to_string(),
+                dir.to_string_lossy().into_owned(),
+            );
+        }
         #[cfg(feature = "acp-mcp")]
         let spawn_env: std::collections::HashMap<String, String> = {
-            let mut env = self.config.env.clone();
+            let mut env = base_env;
             if let Some(tok) = &session_token {
                 // The static facade MCP entry references ${OPENAB_SESSION_TOKEN};
                 // the value lives only in this agent process's environment.
@@ -919,7 +935,7 @@ impl SessionPool {
             env
         };
         #[cfg(not(feature = "acp-mcp"))]
-        let spawn_env = self.config.env.clone();
+        let spawn_env = base_env;
         // Callers may pass a per-session working directory that doesn't exist
         // yet (e.g. per-conversation isolation). Create it so the spawn's
         // current_dir() doesn't fail.

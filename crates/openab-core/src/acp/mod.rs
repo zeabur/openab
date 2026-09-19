@@ -3,6 +3,7 @@ pub mod agentcore;
 pub mod connection;
 pub mod pool;
 pub mod protocol;
+pub mod session_credentials;
 pub mod session_state;
 mod startup;
 mod steering;
