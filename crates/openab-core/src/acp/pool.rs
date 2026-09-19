@@ -1,5 +1,6 @@
 use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
+use crate::acp::startup::{spawn_initialized, AgentCommand, LOCKED_STATE_RETRY_DELAYS};
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -923,16 +924,17 @@ impl SessionPool {
         // yet (e.g. per-conversation isolation). Create it so the spawn's
         // current_dir() doesn't fail.
         let _ = std::fs::create_dir_all(&effective_workdir);
-        let mut new_conn = AcpConnection::spawn(
-            &self.config.command,
-            &self.config.args,
-            &effective_workdir,
-            &spawn_env,
-            &self.config.inherit_env,
+        let mut new_conn = spawn_initialized(
+            &AgentCommand {
+                command: &self.config.command,
+                args: &self.config.args,
+                working_dir: &effective_workdir,
+                env: &spawn_env,
+                inherit_env: &self.config.inherit_env,
+            },
+            &LOCKED_STATE_RETRY_DELAYS,
         )
         .await?;
-
-        new_conn.initialize().await?;
 
         let mut resumed = false;
         let mut load_failed: Option<&str> = None;
