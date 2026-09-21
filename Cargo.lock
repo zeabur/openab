@@ -2609,6 +2609,7 @@ dependencies = [
  "hmac 0.12.1",
  "image",
  "jsonwebtoken",
+ "libc",
  "parking_lot",
  "prost",
  "quick-xml",

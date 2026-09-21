@@ -958,6 +958,18 @@ When running with `BUILD_MODE=unified`, the binary embeds a webhook server for g
 | `GATEWAY_TRUSTED_BOT_IDS` | _(empty)_ | Comma-separated bot IDs to allow even when `GATEWAY_ALLOW_BOT_MESSAGES=false` |
 | `GATEWAY_BOT_USERNAME` | _(empty)_ | Bot's username for @mention detection in groups |
 
+### ACP runtime sign-in
+
+For a runtime an operator started by hand, these let the operator drive the provider
+CLI's interactive device login over `/acp` instead of an out-of-band `docker exec`. Both
+are read at startup; the methods they enable require `OPENAB_ACP_CONTROL_KEY` (see
+`docs/adr/runtime-session-authority.md`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAB_RUNTIME_LOGIN_COMMAND` | _(empty)_ | Whitespace-separated argv (no shell) that `_openab/runtime/login` runs. It should print NDJSON objects on stdout; each is relayed to the operator as an `_openab/runtime/login/frame` notification and is never logged. Unset → the method reports that this runtime has no sign-in. |
+| `OPENAB_RUNTIME_AUTH_FILE` | _(empty)_ | Path to the credential the provider CLI reads. A non-empty file there makes `_openab/runtime/state` report `authenticated: true`. Unset → `authenticated` is `null`, meaning OpenAB cannot tell — not that the runtime is signed out. |
+
 ### Platform Adapters
 
 Each platform is auto-enabled when its env vars are present:
