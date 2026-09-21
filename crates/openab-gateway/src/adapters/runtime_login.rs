@@ -1,0 +1,444 @@
+//! Operator-driven device sign-in for a runtime nobody provisioned.
+//!
+//! A runtime an operator started by hand has no pod template, no projected Secret and no
+//! exec channel, so the credential its provider CLI mints interactively cannot be seeded
+//! from outside. `_openab/runtime/login` runs a configured command inside this container
+//! and streams its NDJSON stdout back to the operator as notifications, so a remote
+//! application can render the device prompt without ever holding the credential.
+//!
+//! OpenAB stays provider-agnostic: it knows only how to run
+//! `OPENAB_RUNTIME_LOGIN_COMMAND` and relay whatever JSON objects it prints.
+
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{info, warn};
+
+/// Cap on one NDJSON frame from the login command, matching the operator-side parser.
+const MAX_LOGIN_FRAME_BYTES: usize = 128 * 1024;
+/// A device prompt nobody answers must release the slot rather than hold it forever.
+const LOGIN_TIMEOUT_SECS: u64 = 15 * 60;
+/// Notification carrying one frame the login command printed.
+pub const LOGIN_FRAME_METHOD: &str = "_openab/runtime/login/frame";
+
+/// Another sign-in already owns the runtime's single login slot.
+pub const LOGIN_BUSY: i32 = -32005;
+/// No `OPENAB_RUNTIME_LOGIN_COMMAND` is configured for this runtime.
+pub const LOGIN_UNSUPPORTED: i32 = -32601;
+/// The command could not run, or ended without signing in.
+pub const LOGIN_FAILED: i32 = -32006;
+
+/// The program and arguments `OPENAB_RUNTIME_LOGIN_COMMAND` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Whitespace-separated argv. Deliberately not a shell: the value is operator
+/// configuration for a fixed command, and a shell would turn it into an execution
+/// surface for anything that can write the environment.
+pub fn parse_login_command(raw: &str) -> Option<LoginCommand> {
+    let mut parts = raw.split_whitespace().map(str::to_string);
+    let program = parts.next()?;
+    Some(LoginCommand {
+        program,
+        args: parts.collect(),
+    })
+}
+
+/// An `attemptId` is echoed back to the operator on every frame, so it must be safe to
+/// place in a log line and small enough not to be a payload of its own.
+pub fn valid_attempt_id(attempt: &str) -> bool {
+    !attempt.is_empty()
+        && attempt.len() <= 128
+        && attempt
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+struct InFlight {
+    attempt: String,
+    connection: String,
+    pgid: Option<i32>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// One sign-in at a time for the whole runtime. Two concurrent device flows would
+/// race to write the same credential file, and the loser would silently win.
+static IN_FLIGHT: parking_lot::Mutex<Option<InFlight>> = parking_lot::Mutex::new(None);
+
+/// The slot is runtime-wide by design, so every test that drives a sign-in — here and in
+/// the ACP server's WebSocket suite — has to take this first.
+#[cfg(test)]
+pub static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn claim(attempt: &str, connection: &str) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let mut slot = IN_FLIGHT.lock();
+    if slot.is_some() {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *slot = Some(InFlight {
+        attempt: attempt.to_string(),
+        connection: connection.to_string(),
+        pgid: None,
+        cancel: Some(tx),
+    });
+    Some(rx)
+}
+
+fn record_pgid(attempt: &str, pgid: Option<i32>) {
+    let mut slot = IN_FLIGHT.lock();
+    if let Some(entry) = slot.as_mut() {
+        if entry.attempt == attempt {
+            entry.pgid = pgid;
+        }
+    }
+}
+
+fn release(attempt: &str) {
+    let mut slot = IN_FLIGHT.lock();
+    if slot.as_ref().is_some_and(|entry| entry.attempt == attempt) {
+        *slot = None;
+    }
+}
+
+/// Signal the in-flight sign-in to stop. `attempt` of `None` cancels whichever one is
+/// running. Returns whether an attempt was signalled.
+pub fn cancel(attempt: Option<&str>) -> bool {
+    let mut slot = IN_FLIGHT.lock();
+    let Some(entry) = slot.as_mut() else {
+        return false;
+    };
+    if attempt.is_some_and(|wanted| wanted != entry.attempt) {
+        return false;
+    }
+    kill_group(entry.pgid);
+    // A send failure means the driving task has already stopped; the kill above is what
+    // actually ends the command either way.
+    let signalled = entry.cancel.take();
+    if let Some(tx) = signalled {
+        let _ = tx.send(());
+        return true;
+    }
+    false
+}
+
+/// The exec channel this replaces died with its request. A sign-in whose operator is
+/// gone has nobody to answer the device prompt, so it must not outlive the connection.
+pub fn cancel_for_connection(connection: &str) {
+    let owned = {
+        let slot = IN_FLIGHT.lock();
+        slot.as_ref()
+            .filter(|entry| entry.connection == connection)
+            .map(|entry| entry.attempt.clone())
+    };
+    if let Some(attempt) = owned {
+        cancel(Some(&attempt));
+    }
+}
+
+/// The provider CLI launches its own children (a browser opener, a native helper) and
+/// they keep the pipes open, so only the whole group going away ends the sign-in.
+fn kill_group(pgid: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid {
+        // SAFETY: `kill` on a process-group id we created ourselves; an already-exited
+        // group returns ESRCH, which is the outcome we want anyway.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
+fn frame_notification(attempt: &str, frame: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": LOGIN_FRAME_METHOD,
+        "params": {"attemptId": attempt, "frame": frame},
+    })
+    .to_string()
+}
+
+/// Run the configured login command, relaying its NDJSON stdout to `out_tx`.
+///
+/// Frame contents are never logged: they carry a device code and, for some providers,
+/// the credential itself.
+pub async fn run(
+    command: &LoginCommand,
+    attempt: &str,
+    connection: &str,
+    out_tx: &UnboundedSender<String>,
+    on_success: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Value, (i32, String)> {
+    let Some(cancelled) = claim(attempt, connection) else {
+        return Err((
+            LOGIN_BUSY,
+            "A runtime sign-in is already in progress".to_string(),
+        ));
+    };
+    let outcome = drive(command, attempt, out_tx, cancelled).await;
+    release(attempt);
+    if matches!(&outcome, Ok(value) if value["exitCode"] == 0) {
+        if let Some(hook) = on_success {
+            hook();
+        }
+    }
+    outcome
+}
+
+async fn drive(
+    command: &LoginCommand,
+    attempt: &str,
+    out_tx: &UnboundedSender<String>,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> Result<Value, (i32, String)> {
+    let mut builder = tokio::process::Command::new(&command.program);
+    builder
+        .args(&command.args)
+        .stdin(std::process::Stdio::null())
+        // Provider output can carry secrets and is not ours to interpret; only the
+        // command's own NDJSON frames leave this process.
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    builder.process_group(0);
+    let mut child = builder.spawn().map_err(|error| {
+        warn!(error = %error, "runtime login command could not start");
+        (
+            LOGIN_FAILED,
+            "Runtime login command could not start".to_string(),
+        )
+    })?;
+    let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+    record_pgid(attempt, pgid);
+    info!(attempt = %attempt, "runtime sign-in started");
+
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let relay = {
+        let out_tx = out_tx.clone();
+        let attempt = attempt.to_string();
+        tokio::spawn(async move { relay_frames(stdout, &attempt, &out_tx).await })
+    };
+
+    let status = tokio::select! {
+        status = child.wait() => status,
+        _ = cancelled => {
+            kill_group(pgid);
+            let _ = child.kill().await;
+            relay.abort();
+            return Err((LOGIN_FAILED, "Runtime sign-in was cancelled".to_string()));
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS)) => {
+            kill_group(pgid);
+            let _ = child.kill().await;
+            relay.abort();
+            return Err((LOGIN_FAILED, "Runtime sign-in timed out".to_string()));
+        }
+    };
+    // The command's last frames are what report success; wait for the reader to drain
+    // the pipe before answering, or a fast exit races its own output.
+    let relayed = relay.await.unwrap_or(Err(()));
+    kill_group(pgid);
+    if relayed.is_err() {
+        return Err((
+            LOGIN_FAILED,
+            "Runtime login produced an unreadable response".to_string(),
+        ));
+    }
+    let code = status
+        .map(|status| status.code().unwrap_or(-1))
+        .map_err(|error| {
+            warn!(error = %error, "runtime login command did not report an exit status");
+            (LOGIN_FAILED, "Runtime sign-in did not complete".to_string())
+        })?;
+    info!(attempt = %attempt, exit_code = code, "runtime sign-in finished");
+    Ok(json!({"exitCode": code}))
+}
+
+/// Split stdout into NDJSON frames and forward each JSON object. A line over the cap
+/// fails the sign-in rather than growing a buffer the remote end controls.
+async fn relay_frames(
+    mut stdout: tokio::process::ChildStdout,
+    attempt: &str,
+    out_tx: &UnboundedSender<String>,
+) -> Result<(), ()> {
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match stdout.read(&mut chunk).await {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(_) => return Err(()),
+        };
+        pending.extend_from_slice(&chunk[..read]);
+        if pending.len() > MAX_LOGIN_FRAME_BYTES {
+            return Err(());
+        }
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=newline).take(newline).collect();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                return Err(());
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let Ok(frame @ Value::Object(_)) = serde_json::from_str::<Value>(text) else {
+                return Err(());
+            };
+            if out_tx.send(frame_notification(attempt, frame)).is_err() {
+                return Err(());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_command_is_argv_not_a_shell_line() {
+        assert_eq!(
+            parse_login_command("  node /opt/login.mjs --device  "),
+            Some(LoginCommand {
+                program: "node".into(),
+                args: vec!["/opt/login.mjs".into(), "--device".into()],
+            })
+        );
+        assert_eq!(parse_login_command("   "), None);
+    }
+
+    #[test]
+    fn an_attempt_id_stays_loggable() {
+        assert!(valid_attempt_id("a-b_C9"));
+        assert!(!valid_attempt_id(""));
+        assert!(!valid_attempt_id("has space"));
+        assert!(!valid_attempt_id(&"x".repeat(129)));
+    }
+
+    #[tokio::test]
+    async fn frames_reach_the_operator_and_the_slot_is_released() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let command = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '{\"type\":\"device\"}\\n{\"type\":\"authenticated\"}\\n'".into(),
+            ],
+        };
+        let result = run(&command, "attempt-1", "conn-1", &out_tx, None)
+            .await
+            .unwrap();
+        assert_eq!(result["exitCode"], 0);
+        let first: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(first["method"], LOGIN_FRAME_METHOD);
+        assert_eq!(first["params"]["attemptId"], "attempt-1");
+        assert_eq!(first["params"]["frame"]["type"], "device");
+        let second: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(second["params"]["frame"]["type"], "authenticated");
+        assert!(IN_FLIGHT.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_sign_in_is_refused_while_one_runs() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let slow = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+        };
+        let first = {
+            let out_tx = out_tx.clone();
+            let slow = slow.clone();
+            tokio::spawn(async move { run(&slow, "attempt-a", "conn-1", &out_tx, None).await })
+        };
+        // Wait for the slot rather than a fixed delay; the spawn above is not ordered.
+        while IN_FLIGHT.lock().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let refused = run(&slow, "attempt-b", "conn-1", &out_tx, None).await;
+        assert_eq!(refused.unwrap_err().0, LOGIN_BUSY);
+        assert!(cancel(Some("attempt-a")));
+        let _ = first.await.unwrap();
+        assert!(IN_FLIGHT.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_ends_its_sign_in() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let slow = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+        };
+        let running = {
+            let out_tx = out_tx.clone();
+            let slow = slow.clone();
+            tokio::spawn(async move { run(&slow, "attempt-c", "conn-9", &out_tx, None).await })
+        };
+        while IN_FLIGHT.lock().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cancel_for_connection("someone-else");
+        assert!(IN_FLIGHT.lock().is_some());
+        cancel_for_connection("conn-9");
+        assert_eq!(running.await.unwrap().unwrap_err().0, LOGIN_FAILED);
+        assert!(IN_FLIGHT.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_line_fails_the_sign_in() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let flood = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("printf '%0{}d' 0", MAX_LOGIN_FRAME_BYTES + 1),
+            ],
+        };
+        assert_eq!(
+            run(&flood, "attempt-d", "conn-1", &out_tx, None)
+                .await
+                .unwrap_err()
+                .0,
+            LOGIN_FAILED
+        );
+        assert!(out_rx.try_recv().is_err());
+        assert!(IN_FLIGHT.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_completed_sign_in_runs_the_success_hook_once() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let ok = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "true".into()],
+        };
+        let fail = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exit 3".into()],
+        };
+        run(&ok, "attempt-e", "conn-1", &out_tx, Some(hook.clone()))
+            .await
+            .unwrap();
+        let failed = run(&fail, "attempt-f", "conn-1", &out_tx, Some(hook))
+            .await
+            .unwrap();
+        assert_eq!(failed["exitCode"], 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}

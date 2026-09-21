@@ -83,6 +83,13 @@ pub type AcpSessionInventory = Arc<
         + Sync,
 >;
 
+/// Retire the sessions the pool can safely let go of, so the next message respawns its
+/// agent. Invoked after a device sign-in installs a credential an already-running
+/// provider process would not otherwise read. It is the pool's own idle path, which
+/// skips any session that still owns a turn — and a runtime only signs in when it has
+/// no working credential, so there is no turn to strand.
+pub type AcpRuntimeSuspend = Arc<dyn Fn() + Send + Sync>;
+
 /// Coalesced pool-cancel queue: inserts are deduplicated by thread key,
 /// so every distinct session's cancel is retained even if one client
 /// sends many cancels. Memory is bounded by the number of live sessions.
@@ -166,6 +173,8 @@ pub struct AppState {
     pub acp_session_steer: Option<AcpSessionSteer>,
     #[cfg(feature = "acp")]
     pub acp_session_inventory: Option<AcpSessionInventory>,
+    #[cfg(feature = "acp")]
+    pub acp_runtime_suspend: Option<AcpRuntimeSuspend>,
     #[cfg(feature = "acp")]
     pub acp_session_automation: adapters::acp_server::SessionAutomation,
     #[cfg(feature = "acp")]
@@ -254,6 +263,8 @@ impl AppState {
             acp_session_steer: None,
             #[cfg(feature = "acp")]
             acp_session_inventory: None,
+            #[cfg(feature = "acp")]
+            acp_runtime_suspend: None,
             #[cfg(feature = "acp")]
             acp_session_automation: Default::default(),
             #[cfg(feature = "acp")]
@@ -404,6 +415,8 @@ impl AppState {
             acp_session_steer: None,
             #[cfg(feature = "acp")]
             acp_session_inventory: None,
+            #[cfg(feature = "acp")]
+            acp_runtime_suspend: None,
             #[cfg(feature = "acp")]
             acp_session_automation: Default::default(),
             #[cfg(feature = "acp")]
@@ -1031,6 +1044,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         acp_session_steer: None,
         #[cfg(feature = "acp")]
         acp_session_inventory: None,
+        #[cfg(feature = "acp")]
+        acp_runtime_suspend: None,
         #[cfg(feature = "acp")]
         acp_session_automation: Default::default(),
         #[cfg(feature = "acp")]

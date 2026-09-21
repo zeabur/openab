@@ -1198,6 +1198,14 @@ async fn main() -> anyhow::Result<()> {
                             .collect()
                     })
                 }));
+                // The pool's own idle sweep, invoked on demand after a device sign-in
+                // installs a credential. `0` makes every session that is not holding a
+                // turn idle; the sweep already refuses to suspend one that is.
+                let suspend_pool = pool.clone();
+                gw_state_inner.acp_runtime_suspend = Some(Arc::new(move || {
+                    let pool = suspend_pool.clone();
+                    tokio::spawn(async move { pool.cleanup_idle(0).await });
+                }));
                 let steer_pool = pool.clone();
                 gw_state_inner.acp_session_steer = Some(Arc::new(
                     move |channel: String, prompt: serde_json::Value| {

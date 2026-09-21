@@ -16,6 +16,10 @@
 mod automation;
 pub use automation::{observe_runtime_reply, SessionAutomation};
 
+#[path = "runtime_login.rs"]
+mod runtime_login;
+pub use runtime_login::LoginCommand;
+
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -214,6 +218,14 @@ pub struct AcpConfig {
     /// `OPENAB_ACP_ALLOWED_ORIGINS`, comma-separated). Empty by default → every
     /// browser-set `Origin` is rejected; non-browser clients (no `Origin`) are unaffected.
     pub allowed_origins: Vec<String>,
+    /// Command `_openab/runtime/login` runs to drive a provider's interactive sign-in
+    /// (`OPENAB_RUNTIME_LOGIN_COMMAND`, whitespace-separated argv). Unset → the method
+    /// reports that this runtime has no sign-in.
+    pub login_command: Option<LoginCommand>,
+    /// File whose presence means the provider CLI in this container holds a credential
+    /// (`OPENAB_RUNTIME_AUTH_FILE`). Unset → `_openab/runtime/state` reports
+    /// `authenticated: null`, which is "OpenAB cannot tell", not "signed out".
+    pub auth_file: Option<String>,
 }
 
 impl AcpConfig {
@@ -258,12 +270,30 @@ impl AcpConfig {
         let control_key = std::env::var("OPENAB_ACP_CONTROL_KEY")
             .ok()
             .filter(|key| key.len() >= 32 && Some(key) != auth_key.as_ref());
+        let login_command = std::env::var("OPENAB_RUNTIME_LOGIN_COMMAND")
+            .ok()
+            .as_deref()
+            .and_then(runtime_login::parse_login_command);
+        let auth_file = std::env::var("OPENAB_RUNTIME_AUTH_FILE")
+            .ok()
+            .filter(|path| !path.trim().is_empty());
         Some(Self {
             auth_key,
             control_key,
             allowed_origins,
+            login_command,
+            auth_file,
         })
     }
+}
+
+/// Whether the provider CLI in this container holds a credential. `None` when no
+/// `OPENAB_RUNTIME_AUTH_FILE` is configured — an operator who cannot answer the question
+/// must not be told "signed out", because a container can carry its own credential in a
+/// form OpenAB never sees.
+fn runtime_authenticated(state: &crate::AppState) -> Option<bool> {
+    let path = state.acp.as_ref()?.auth_file.as_ref()?;
+    Some(std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0))
 }
 
 /// Whether a **keyless-mode** WS upgrade may proceed given its `Origin` header. WS
@@ -1940,6 +1970,8 @@ async fn handle_acp_connection(
                     | "_openab/session/steer"
                     | "_openab/session/state"
                     | "_openab/runtime/state"
+                    | "_openab/runtime/login"
+                    | "_openab/runtime/login/cancel"
                     | "_openab/session/requests"
             )
         {
@@ -2279,11 +2311,76 @@ async fn handle_acp_connection(
                             snapshots.push(snapshot);
                         }
                     }
-                    JsonRpcResponse::success(id, json!({"sessions":snapshots}))
+                    JsonRpcResponse::success(
+                        id,
+                        json!({
+                            "sessions": snapshots,
+                            "authenticated": runtime_authenticated(&state),
+                        }),
+                    )
                 } else {
                     JsonRpcResponse::error(id, -32601, "Runtime inventory unavailable")
                 };
                 let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            "_openab/runtime/login" | "_openab/runtime/login/cancel" => {
+                let cancelling = req.method.ends_with("/cancel");
+                let attempt = req
+                    .params
+                    .as_ref()
+                    .and_then(|params| params["attemptId"].as_str())
+                    .map(str::to_string);
+                if !runtime_control {
+                    let response =
+                        JsonRpcResponse::error(id, -32003, "Runtime operator credential required");
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if !initialized {
+                    let response = JsonRpcResponse::error(id, -32002, "Not initialized");
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if cancelling {
+                    let signalled = runtime_login::cancel(attempt.as_deref());
+                    let response = JsonRpcResponse::success(id, json!({"cancelled": signalled}));
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                let Some(attempt) = attempt.filter(|id| runtime_login::valid_attempt_id(id)) else {
+                    let response = JsonRpcResponse::error(id, -32602, "Invalid attemptId");
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                };
+                let Some(command) = state.acp.as_ref().and_then(|c| c.login_command.clone()) else {
+                    let response = JsonRpcResponse::error(
+                        id,
+                        runtime_login::LOGIN_UNSUPPORTED,
+                        "This runtime has no sign-in command configured",
+                    );
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                };
+                // A device flow outlives every other request on this connection, so it
+                // owns a task; the reader stays free for its cancel.
+                let out_tx = out_tx.clone();
+                let connection_id = connection_id.clone();
+                let on_success = state.acp_runtime_suspend.clone();
+                prompt_tasks.push(tokio::spawn(async move {
+                    let response = match runtime_login::run(
+                        &command,
+                        &attempt,
+                        &connection_id,
+                        &out_tx,
+                        on_success,
+                    )
+                    .await
+                    {
+                        Ok(result) => JsonRpcResponse::success(id, result),
+                        Err((code, message)) => JsonRpcResponse::error(id, code, message),
+                    };
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                }));
             }
             "_openab/session/requests" => {
                 let response = if !runtime_control {
@@ -2638,6 +2735,10 @@ async fn handle_acp_connection(
     for (_id, tx) in pending_requests.lock().await.drain() {
         drop(tx);
     }
+
+    // A device sign-in this connection started has nobody left to answer its prompt.
+    // The Kubernetes exec channel it replaces died with its request; match that.
+    runtime_login::cancel_for_connection(&connection_id);
 
     // --- Disconnect cleanup ---
     // Announce the close BEFORE anything is torn down. An establish that is past its last await
@@ -7124,6 +7225,8 @@ mod acp_ws_integration {
             auth_key: None,
             control_key: None,
             allowed_origins: vec![],
+            login_command: None,
+            auth_file: None,
         });
         let reply_registry = new_reply_registry();
         state.acp_reply_registry = Some(reply_registry.clone());
@@ -7149,6 +7252,8 @@ mod acp_ws_integration {
             auth_key: None,
             control_key: Some("operator-fixture-key".into()),
             allowed_origins: vec![],
+            login_command: None,
+            auth_file: None,
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"state":"active","steeringSupported":true}) })
@@ -7215,6 +7320,8 @@ mod acp_ws_integration {
             auth_key: None,
             control_key: Some("operator-fixture-key".into()),
             allowed_origins: vec![],
+            login_command: None,
+            auth_file: None,
         });
         let registry = new_reply_registry();
         state.acp_reply_registry = Some(registry.clone());
@@ -7267,6 +7374,8 @@ mod acp_ws_integration {
             auth_key: Some("ordinary-fixture".into()),
             control_key: Some("independent-operator-fixture".into()),
             allowed_origins: vec![],
+            login_command: None,
+            auth_file: None,
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"epoch":"provider","state":"active","operation":"prompt"}) })
@@ -7314,6 +7423,100 @@ mod acp_ws_integration {
                 }
             }
         }
+    }
+
+    /// The whole point of the method: an operator drives a device sign-in it can watch
+    /// but never holds the credential for, and an ordinary client cannot reach it at all.
+    #[tokio::test]
+    async fn an_operator_drives_a_device_sign_in_and_an_ordinary_client_cannot() {
+        let _serialized = runtime_login::TEST_GUARD.lock().await;
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(events);
+        let credential = std::env::temp_dir().join(format!("openab-login-{}", Uuid::new_v4()));
+        state.acp = Some(AcpConfig {
+            auth_key: Some("ordinary-fixture".into()),
+            control_key: Some("operator-fixture-key-that-is-long-enough".into()),
+            allowed_origins: vec![],
+            login_command: Some(LoginCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "printf '{{\"type\":\"device\",\"userCode\":\"ABCD-1234\"}}\\n'; printf x > {}",
+                        credential.display()
+                    ),
+                ],
+            }),
+            auth_file: Some(credential.display().to_string()),
+        });
+        state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
+        let suspends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = suspends.clone();
+        state.acp_runtime_suspend = Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let connect = |key: &str| {
+            let mut request = format!("ws://{address}/acp").into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert("Authorization", format!("Bearer {key}").parse().unwrap());
+            request
+        };
+        let initialize =
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}});
+        let login = json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/login","params":{"attemptId":"attempt-ws"}});
+
+        let (mut ordinary, _) = tokio_tungstenite::connect_async(connect("ordinary-fixture"))
+            .await
+            .unwrap();
+        send(&mut ordinary, initialize.clone()).await;
+        let _ = recv(&mut ordinary).await;
+        send(&mut ordinary, login.clone()).await;
+        let refused = recv(&mut ordinary).await;
+        assert_eq!(refused["error"]["code"], -32003, "{refused}");
+
+        let (mut operator, _) =
+            tokio_tungstenite::connect_async(connect("operator-fixture-key-that-is-long-enough"))
+                .await
+                .unwrap();
+        send(&mut operator, initialize).await;
+        let _ = recv(&mut operator).await;
+        // Nothing has signed in yet, so the runtime reports it authoritatively.
+        send(
+            &mut operator,
+            json!({"jsonrpc":"2.0","id":9,"method":"_openab/runtime/state","params":{}}),
+        )
+        .await;
+        assert_eq!(recv(&mut operator).await["result"]["authenticated"], false);
+
+        send(&mut operator, login).await;
+        let frame = recv(&mut operator).await;
+        assert_eq!(frame["method"], runtime_login::LOGIN_FRAME_METHOD);
+        assert_eq!(frame["params"]["attemptId"], "attempt-ws");
+        assert_eq!(frame["params"]["frame"]["userCode"], "ABCD-1234");
+        let completion = recv(&mut operator).await;
+        assert_eq!(completion["id"], 2);
+        assert_eq!(completion["result"]["exitCode"], 0);
+        // The credential stayed in the container — only the device frame crossed the wire.
+        assert!(completion["result"].get("authJson").is_none());
+        assert_eq!(suspends.load(Ordering::SeqCst), 1);
+
+        send(
+            &mut operator,
+            json!({"jsonrpc":"2.0","id":10,"method":"_openab/runtime/state","params":{}}),
+        )
+        .await;
+        assert_eq!(recv(&mut operator).await["result"]["authenticated"], true);
+        let _ = std::fs::remove_file(&credential);
     }
 
     async fn serve() -> (String, AcpTunnelRegistry) {
