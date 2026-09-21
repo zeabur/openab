@@ -19,6 +19,8 @@ use tracing::{info, warn};
 const MAX_LOGIN_FRAME_BYTES: usize = 128 * 1024;
 /// A device prompt nobody answers must release the slot rather than hold it forever.
 const LOGIN_TIMEOUT_SECS: u64 = 15 * 60;
+/// How long the pipe may still be drained after the command's group has been killed.
+const RELAY_DRAIN_SECS: u64 = 5;
 /// Notification carrying one frame the login command printed.
 pub const LOGIN_FRAME_METHOD: &str = "_openab/runtime/login/frame";
 
@@ -105,25 +107,33 @@ fn release(attempt: &str) {
     }
 }
 
-/// Signal the in-flight sign-in to stop. `attempt` of `None` cancels whichever one is
-/// running. Returns whether an attempt was signalled.
+/// Stop the in-flight sign-in. `attempt` of `None` cancels whichever one is running.
+/// Returns whether an attempt was cancelled.
+///
+/// The slot is freed here rather than by the driving task, because a cancel that arrives
+/// with a closing connection races that task's own teardown: if the task is dropped
+/// before it can release, every later sign-in is refused until the process restarts. The
+/// kill below is synchronous and unconditional, so the command is already gone by the
+/// time the slot is free for someone else to claim.
 pub fn cancel(attempt: Option<&str>) -> bool {
     let mut slot = IN_FLIGHT.lock();
-    let Some(entry) = slot.as_mut() else {
+    let Some(entry) = slot.as_ref() else {
         return false;
     };
     if attempt.is_some_and(|wanted| wanted != entry.attempt) {
         return false;
     }
+    let Some(entry) = slot.take() else {
+        return false;
+    };
+
     kill_group(entry.pgid);
-    // A send failure means the driving task has already stopped; the kill above is what
+    // A send failure means the driving task has already stopped; the kill is what
     // actually ends the command either way.
-    let signalled = entry.cancel.take();
-    if let Some(tx) = signalled {
+    if let Some(tx) = entry.cancel {
         let _ = tx.send(());
-        return true;
     }
-    false
+    true
 }
 
 /// The exec channel this replaces died with its request. A sign-in whose operator is
@@ -241,10 +251,15 @@ async fn drive(
             return Err((LOGIN_FAILED, "Runtime sign-in timed out".to_string()));
         }
     };
-    // The command's last frames are what report success; wait for the reader to drain
-    // the pipe before answering, or a fast exit races its own output.
-    let relayed = relay.await.unwrap_or(Err(()));
+    // End the group before waiting for EOF. A descendant that inherited stdout can hold
+    // the pipe open long after the command itself exits, and by here the cancellation and
+    // timeout arms are gone — so an unbounded drain would outlive both guarantees. Bytes
+    // already written stay readable once the writers are dead, so no frame is lost.
     kill_group(pgid);
+    let relayed = tokio::time::timeout(std::time::Duration::from_secs(RELAY_DRAIN_SECS), relay)
+        .await
+        .unwrap_or_else(|_| Ok(Err(())))
+        .unwrap_or(Err(()));
     if relayed.is_err() {
         return Err((
             LOGIN_FAILED,
@@ -390,6 +405,39 @@ mod tests {
         assert!(IN_FLIGHT.lock().is_some());
         cancel_for_connection("conn-9");
         assert_eq!(running.await.unwrap().unwrap_err().0, LOGIN_FAILED);
+        assert!(IN_FLIGHT.lock().is_none());
+    }
+
+    /// A helper that inherited stdout can outlive the command that spawned it. Before the
+    /// group was killed ahead of the drain, the pipe stayed open and the runtime-wide slot
+    /// with it — long past the sign-in's own bound.
+    #[tokio::test]
+    async fn a_descendant_holding_stdout_cannot_hold_the_slot() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let lingering = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "sleep 120 & printf '{\"type\":\"authenticated\"}\\n'".into(),
+            ],
+        };
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run(&lingering, "attempt-g", "conn-1", &out_tx, None),
+        )
+        .await
+        .expect("the sign-in must not wait on a descendant's copy of stdout")
+        .unwrap();
+
+        assert_eq!(result["exitCode"], 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(RELAY_DRAIN_SECS + 5));
+        // The frame the command did print still arrives: killing the writers does not
+        // discard what is already in the pipe.
+        let frame: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+
+        assert_eq!(frame["params"]["frame"]["type"], "authenticated");
         assert!(IN_FLIGHT.lock().is_none());
     }
 

@@ -7519,6 +7519,91 @@ mod acp_ws_integration {
         let _ = std::fs::remove_file(&credential);
     }
 
+    /// The sign-in slot is runtime-wide, so a connection that dies mid-flow must hand it
+    /// back. Releasing it from the login task instead raced that connection's teardown,
+    /// and a lost race refused every later sign-in until the process restarted.
+    #[tokio::test]
+    async fn a_dropped_connection_hands_its_sign_in_slot_to_the_next_one() {
+        let _serialized = runtime_login::TEST_GUARD.lock().await;
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(events);
+        state.acp = Some(AcpConfig {
+            auth_key: None,
+            control_key: Some("operator-fixture-key-that-is-long-enough".into()),
+            allowed_origins: vec![],
+            login_command: Some(LoginCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '{\"type\":\"device\"}\\n'; sleep 120".into(),
+                ],
+            }),
+            auth_file: None,
+        });
+        state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let open = || async {
+            let mut request = format!("ws://{address}/acp").into_client_request().unwrap();
+            request.headers_mut().insert(
+                "Authorization",
+                "Bearer operator-fixture-key-that-is-long-enough"
+                    .parse()
+                    .unwrap(),
+            );
+            let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+            send(&mut ws, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}})).await;
+            let _ = recv(&mut ws).await;
+
+            ws
+        };
+
+        let mut abandoned = open().await;
+
+        send(
+            &mut abandoned,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/login","params":{"attemptId":"abandoned"}}),
+        )
+        .await;
+        // The device frame proves the command is running, so the slot is genuinely taken.
+        assert_eq!(
+            recv(&mut abandoned).await["params"]["attemptId"],
+            "abandoned"
+        );
+        drop(abandoned);
+
+        let mut successor = open().await;
+
+        send(
+            &mut successor,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/login","params":{"attemptId":"successor"}}),
+        )
+        .await;
+        let frame = recv(&mut successor).await;
+
+        assert_eq!(frame["params"]["attemptId"], "successor", "{frame}");
+        send(
+            &mut successor,
+            json!({"jsonrpc":"2.0","id":3,"method":"_openab/runtime/login/cancel","params":{"attemptId":"successor"}}),
+        )
+        .await;
+        loop {
+            let message = recv(&mut successor).await;
+
+            if message["id"] == 2 {
+                break;
+            }
+        }
+    }
+
     async fn serve() -> (String, AcpTunnelRegistry) {
         let (url, tunnel_registry, _reply_registry, _event_rx) = serve_with_events().await;
         (url, tunnel_registry)
