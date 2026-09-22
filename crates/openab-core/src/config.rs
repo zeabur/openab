@@ -1913,10 +1913,10 @@ fn default_agent_args() -> Vec<String> {
     Vec::new()
 }
 fn default_max_sessions() -> usize {
-    10
+    100_000
 }
 fn default_ttl_hours() -> u64 {
-    24 * 30
+    4
 }
 pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
     30 * 60
@@ -3408,7 +3408,7 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
-        assert_eq!(cfg.pool.max_sessions, 10);
+        assert_eq!(cfg.pool.max_sessions, 100_000);
         assert!(cfg.reactions.enabled);
     }
 
