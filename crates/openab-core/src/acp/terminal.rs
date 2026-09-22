@@ -83,17 +83,29 @@ struct Terminal {
     exit_notify: Notify,
 }
 
+#[derive(Default)]
+struct Registry {
+    /// Set by `shutdown()`. Checked in the same critical section `create()`
+    /// spawns and registers a new terminal in, so a create racing a shutdown
+    /// either finishes registering before `shutdown()` can observe it (and so
+    /// gets killed like every other tracked terminal) or sees `closed` and
+    /// refuses to spawn — there is no window where a spawned child exists but
+    /// isn't yet visible to `shutdown()`.
+    closed: bool,
+    terminals: HashMap<String, Arc<Terminal>>,
+}
+
 /// Tracks every terminal the agent has created for a session via `terminal/create`,
 /// through `terminal/output` / `terminal/wait_for_exit` / `terminal/kill` /
 /// `terminal/release`. One instance per [`super::connection::AcpConnection`].
 ///
-/// `terminals` is a `std::sync::Mutex`, not a `tokio` one: every critical
-/// section below is lock-then-immediately-release with no `.await` in
-/// between, and a plain sync mutex is what lets [`TerminalManager::shutdown`]
-/// run from `Drop`, which cannot `.await`.
+/// `registry` is a `std::sync::Mutex`, not a `tokio` one: every critical
+/// section below (including `create`'s synchronous `Command::spawn`) holds it
+/// with no `.await` in between, and a plain sync mutex is what lets
+/// [`TerminalManager::shutdown`] run from `Drop`, which cannot `.await`.
 #[derive(Default)]
 pub struct TerminalManager {
-    terminals: std::sync::Mutex<HashMap<String, Arc<Terminal>>>,
+    registry: std::sync::Mutex<Registry>,
 }
 
 /// Append `chunk` to `buf`, then truncate from the front to `limit` bytes at a
@@ -143,28 +155,34 @@ impl TerminalManager {
             cmd.env(&var.name, &var.value);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn terminal command {}: {e}", params.command))?;
-        let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let terminal = Arc::new(Terminal {
-            pgid,
-            child: Mutex::new(Some(child)),
-            output: Mutex::new(Vec::new()),
-            output_byte_limit,
-            truncated: AtomicBool::new(false),
-            exit: Mutex::new(None),
-            exit_notify: Notify::new(),
-        });
-
         let terminal_id = uuid::Uuid::new_v4().to_string();
-        self.terminals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(terminal_id.clone(), terminal.clone());
+        // Spawn and register under the same lock `shutdown()` takes, so a
+        // shutdown racing this call can never miss the terminal it creates.
+        let (terminal, stdout, stderr) = {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            if registry.closed {
+                return Err(anyhow!("terminal manager is shutting down"));
+            }
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| anyhow!("failed to spawn terminal command {}: {e}", params.command))?;
+            let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let terminal = Arc::new(Terminal {
+                pgid,
+                child: Mutex::new(Some(child)),
+                output: Mutex::new(Vec::new()),
+                output_byte_limit,
+                truncated: AtomicBool::new(false),
+                exit: Mutex::new(None),
+                exit_notify: Notify::new(),
+            });
+            registry
+                .terminals
+                .insert(terminal_id.clone(), terminal.clone());
+            (terminal, stdout, stderr)
+        };
 
         tokio::spawn(pump_output_and_wait(terminal, stdout, stderr));
 
@@ -210,9 +228,10 @@ impl TerminalManager {
             serde_json::from_value(params.cloned().ok_or_else(|| anyhow!("missing params"))?)
                 .map_err(|e| anyhow!("invalid terminal params: {e}"))?;
         let terminal = self
-            .terminals
+            .registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .terminals
             .remove(&params.terminal_id)
             .ok_or_else(|| anyhow!("unknown terminalId {}", params.terminal_id))?;
         if terminal.exit.lock().await.is_none() {
@@ -223,15 +242,17 @@ impl TerminalManager {
         Ok(json!({}))
     }
 
-    /// SIGTERM→SIGKILL every terminal this manager still knows about. Synchronous
-    /// so it can run from [`super::connection::AcpConnection`]'s `Drop` — a
-    /// terminal the agent never called `terminal/release` on must not outlive
-    /// the ACP connection that created it. Killing the process group is enough:
-    /// each terminal's own `pump_output_and_wait` task reaps its child once the
+    /// Mark the manager closed (refusing further `terminal/create` calls) and
+    /// SIGTERM→SIGKILL every terminal it still tracks. Synchronous so it can
+    /// run from [`super::connection::AcpConnection`]'s `Drop` — a terminal the
+    /// agent never called `terminal/release` on must not outlive the ACP
+    /// connection that created it. Killing the process group is enough: each
+    /// terminal's own `pump_output_and_wait` task reaps its child once the
     /// signal lands, without this call needing to wait for that.
     pub fn shutdown(&self) {
-        let terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner());
-        for terminal in terminals.values() {
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        registry.closed = true;
+        for terminal in registry.terminals.values() {
             if let Some(pgid) = terminal.pgid {
                 kill_process_group(pgid);
             }
@@ -242,9 +263,10 @@ impl TerminalManager {
         let params: TerminalIdParams =
             serde_json::from_value(params.cloned().ok_or_else(|| anyhow!("missing params"))?)
                 .map_err(|e| anyhow!("invalid terminal params: {e}"))?;
-        self.terminals
+        self.registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .terminals
             .get(&params.terminal_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown terminalId {}", params.terminal_id))
@@ -399,6 +421,67 @@ mod tests {
         .expect("terminal did not exit after shutdown")
         .unwrap();
         assert!(exit["exitCode"].is_number() || exit["signal"].is_string());
+    }
+
+    #[tokio::test]
+    async fn create_after_shutdown_is_rejected() {
+        let manager = TerminalManager::new();
+        manager.shutdown();
+        let err = manager
+            .create(Some(&json!({
+                "sessionId": "s1",
+                "command": "sh",
+                "args": ["-c", "sleep 30"],
+            })))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("shutting down"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_and_shutdown_leaves_nothing_running() {
+        // Reproduces the race the council flagged: create() spawns a child and
+        // registers it under the same lock shutdown() takes, so every create
+        // racing a shutdown either gets killed (it registered first) or is
+        // rejected outright (shutdown ran first) — never spawns a process that
+        // shutdown() can miss.
+        let manager = Arc::new(TerminalManager::new());
+        let creates: Vec<_> = (0..20)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .create(Some(&json!({
+                            "sessionId": "s1",
+                            "command": "sh",
+                            "args": ["-c", "sleep 30"],
+                        })))
+                        .await
+                })
+            })
+            .collect();
+
+        manager.shutdown();
+
+        for handle in creates {
+            match handle.await.unwrap() {
+                Ok(created) => {
+                    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+                    let exit = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        manager.wait_for_exit(Some(&json!({"terminalId": terminal_id}))),
+                    )
+                    .await
+                    .expect("a terminal registered before shutdown escaped it")
+                    .unwrap();
+                    assert!(exit["exitCode"].is_number() || exit["signal"].is_string());
+                }
+                Err(_) => {
+                    // Rejected because shutdown had already closed the manager —
+                    // nothing was spawned for this one, so there's nothing to leak.
+                }
+            }
+        }
     }
 
     #[tokio::test]
