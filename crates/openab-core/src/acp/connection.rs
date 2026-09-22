@@ -341,6 +341,10 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
+    /// Dormant Part B scaffolding (https://agentclientprotocol.com/protocol/terminals):
+    /// tracks terminals created via the spec's `terminal/*` RPCs. No adapter this
+    /// gateway talks to today issues those RPCs (see `terminal.rs`).
+    pub terminal: Arc<super::terminal::TerminalManager>,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
@@ -384,12 +388,45 @@ fn build_agent_env(
 /// id-bearing messages to the active subscriber. The subscriber owns policy:
 /// legacy chat surfaces auto-approve permissions, while opted-in ACP clients
 /// can relay the request to their user before responding.
+///
+/// Only `spawn()`'s production path needs `terminal/*` dispatch, so it goes
+/// straight to [`run_reader_loop_with_state_and_terminal`]; this narrower
+/// signature remains for tests that don't exercise terminals.
+#[cfg(test)]
 pub(crate) async fn run_reader_loop_with_state<R>(
     reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: NotificationSender,
     idle_notify_tx: NotificationSender,
     execution: Option<Arc<SessionActivity>>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    run_reader_loop_with_state_and_terminal(
+        reader,
+        pending,
+        notify_tx,
+        idle_notify_tx,
+        execution,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Same as [`run_reader_loop_with_state`], additionally serving the dormant
+/// `terminal/*` RPC family (Part B: https://agentclientprotocol.com/protocol/terminals)
+/// directly off `stdin`/`terminal` when both are present. Split out so tests that
+/// don't care about terminals keep the simpler signature.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_reader_loop_with_state_and_terminal<R>(
+    reader: R,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    notify_tx: NotificationSender,
+    idle_notify_tx: NotificationSender,
+    execution: Option<Arc<SessionActivity>>,
+    stdin: Option<Arc<Mutex<ChildStdin>>>,
+    terminal: Option<Arc<super::terminal::TerminalManager>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -449,6 +486,30 @@ pub(crate) async fn run_reader_loop_with_state<R>(
             }
         }
 
+        // Dormant Part B scaffolding: an agent-initiated `terminal/*` request
+        // (https://agentclientprotocol.com/protocol/terminals). No adapter this
+        // gateway talks to today issues these (see terminal.rs), but if one
+        // does, answer it directly here instead of routing it through the
+        // chat-turn subscriber — terminal lifecycle is client-local process
+        // management, not something a turn's UI needs to see.
+        if let (Some(id), Some(method), Some(stdin), Some(terminal)) = (
+            msg.id,
+            msg.method.as_deref(),
+            stdin.clone(),
+            terminal.clone(),
+        ) {
+            if let Some(handler) = terminal_method_handler(method) {
+                tokio::spawn(handle_terminal_request(
+                    id,
+                    handler,
+                    msg.params.clone(),
+                    stdin,
+                    terminal,
+                ));
+                continue;
+            }
+        }
+
         // Notification → forward to the turn's subscriber, and fall back to the
         // session-scoped idle subscriber when that turn is gone.
         //
@@ -497,6 +558,165 @@ pub(crate) async fn run_reader_loop_with_state<R>(
     *idle_notify_tx.lock().await = None;
 }
 
+type TerminalHandler = for<'a> fn(
+    &'a super::terminal::TerminalManager,
+    Option<&'a Value>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>,
+>;
+
+/// Maps a `terminal/*` method name to its [`super::terminal::TerminalManager`] handler.
+fn terminal_method_handler(method: &str) -> Option<TerminalHandler> {
+    match method {
+        "terminal/create" => Some(|m, p| Box::pin(m.create(p))),
+        "terminal/output" => Some(|m, p| Box::pin(m.output(p))),
+        "terminal/wait_for_exit" => Some(|m, p| Box::pin(m.wait_for_exit(p))),
+        "terminal/kill" => Some(|m, p| Box::pin(m.kill(p))),
+        "terminal/release" => Some(|m, p| Box::pin(m.release(p))),
+        _ => None,
+    }
+}
+
+/// Run one `terminal/*` handler and write its JSON-RPC response back to the
+/// agent. Spawned per-request so a slow `terminal/wait_for_exit` never blocks
+/// the reader loop from processing the agent's other traffic.
+async fn handle_terminal_request(
+    id: u64,
+    handler: TerminalHandler,
+    params: Option<Value>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    terminal: Arc<super::terminal::TerminalManager>,
+) {
+    let response = match handler(&terminal, params.as_ref()).await {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(err) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": err.to_string()},
+        }),
+    };
+    if let Ok(data) = serde_json::to_string(&response) {
+        let _ = write_to_stdin(&stdin, &data).await;
+    }
+}
+
+/// Bounded raw write to an agent's stdin, mirroring [`AcpConnection::send_raw`].
+/// Standalone because the terminal RPC handlers run detached from an
+/// `AcpConnection` borrow (they own only an `Arc` clone of its stdin).
+async fn write_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, data: &str) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut w = stdin.lock().await;
+        w.write_all(data.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("stdin write timeout"))??;
+    Ok(())
+}
+
+/// Build a `Command` with the security baseline shared by every subprocess this
+/// crate spawns (the agent process itself and, for the dormant `terminal/*` RPC
+/// scaffolding, terminals the agent asks the client to create): its own process
+/// group for tree-wide kill, a cleared environment, and the minimal HOME/PATH/
+/// user vars a subprocess needs to function. Callers layer stdio and any
+/// additional env on top.
+pub(crate) fn baseline_command(
+    command: &str,
+    args: &[String],
+    working_dir: &str,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args).current_dir(working_dir);
+    // Create a new process group so we can kill the entire tree.
+    // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
+    // before exec. Return value checked — failure means the child won't
+    // have its own process group, so kill(-pgid) would be unsafe.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+    }
+    // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
+    // Only explicit values + essential baseline vars are passed through.
+    cmd.env_clear();
+    // Preserve the real HOME so agents/terminals can find OAuth/auth files
+    // (~/.codex, ~/.claude, ~/.config/gh, etc.). working_dir is already set via
+    // current_dir() above and is not necessarily the user's home directory.
+    cmd.env(
+        "HOME",
+        std::env::var("HOME").unwrap_or_else(|_| working_dir.into()),
+    );
+    cmd.env(
+        "PATH",
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+    );
+    #[cfg(unix)]
+    {
+        cmd.env(
+            "USER",
+            std::env::var("USER").unwrap_or_else(|_| "agent".into()),
+        );
+    }
+    #[cfg(windows)]
+    {
+        // Windows requires SystemRoot for DLL loading and basic OS functionality.
+        // USERPROFILE is the Windows equivalent of HOME.
+        cmd.env(
+            "USERPROFILE",
+            std::env::var("USERPROFILE").unwrap_or_else(|_| working_dir.into()),
+        );
+        cmd.env(
+            "USERNAME",
+            std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()),
+        );
+        if let Ok(v) = std::env::var("SystemRoot") {
+            cmd.env("SystemRoot", v);
+        }
+        if let Ok(v) = std::env::var("SystemDrive") {
+            cmd.env("SystemDrive", v);
+        }
+    }
+    cmd
+}
+
+/// SIGTERM → SIGKILL a process group. Shared by the agent connection's own
+/// teardown and the `terminal/kill` / `terminal/release` RPC handlers.
+/// Uses std::thread (not tokio::spawn) so SIGKILL fires even during
+/// runtime shutdown or panic unwinding.
+pub(crate) fn kill_process_group(pgid: i32) {
+    if pgid <= 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // Stage 1: SIGTERM the process group
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        // Stage 2: SIGKILL after brief grace (std::thread survives runtime shutdown)
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid; // suppress unused warning on Windows
+    }
+}
+
 impl AcpConnection {
     pub async fn spawn(
         command: &str,
@@ -507,69 +727,10 @@ impl AcpConnection {
     ) -> Result<Self> {
         info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
 
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(std::process::Stdio::piped())
+        let mut cmd = baseline_command(command, args, working_dir);
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .current_dir(working_dir);
-        // Create a new process group so we can kill the entire tree.
-        // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
-        // before exec. Return value checked — failure means the child won't
-        // have its own process group, so kill(-pgid) would be unsafe.
-        #[cfg(unix)]
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        #[cfg(windows)]
-        {
-            cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
-        }
-        // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
-        // Only [agent].env values + essential baseline vars are passed through.
-        cmd.env_clear();
-        // Preserve the real HOME so agents can find OAuth/auth files (~/.codex,
-        // ~/.claude, ~/.config/gh, etc.). working_dir is already set via
-        // current_dir() above and is not necessarily the user's home directory.
-        cmd.env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| working_dir.into()),
-        );
-        cmd.env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
-        );
-        #[cfg(unix)]
-        {
-            cmd.env(
-                "USER",
-                std::env::var("USER").unwrap_or_else(|_| "agent".into()),
-            );
-        }
-        #[cfg(windows)]
-        {
-            // Windows requires SystemRoot for DLL loading and basic OS functionality.
-            // USERPROFILE is the Windows equivalent of HOME.
-            cmd.env(
-                "USERPROFILE",
-                std::env::var("USERPROFILE").unwrap_or_else(|_| working_dir.into()),
-            );
-            cmd.env(
-                "USERNAME",
-                std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()),
-            );
-            if let Ok(v) = std::env::var("SystemRoot") {
-                cmd.env("SystemRoot", v);
-            }
-            if let Ok(v) = std::env::var("SystemDrive") {
-                cmd.env("SystemDrive", v);
-            }
-        }
+            .stderr(std::process::Stdio::piped());
         for (k, v) in env {
             cmd.env(k, expand_env(v));
         }
@@ -636,12 +797,15 @@ impl AcpConnection {
             Arc::new(Mutex::new(None));
 
         let activity = Arc::new(SessionActivity::new());
-        let reader_handle = tokio::spawn(run_reader_loop_with_state(
+        let terminal = Arc::new(super::terminal::TerminalManager::new());
+        let reader_handle = tokio::spawn(run_reader_loop_with_state_and_terminal(
             stdout,
             pending.clone(),
             notify_tx.clone(),
             idle_notify_tx.clone(),
             Some(activity.clone()),
+            Some(stdin.clone()),
+            Some(terminal.clone()),
         ));
 
         Ok(Self {
@@ -660,6 +824,7 @@ impl AcpConnection {
             last_active: Instant::now(),
             activity,
             session_reset: false,
+            terminal,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
@@ -748,13 +913,22 @@ impl AcpConnection {
                 Some(json!({
                     "protocolVersion": 1,
                     "clientCapabilities": {
+                        // Spec capability (agentclientprotocol.com/protocol/terminals).
+                        // Neither adapter this gateway runs against today reads it; see
+                        // `terminal_output` below, which is what they actually gate on.
+                        "terminal": true,
                         "_meta": {
                             "jetbrains": {
                                 "air": {
                                     "version": 1,
                                     "capabilities": ["asyncTasks"]
                                 }
-                            }
+                            },
+                            // Zed's own client-capability convention (claude-agent-acp is
+                            // published from zed-industries/claude-code-acp), not part of the
+                            // ACP spec. claude-agent-acp 0.74.0 and codex-acp 1.1.4 both gate
+                            // terminal behavior on this instead of `terminal` above.
+                            "terminal_output": true
                         }
                     },
                     "clientInfo": {"name": "openab", "version": "0.1.0"},
@@ -1104,30 +1278,9 @@ impl AcpConnection {
     }
 
     /// Kill the entire process group: SIGTERM → SIGKILL.
-    /// Uses std::thread (not tokio::spawn) so SIGKILL fires even during
-    /// runtime shutdown or panic unwinding.
     fn kill_process_group(&mut self) {
-        let pgid = match self.child_pgid {
-            Some(pid) if pid > 0 => pid,
-            _ => return,
-        };
-        #[cfg(unix)]
-        {
-            // Stage 1: SIGTERM the process group
-            unsafe {
-                libc::kill(-pgid, libc::SIGTERM);
-            }
-            // Stage 2: SIGKILL after brief grace (std::thread survives runtime shutdown)
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            });
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pgid; // suppress unused warning on Windows
+        if let Some(pgid) = self.child_pgid {
+            kill_process_group(pgid);
         }
     }
 }

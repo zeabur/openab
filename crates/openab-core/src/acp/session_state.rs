@@ -2,6 +2,85 @@
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
+/// Part A of the shells-panel work: neither agent adapter this gateway talks to
+/// (claude-agent-acp 0.74.0, codex-acp 1.1.4) calls the ACP spec's `terminal/*`
+/// RPCs. Both instead report terminal activity inline on ordinary
+/// `tool_call`/`tool_call_update` notifications — a `ToolCallContent::Terminal`
+/// content item (`{"type":"terminal","terminalId":...}`) plus live output/exit
+/// bundled onto the notification's own `_meta` (`terminal_info`,
+/// `terminal_output`, `terminal_output_delta`, `terminal_exit`) — a convention
+/// originated by Zed (`_meta.terminal_output` at `initialize`; see
+/// `connection.rs`), not the spec's `terminal/*` RPC family. This extracts that
+/// into the tool's tracked state so it survives the ACP passthrough forwarding
+/// (`ChatAdapter::forward_agent_update`) into the same `runtime_state` snapshot
+/// the client already reads (`AppState::acp_session_snapshot`).
+fn terminal_id_from_content(update: &Value) -> Option<&str> {
+    update
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                (item.get("type").and_then(Value::as_str) == Some("terminal"))
+                    .then(|| item.get("terminalId").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+}
+
+fn apply_terminal_fields(tool: &mut Value, update: &Value) {
+    // The initial `tool_call` carries the terminal id via `ToolCallContent::Terminal`
+    // (or `_meta.terminal_info.terminalId`); later `tool_call_update`s for the same
+    // call only carry incremental `_meta` fields (delta/exit) and must be matched
+    // against the id already recorded on this tool.
+    let terminal_id = terminal_id_from_content(update)
+        .or_else(|| {
+            update
+                .pointer("/_meta/terminal_info/terminalId")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .or_else(|| tool["terminal"]["terminalId"].as_str().map(str::to_owned));
+    let Some(terminal_id) = terminal_id else {
+        return;
+    };
+    if tool["terminal"].as_object().is_none() {
+        tool["terminal"] = json!({});
+    }
+    let terminal = tool["terminal"].as_object_mut().unwrap();
+    terminal.insert("terminalId".into(), json!(terminal_id));
+    if let Some(command) = update
+        .pointer("/_meta/terminal_info/command")
+        .and_then(Value::as_str)
+        .or_else(|| update["title"].as_str())
+    {
+        terminal.insert("command".into(), json!(command));
+    }
+    if let Some(output) = update
+        .pointer("/_meta/terminal_output")
+        .and_then(Value::as_str)
+    {
+        terminal.insert("output".into(), json!(output));
+    }
+    if let Some(delta) = update
+        .pointer("/_meta/terminal_output_delta")
+        .and_then(Value::as_str)
+    {
+        let mut appended = terminal
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        appended.push_str(delta);
+        terminal.insert("output".into(), json!(appended));
+    }
+    if let Some(exit) = update.pointer("/_meta/terminal_exit") {
+        terminal.insert("exit".into(), exit.clone());
+        terminal.insert("status".into(), json!("exited"));
+    } else if !terminal.contains_key("status") {
+        terminal.insert("status".into(), json!("running"));
+    }
+}
+
 pub struct SessionState(Mutex<Value>);
 
 impl Default for SessionState {
@@ -206,6 +285,7 @@ impl SessionState {
                                         tool[field] = json!(value);
                                     }
                                 }
+                                apply_terminal_fields(tool, update);
                             }
                         }
                     }
@@ -327,5 +407,47 @@ mod tests {
         state.observe_and_stamp(Some(&mut done));
         assert!(done["update"]["_meta"]["dev.openab/taskToken"].is_null());
         assert_eq!(done["update"]["_meta"]["dev.openab/backgroundTool"], false);
+    }
+
+    #[test]
+    fn zed_terminal_meta_is_tracked_on_the_tool_call() {
+        let state = SessionState::default();
+        state.observe(Some(&json!({"update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "ls -la",
+            "status": "in_progress",
+            "content": [{"type": "terminal", "terminalId": "term-1"}],
+            "_meta": {"terminal_output": "line one\n"}
+        }})));
+        let snapshot = state.snapshot();
+        let terminal = &snapshot["tools"]["t1"]["terminal"];
+        assert_eq!(terminal["terminalId"], "term-1");
+        assert_eq!(terminal["command"], "ls -la");
+        assert_eq!(terminal["output"], "line one\n");
+        assert_eq!(terminal["status"], "running");
+
+        state.observe(Some(&json!({"update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "in_progress",
+            "_meta": {"terminal_output_delta": "line two\n"}
+        }})));
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot["tools"]["t1"]["terminal"]["output"],
+            "line one\nline two\n"
+        );
+
+        state.observe(Some(&json!({"update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "in_progress",
+            "_meta": {"terminal_exit": {"exitCode": 0}}
+        }})));
+        let snapshot = state.snapshot();
+        let terminal = &snapshot["tools"]["t1"]["terminal"];
+        assert_eq!(terminal["status"], "exited");
+        assert_eq!(terminal["exit"]["exitCode"], 0);
     }
 }
