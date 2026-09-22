@@ -86,9 +86,14 @@ struct Terminal {
 /// Tracks every terminal the agent has created for a session via `terminal/create`,
 /// through `terminal/output` / `terminal/wait_for_exit` / `terminal/kill` /
 /// `terminal/release`. One instance per [`super::connection::AcpConnection`].
+///
+/// `terminals` is a `std::sync::Mutex`, not a `tokio` one: every critical
+/// section below is lock-then-immediately-release with no `.await` in
+/// between, and a plain sync mutex is what lets [`TerminalManager::shutdown`]
+/// run from `Drop`, which cannot `.await`.
 #[derive(Default)]
 pub struct TerminalManager {
-    terminals: Mutex<HashMap<String, Arc<Terminal>>>,
+    terminals: std::sync::Mutex<HashMap<String, Arc<Terminal>>>,
 }
 
 /// Append `chunk` to `buf`, then truncate from the front to `limit` bytes at a
@@ -158,7 +163,7 @@ impl TerminalManager {
         let terminal_id = uuid::Uuid::new_v4().to_string();
         self.terminals
             .lock()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .insert(terminal_id.clone(), terminal.clone());
 
         tokio::spawn(pump_output_and_wait(terminal, stdout, stderr));
@@ -207,7 +212,7 @@ impl TerminalManager {
         let terminal = self
             .terminals
             .lock()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&params.terminal_id)
             .ok_or_else(|| anyhow!("unknown terminalId {}", params.terminal_id))?;
         if terminal.exit.lock().await.is_none() {
@@ -218,13 +223,28 @@ impl TerminalManager {
         Ok(json!({}))
     }
 
+    /// SIGTERM→SIGKILL every terminal this manager still knows about. Synchronous
+    /// so it can run from [`super::connection::AcpConnection`]'s `Drop` — a
+    /// terminal the agent never called `terminal/release` on must not outlive
+    /// the ACP connection that created it. Killing the process group is enough:
+    /// each terminal's own `pump_output_and_wait` task reaps its child once the
+    /// signal lands, without this call needing to wait for that.
+    pub fn shutdown(&self) {
+        let terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner());
+        for terminal in terminals.values() {
+            if let Some(pgid) = terminal.pgid {
+                kill_process_group(pgid);
+            }
+        }
+    }
+
     async fn get(&self, params: Option<&Value>) -> Result<Arc<Terminal>> {
         let params: TerminalIdParams =
             serde_json::from_value(params.cloned().ok_or_else(|| anyhow!("missing params"))?)
                 .map_err(|e| anyhow!("invalid terminal params: {e}"))?;
         self.terminals
             .lock()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .get(&params.terminal_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown terminalId {}", params.terminal_id))
@@ -353,6 +373,32 @@ mod tests {
         assert!(truncated.load(Ordering::Relaxed));
         assert_eq!(buf.len(), 4);
         assert_eq!(&buf, b"6789");
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_every_tracked_terminal_without_release() {
+        let manager = TerminalManager::new();
+        let created = manager
+            .create(Some(&json!({
+                "sessionId": "s1",
+                "command": "sh",
+                "args": ["-c", "sleep 30"],
+            })))
+            .await
+            .unwrap();
+        let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+        // Simulates the owning AcpConnection dropping without a `terminal/release`.
+        manager.shutdown();
+
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.wait_for_exit(Some(&json!({"terminalId": terminal_id}))),
+        )
+        .await
+        .expect("terminal did not exit after shutdown")
+        .unwrap();
+        assert!(exit["exitCode"].is_number() || exit["signal"].is_string());
     }
 
     #[tokio::test]

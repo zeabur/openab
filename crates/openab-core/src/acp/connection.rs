@@ -1322,6 +1322,9 @@ impl Drop for AcpConnection {
             handle.abort();
         }
         self.kill_process_group();
+        // Terminals are tracked independently of the agent process; a terminal
+        // the agent never `terminal/release`d must not outlive this connection.
+        self.terminal.shutdown();
     }
 }
 
