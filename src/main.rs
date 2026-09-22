@@ -1440,6 +1440,13 @@ async fn main() -> anyhow::Result<()> {
                 .route("/health", axum::routing::get(|| async { "ok" }))
                 .route("/statusz", axum::routing::get(statusz));
 
+            // Tracks whether /acp actually gets mounted below, so the status page's
+            // "ACP: enabled/disabled" line matches reality rather than just the env flag.
+            #[cfg(feature = "acp")]
+            let mut unified_acp_mounted = false;
+            #[cfg(not(feature = "acp"))]
+            let unified_acp_mounted = false;
+
             #[cfg(feature = "telegram")]
             if gw_state.telegram_bot_token.is_some() {
                 let path = telegram_webhook_path.clone().unwrap_or_else(|| {
@@ -1580,10 +1587,18 @@ async fn main() -> anyhow::Result<()> {
                             "/acp",
                             axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
                         );
+                        unified_acp_mounted = true;
                     }
                     Err(e) => error!("unified: ACP endpoint NOT mounted: {e}"),
                 }
             }
+
+            // Unauthenticated status page — reports liveness and non-secret build
+            // facts only, so it is safe to open at the base URL with no credential.
+            app = app.route(
+                "/",
+                axum::routing::get(move || openab_gateway::status_page(unified_acp_mounted)),
+            );
 
             #[cfg(feature = "lineworks")]
             if let Some(ref lw) = gw_state.lineworks {
