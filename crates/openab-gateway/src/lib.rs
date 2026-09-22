@@ -808,6 +808,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     // ACP Server adapter. Fail-open (no transport key) is only allowed on a loopback
     // bind; a non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
     #[cfg(feature = "acp")]
+    let mut acp_mounted = false;
+    #[cfg(feature = "acp")]
     if std::env::var("OPENAB_ACP_ENABLED")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false)
@@ -817,10 +819,17 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             Ok(()) => {
                 info!("ACP server endpoint enabled at /acp");
                 app = app.route("/acp", get(adapters::acp_server::ws_upgrade));
+                acp_mounted = true;
             }
             Err(e) => tracing::error!("ACP endpoint NOT mounted: {e}"),
         }
     }
+    #[cfg(not(feature = "acp"))]
+    let acp_mounted = false;
+
+    // Unauthenticated status page. Safe to expose with zero auth: it reports
+    // liveness and non-secret build facts only, never a key or credential.
+    app = app.route("/", get(move || status_page(acp_mounted)));
 
     // Telegram adapter
     #[cfg(feature = "telegram")]
@@ -1353,6 +1362,93 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Unauthenticated `GET /` status page. Reports only non-secret facts — liveness,
+/// runtime label, image version, whether ACP is mounted — never a key, token or
+/// credential, so it is safe for anyone who has the base URL to load in a browser.
+///
+/// Also mounted directly by the unified `openab run` router in `src/main.rs`.
+pub async fn status_page(acp_enabled: bool) -> axum::response::Html<String> {
+    let mut rows = String::new();
+    if let Ok(label) = std::env::var("OPENAB_RUNTIME_LABEL") {
+        if !label.is_empty() {
+            rows.push_str(&format!("<dt>Runtime</dt><dd>{}</dd>", html_escape(&label)));
+        }
+    }
+    if let Ok(version) = std::env::var("OPENAB_RUNTIME_VERSION") {
+        if !version.is_empty() {
+            rows.push_str(&format!(
+                "<dt>Version</dt><dd>{}</dd>",
+                html_escape(&version)
+            ));
+        }
+    }
+    rows.push_str(&format!(
+        "<dt>ACP</dt><dd>{}</dd>",
+        if acp_enabled { "enabled" } else { "disabled" }
+    ));
+
+    axum::response::Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nuphos runtime</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fafafa; color: #1a1a1a; margin: 0; padding: 48px 20px; }}
+  .card {{ max-width: 520px; margin: 0 auto; background: #fff; border: 1px solid #e5e5e5; border-radius: 12px; padding: 28px 32px; }}
+  h1 {{ font-size: 19px; margin: 0 0 6px; }}
+  .status {{ color: #16794a; font-weight: 600; font-size: 14px; }}
+  dl {{ display: grid; grid-template-columns: auto 1fr; gap: 6px 18px; margin: 20px 0 0; font-size: 14px; }}
+  dt {{ color: #6b6b6b; }}
+  dd {{ margin: 0; }}
+  .hint {{ margin-top: 22px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; line-height: 1.5; color: #444; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Nuphos runtime</h1>
+    <p class="status">&#9679; Nuphos runtime is running</p>
+    <dl>{rows}</dl>
+    <p class="hint">Paste this runtime's address into Nuphos &rarr; Settings &rarr; Agent &rarr; Connect your own, along with the admin password you started it with.</p>
+  </div>
+</body>
+</html>
+"#
+    ))
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod status_page_tests {
+    use super::{html_escape, status_page};
+
+    #[test]
+    fn escapes_html_special_characters() {
+        assert_eq!(
+            html_escape("<script>&\"x\"</script>"),
+            "&lt;script&gt;&amp;&quot;x&quot;&lt;/script&gt;"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_liveness_and_acp_state() {
+        let axum::response::Html(page) = status_page(true).await;
+        assert!(page.contains("Nuphos runtime is running"));
+        assert!(page.contains("<dt>ACP</dt><dd>enabled</dd>"));
+
+        let axum::response::Html(page) = status_page(false).await;
+        assert!(page.contains("<dt>ACP</dt><dd>disabled</dd>"));
+    }
 }
 
 #[cfg(test)]

@@ -970,6 +970,17 @@ are read at startup; the methods they enable require `OPENAB_ACP_CONTROL_KEY` (s
 | `OPENAB_RUNTIME_LOGIN_COMMAND` | _(empty)_ | Whitespace-separated argv (no shell) that `_openab/runtime/login` runs. It should print NDJSON objects on stdout; each is relayed to the operator as an `_openab/runtime/login/frame` notification and is never logged. Unset → the method reports that this runtime has no sign-in. |
 | `OPENAB_RUNTIME_AUTH_FILE` | _(empty)_ | Path to the credential the provider CLI reads. A non-empty file there makes `_openab/runtime/state` report `authenticated: true`. Unset → `authenticated` is `null`, meaning OpenAB cannot tell — not that the runtime is signed out. |
 
+### Status page
+
+`GET /` serves a small unauthenticated HTML page confirming the process is up. It
+reports only non-secret facts — never a key, token or credential — so it is safe to
+open at the base URL with no password.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAB_RUNTIME_LABEL` | _(empty)_ | Free-form display label for the status page, e.g. `Claude Code` or `Codex`. Unset → the "Runtime" row is omitted. |
+| `OPENAB_RUNTIME_VERSION` | _(empty)_ | Display version for the status page, e.g. an image's release tag. Unset → the "Version" row is omitted. |
+
 ### Platform Adapters
 
 Each platform is auto-enabled when its env vars are present:
