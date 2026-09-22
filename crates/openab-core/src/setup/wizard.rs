@@ -418,10 +418,12 @@ fn section_pool() -> (usize, u64) {
     cprintln!(C.bold, "--- Step 4: Session Pool ---");
     println!();
 
-    let max_sessions: usize = prompt_default("  Max sessions", "10").parse().unwrap_or(10);
-    let ttl_hours: u64 = prompt_default("  Session TTL (hours)", "720")
+    let max_sessions: usize = prompt_default("  Max sessions", "100000")
         .parse()
-        .unwrap_or(720);
+        .unwrap_or(100_000);
+    let ttl_hours: u64 = prompt_default("  Session TTL (hours)", "4")
+        .parse()
+        .unwrap_or(4);
 
     cprintln!(
         C.green,
@@ -481,8 +483,8 @@ fn print_noninteractive_guide() {
         "  working_dir = \"/home/agent\"",
         "",
         "  [pool]",
-        "  max_sessions = 10",
-        "  session_ttl_hours = 720",
+        "  max_sessions = 100000",
+        "  session_ttl_hours = 4",
         "",
         "  [reactions]",
         "  enabled = true",
