@@ -2,6 +2,12 @@
 use super::*;
 use std::collections::BTreeSet;
 
+/// Bound on the whole internal continuation call (`handle_session_prompt` + response
+/// forwarding), strictly below the pool's hung-session watchdog
+/// (`prompt_hard_timeout_secs` 1800s + `hung_grace_secs` 120s) so this loop owns
+/// reporting the failure instead of silently hanging until that backstop fires.
+const CONTINUATION_TIMEOUT_SECS: u64 = 600;
+
 #[derive(Default)]
 pub struct SessionAutomation(std::sync::Mutex<HashMap<String, Automation>>);
 #[derive(Default)]
@@ -339,20 +345,26 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
             json!({"error":{"message":"Continuation transport closed"}})
         };
         let cancel = Arc::new(tokio::sync::Notify::new());
-        let (_, response) = tokio::join!(
-            handle_session_prompt(
-                &state,
-                &sessions,
-                internal_id,
-                Some(&params),
-                &tx,
-                session_id,
-                cancel,
-                &owner,
-                connection_generation
-            ),
-            forward
-        );
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
+            async {
+                tokio::join!(
+                    handle_session_prompt(
+                        &state,
+                        &sessions,
+                        internal_id,
+                        Some(&params),
+                        &tx,
+                        session_id,
+                        cancel,
+                        &owner,
+                        connection_generation
+                    ),
+                    forward
+                )
+            },
+        )
+        .await;
         // The prompt installed its forwarding channel as the idle sink. Restore the
         // live connection output before dropping it; never overwrite a successor.
         if let Some(registry) = &state.acp_reply_registry {
@@ -375,6 +387,18 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
             return;
         };
         entry.running = false;
+        let Ok((_, response)) = outcome else {
+            // No progress within CONTINUATION_TIMEOUT_SECS; surface a real failure instead
+            // of leaving the UI on "resuming" until the pool's own hung-session watchdog
+            // eventually force-recovers it. Retry on the next tick.
+            warn!(
+                channel = %channel,
+                timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                "background continuation timed out waiting for the runtime"
+            );
+            entry.error = Some("Continuation timed out waiting for the runtime".into());
+            continue;
+        };
         if matches!(
             response["error"]["message"].as_str(),
             Some("ACP session output sink is unavailable" | "Runtime session is busy")
