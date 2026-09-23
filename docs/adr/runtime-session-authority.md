@@ -88,6 +88,30 @@ same credential file and the loser would silently win; a second request is refus
 it, kill the command's whole process group — a provider CLI launches children that hold
 the pipes open, so signalling only the parent leaves the sign-in running.
 
+`_openab/runtime/job` runs one of the jobs the image lists in `OPENAB_RUNTIME_JOBS`,
+under the same `-32003` operator boundary. The caller names a job and never sends argv:
+
+```jsonc
+// request params
+{"jobId": "…", "job": "cost-panel", "stdin": "…", "env": {"K": "V"},
+ "timeoutMs": 60000, "maxStdoutBytes": 262144}
+// result
+{"exitCode": 0, "stdout": "…", "truncated": false, "timedOut": false}
+```
+
+The child starts with an empty environment plus `PATH`, `HOME`, `TMPDIR` (a fresh
+`0700` directory that is also its cwd and is removed afterwards) and the request's `env`,
+which may not set those three, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `SHELLOPTS` or any
+`LD_*`/`DYLD_*` variable.
+It runs in its own process group, and the whole group is killed on timeout, on
+`_openab/runtime/job/cancel {jobId}`, when the connection that started it closes, and
+once stdout exceeds `maxStdoutBytes` (`truncated: true`). `exitCode` is `-1` when the
+job ended by signal. stderr is discarded, and nothing a job receives or prints is logged.
+`timeoutMs` and `maxStdoutBytes` are clamped to the runtime's own maxima. Errors: `-32005`
+when `OPENAB_RUNTIME_JOB_CONCURRENCY` jobs already run, `-32007` for a job not in the
+list, `-32006` when the job cannot start or is cancelled, `-32602` for invalid params or a
+`jobId` that is already running.
+
 `_openab/runtime/state` gains `authenticated`. It is `true`/`false` when
 `OPENAB_RUNTIME_AUTH_FILE` names the credential the provider CLI reads, and `null` when
 it does not: an operator who cannot answer the question must not be told "signed out",

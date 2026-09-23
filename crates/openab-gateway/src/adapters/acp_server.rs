@@ -20,6 +20,10 @@ pub use automation::{observe_runtime_reply, SessionAutomation};
 mod runtime_login;
 pub use runtime_login::LoginCommand;
 
+#[path = "runtime_job.rs"]
+mod runtime_job;
+pub use runtime_job::RuntimeJobs;
+
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -226,6 +230,9 @@ pub struct AcpConfig {
     /// (`OPENAB_RUNTIME_AUTH_FILE`). Unset → `_openab/runtime/state` reports
     /// `authenticated: null`, which is "OpenAB cannot tell", not "signed out".
     pub auth_file: Option<String>,
+    /// Allowlisted commands `_openab/runtime/job` may run (`OPENAB_RUNTIME_JOBS`) and the
+    /// limits that bound them.
+    pub runtime_jobs: RuntimeJobs,
 }
 
 impl AcpConfig {
@@ -283,6 +290,7 @@ impl AcpConfig {
             allowed_origins,
             login_command,
             auth_file,
+            runtime_jobs: RuntimeJobs::from_env(),
         })
     }
 }
@@ -1972,6 +1980,8 @@ async fn handle_acp_connection(
                     | "_openab/runtime/state"
                     | "_openab/runtime/login"
                     | "_openab/runtime/login/cancel"
+                    | "_openab/runtime/job"
+                    | "_openab/runtime/job/cancel"
                     | "_openab/session/requests"
             )
         {
@@ -1996,6 +2006,10 @@ async fn handle_acp_connection(
                         result["agentCapabilities"]["_meta"]["dev.openab/sessionAuthority"] =
                             json!(2);
                     }
+                }
+                if let (Some(result), Some(acp)) = (resp.result.as_mut(), state.acp.as_ref()) {
+                    result["agentCapabilities"]["_meta"]["dev.openab/runtimeJobs"] =
+                        json!(acp.runtime_jobs.names());
                 }
                 // Only mark the connection initialized when negotiation succeeded.
                 let negotiated_ok = resp.error.is_none();
@@ -2382,6 +2396,51 @@ async fn handle_acp_connection(
                     let _ = out_tx.send(serde_json::to_string(&response).unwrap());
                 }));
             }
+            "_openab/runtime/job" | "_openab/runtime/job/cancel" => {
+                if !runtime_control {
+                    let response =
+                        JsonRpcResponse::error(id, -32003, "Runtime operator credential required");
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if !initialized {
+                    let response = JsonRpcResponse::error(id, -32002, "Not initialized");
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if req.method.ends_with("/cancel") {
+                    let job_id = req.params.as_ref().and_then(|p| p["jobId"].as_str());
+                    let response = match job_id {
+                        Some(job_id) => JsonRpcResponse::success(
+                            id,
+                            json!({"cancelled": runtime_job::cancel(job_id)}),
+                        ),
+                        None => JsonRpcResponse::error(id, -32602, "Invalid jobId"),
+                    };
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                let Some(jobs) = state.acp.as_ref().map(|c| c.runtime_jobs.clone()) else {
+                    continue;
+                };
+                let request = match runtime_job::parse_request(req.params.as_ref(), &jobs) {
+                    Ok(request) => request,
+                    Err(message) => {
+                        let response = JsonRpcResponse::error(id, -32602, message);
+                        let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                let out_tx = out_tx.clone();
+                let connection_id = connection_id.clone();
+                prompt_tasks.push(tokio::spawn(async move {
+                    let response = match runtime_job::run(&jobs, request, &connection_id).await {
+                        Ok(result) => JsonRpcResponse::success(id, result),
+                        Err((code, message)) => JsonRpcResponse::error(id, code, message),
+                    };
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                }));
+            }
             "_openab/session/requests" => {
                 let response = if !runtime_control {
                     JsonRpcResponse::error(id, -32003, "Runtime operator credential required")
@@ -2739,6 +2798,7 @@ async fn handle_acp_connection(
     // A device sign-in this connection started has nobody left to answer its prompt.
     // The Kubernetes exec channel it replaces died with its request; match that.
     runtime_login::cancel_for_connection(&connection_id);
+    runtime_job::cancel_for_connection(&connection_id);
 
     // --- Disconnect cleanup ---
     // Announce the close BEFORE anything is torn down. An establish that is past its last await
@@ -7227,6 +7287,7 @@ mod acp_ws_integration {
             allowed_origins: vec![],
             login_command: None,
             auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
         });
         let reply_registry = new_reply_registry();
         state.acp_reply_registry = Some(reply_registry.clone());
@@ -7254,6 +7315,7 @@ mod acp_ws_integration {
             allowed_origins: vec![],
             login_command: None,
             auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"state":"active","steeringSupported":true}) })
@@ -7322,6 +7384,7 @@ mod acp_ws_integration {
             allowed_origins: vec![],
             login_command: None,
             auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
         });
         let registry = new_reply_registry();
         state.acp_reply_registry = Some(registry.clone());
@@ -7376,6 +7439,7 @@ mod acp_ws_integration {
             allowed_origins: vec![],
             login_command: None,
             auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"epoch":"provider","state":"active","operation":"prompt"}) })
@@ -7448,6 +7512,7 @@ mod acp_ws_integration {
                 ],
             }),
             auth_file: Some(credential.display().to_string()),
+            runtime_jobs: RuntimeJobs::default(),
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let suspends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7539,6 +7604,7 @@ mod acp_ws_integration {
                 ],
             }),
             auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let app = axum::Router::new()
@@ -7602,6 +7668,133 @@ mod acp_ws_integration {
                 break;
             }
         }
+    }
+
+    async fn serve_runtime_jobs(jobs: RuntimeJobs) -> std::net::SocketAddr {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(events);
+        state.acp = Some(AcpConfig {
+            auth_key: Some("ordinary-fixture".into()),
+            control_key: Some("operator-fixture-key-that-is-long-enough".into()),
+            allowed_origins: vec![],
+            login_command: None,
+            auth_file: None,
+            runtime_jobs: jobs,
+        });
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        address
+    }
+
+    async fn open_with_key(address: std::net::SocketAddr, key: &str) -> (Ws, Value) {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{address}/acp").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {key}").parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+        )
+        .await;
+        let initialized = recv(&mut ws).await;
+        (ws, initialized)
+    }
+
+    fn sh_job(script: &str) -> LoginCommand {
+        LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_operator_credential_runs_an_advertised_runtime_job() {
+        let _serialized = runtime_job::TEST_GUARD.lock().await;
+        let address = serve_runtime_jobs(
+            RuntimeJobs::default().with_job("echo", sh_job("cat; printf \" $NUPHOS_TOKEN\"")),
+        )
+        .await;
+        let job = json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/job","params":{
+            "jobId":"ws-1","job":"echo","stdin":"hello","env":{"NUPHOS_TOKEN":"t0k"},
+            "timeoutMs":10_000,"maxStdoutBytes":1024
+        }});
+
+        let (mut ordinary, initialized) = open_with_key(address, "ordinary-fixture").await;
+        assert_eq!(
+            initialized["result"]["agentCapabilities"]["_meta"]["dev.openab/runtimeJobs"],
+            json!(["echo"])
+        );
+        send(&mut ordinary, job.clone()).await;
+        assert_eq!(recv(&mut ordinary).await["error"]["code"], -32003);
+
+        let (mut operator, _) =
+            open_with_key(address, "operator-fixture-key-that-is-long-enough").await;
+        send(&mut operator, job).await;
+        let done = recv(&mut operator).await;
+        assert_eq!(
+            done["result"],
+            json!({"exitCode":0,"stdout":"hello t0k","truncated":false,"timedOut":false}),
+            "{done}"
+        );
+
+        send(
+            &mut operator,
+            json!({"jsonrpc":"2.0","id":3,"method":"_openab/runtime/job","params":{"jobId":"ws-2","job":"cost-panel"}}),
+        )
+        .await;
+        let unknown = recv(&mut operator).await;
+        assert_eq!(
+            unknown["error"]["code"],
+            runtime_job::JOB_UNKNOWN,
+            "{unknown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_kills_its_runtime_jobs() {
+        let _serialized = runtime_job::TEST_GUARD.lock().await;
+        let marker = std::env::temp_dir().join(format!("openab-ws-job-{}", Uuid::new_v4()));
+        let address = serve_runtime_jobs(RuntimeJobs::default().with_job(
+            "slow",
+            sh_job(&format!("sleep 60 & echo $! > {}; wait", marker.display())),
+        ))
+        .await;
+        let (mut operator, _) =
+            open_with_key(address, "operator-fixture-key-that-is-long-enough").await;
+        send(
+            &mut operator,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/job","params":{"jobId":"ws-slow","job":"slow"}}),
+        )
+        .await;
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        drop(operator);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: signal 0 only checks whether the pid exists.
+        while unsafe { libc::kill(pid, 0) } == 0 || runtime_job::running_count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job outlived its connection"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_file(marker);
     }
 
     async fn serve() -> (String, AcpTunnelRegistry) {

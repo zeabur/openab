@@ -152,7 +152,7 @@ pub fn cancel_for_connection(connection: &str) {
 
 /// The provider CLI launches its own children (a browser opener, a native helper) and
 /// they keep the pipes open, so only the whole group going away ends the sign-in.
-fn kill_group(pgid: Option<i32>) {
+pub(super) fn kill_group(pgid: Option<i32>) {
     #[cfg(unix)]
     if let Some(pgid) = pgid {
         // SAFETY: `kill` on a process-group id we created ourselves; an already-exited
