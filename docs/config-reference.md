@@ -969,6 +969,10 @@ are read at startup; the methods they enable require `OPENAB_ACP_CONTROL_KEY` (s
 |----------|---------|-------------|
 | `OPENAB_RUNTIME_LOGIN_COMMAND` | _(empty)_ | Whitespace-separated argv (no shell) that `_openab/runtime/login` runs. It should print NDJSON objects on stdout; each is relayed to the operator as an `_openab/runtime/login/frame` notification and is never logged. Unset → the method reports that this runtime has no sign-in. |
 | `OPENAB_RUNTIME_AUTH_FILE` | _(empty)_ | Path to the credential the provider CLI reads. A non-empty file there makes `_openab/runtime/state` report `authenticated: true`. Unset → `authenticated` is `null`, meaning OpenAB cannot tell — not that the runtime is signed out. |
+| `OPENAB_RUNTIME_JOBS` | _(empty)_ | Jobs `_openab/runtime/job` may run, as `name=argv` entries separated by `;` or newlines, e.g. `cost-panel=node /opt/job.mjs`. argv is whitespace-separated (no shell); names are `[A-Za-z0-9._-]{1,64}`. The names are advertised as `agentCapabilities._meta["dev.openab/runtimeJobs"]` in `initialize`. |
+| `OPENAB_RUNTIME_JOB_MAX_TIMEOUT_MS` | `120000` | Ceiling for a job's `timeoutMs`; also the default when a request omits it. |
+| `OPENAB_RUNTIME_JOB_MAX_STDOUT_BYTES` | `1048576` | Ceiling for a job's `maxStdoutBytes`; also the default when a request omits it. |
+| `OPENAB_RUNTIME_JOB_CONCURRENCY` | `4` | Jobs that may run at once in this runtime; one more is refused with `-32005`. |
 
 ### Status page
 
