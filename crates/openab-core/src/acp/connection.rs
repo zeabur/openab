@@ -301,6 +301,26 @@ impl SessionActivity {
     pub(crate) fn set_last_active_ms(&self, ms: u64) {
         self.last_active_ms.store(ms, Ordering::Release);
     }
+
+    /// Collapse the phase-timing accessors above into one "what is this session
+    /// doing, and for how long" summary, for diagnosing a stalled session without
+    /// grepping logs. Precedence when more than one could apply: an open
+    /// permission wait explains a silent turn best, so it wins over
+    /// `prompt_in_flight`/`agent_relay`, which in turn win over `idle`.
+    pub fn wait_phase(&self) -> Value {
+        let (phase, elapsed) = if let Some(age) = self.prompt_permission_wait_age() {
+            ("prompt_permission_wait", age)
+        } else if let Some(age) = self.agent_permission_wait_age() {
+            ("agent_permission_wait", age)
+        } else if self.in_flight() {
+            ("prompt_in_flight", self.age())
+        } else if let Some(age) = self.agent_relay_age() {
+            ("agent_relay", age)
+        } else {
+            ("idle", self.age())
+        };
+        json!({"phase": phase, "phaseElapsedMs": elapsed.as_millis() as u64})
+    }
 }
 
 #[derive(Clone)]
@@ -1892,6 +1912,60 @@ mod reader_loop_tests {
         activity.set_in_flight(false);
         assert!(activity.prompt_permission_wait_age().is_none());
     }
+
+    #[test]
+    fn wait_phase_is_idle_by_default() {
+        let activity = SessionActivity::new();
+        assert_eq!(activity.wait_phase()["phase"], "idle");
+    }
+
+    #[test]
+    fn wait_phase_reports_prompt_in_flight() {
+        let activity = SessionActivity::new();
+        activity.set_in_flight(true);
+        assert_eq!(activity.wait_phase()["phase"], "prompt_in_flight");
+    }
+
+    #[test]
+    fn wait_phase_reports_agent_relay_when_only_the_relay_is_active() {
+        let activity = SessionActivity::new();
+        activity.mark_agent_relay();
+        assert_eq!(activity.wait_phase()["phase"], "agent_relay");
+    }
+
+    #[test]
+    fn wait_phase_prefers_prompt_permission_wait_over_in_flight() {
+        let activity = SessionActivity::new();
+        activity.set_in_flight(true);
+        activity.begin_prompt_permission_wait();
+        assert_eq!(activity.wait_phase()["phase"], "prompt_permission_wait");
+    }
+
+    #[test]
+    fn wait_phase_prefers_agent_permission_wait_over_agent_relay() {
+        let activity = SessionActivity::new();
+        activity.mark_agent_relay();
+        activity.begin_agent_permission_wait();
+        assert_eq!(activity.wait_phase()["phase"], "agent_permission_wait");
+    }
+
+    #[test]
+    fn wait_phase_prefers_prompt_permission_wait_over_agent_permission_wait() {
+        let activity = SessionActivity::new();
+        activity.begin_agent_permission_wait();
+        activity.begin_prompt_permission_wait();
+        assert_eq!(activity.wait_phase()["phase"], "prompt_permission_wait");
+    }
+
+    #[test]
+    fn wait_phase_elapsed_ms_tracks_the_open_wait() {
+        let activity = SessionActivity::new();
+        activity.begin_prompt_permission_wait();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let elapsed = activity.wait_phase()["phaseElapsedMs"].as_u64().unwrap();
+        assert!(elapsed >= 10, "elapsed was {elapsed}ms");
+    }
+
     #[tokio::test]
     async fn replacing_idle_receiver_does_not_report_a_connection_failure() {
         let (mut writer, reader) = duplex(8192);

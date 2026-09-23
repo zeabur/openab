@@ -432,6 +432,7 @@ impl SessionPool {
                 let mut snapshot = activity.execution.snapshot();
                 snapshot["steeringSupported"] =
                     serde_json::json!(state.steering_handles.contains_key(thread_id));
+                snapshot["activityPhase"] = activity.wait_phase();
                 if loading && !activity.in_flight() {
                     snapshot["operation"] = serde_json::json!("loading");
                 }
