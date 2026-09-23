@@ -388,7 +388,7 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
                     _ = progress.tick() => {
                         progress_ticks += 1;
                         warn!(
-                            channel = %channel,
+                            channel = %redact_id(&channel),
                             elapsed_secs = progress_ticks * CONTINUATION_PROGRESS_LOG_SECS,
                             timeout_secs = CONTINUATION_TIMEOUT_SECS,
                             "background continuation still waiting for the runtime"
@@ -424,7 +424,7 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
             // of leaving the UI on "resuming" until the pool's own hung-session watchdog
             // eventually force-recovers it. Retry on the next tick.
             warn!(
-                channel = %channel,
+                channel = %redact_id(&channel),
                 timeout_secs = CONTINUATION_TIMEOUT_SECS,
                 "background continuation timed out waiting for the runtime"
             );

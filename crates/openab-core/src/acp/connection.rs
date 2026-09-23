@@ -308,13 +308,17 @@ impl SessionActivity {
     /// permission wait explains a silent turn best, so it wins over
     /// `prompt_in_flight`/`agent_relay`, which in turn win over `idle`.
     pub fn wait_phase(&self) -> Value {
+        let relay_grace = std::time::Duration::from_secs(super::pool::AGENT_RELAY_GRACE_SECS);
         let (phase, elapsed) = if let Some(age) = self.prompt_permission_wait_age() {
             ("prompt_permission_wait", age)
         } else if let Some(age) = self.agent_permission_wait_age() {
             ("agent_permission_wait", age)
         } else if self.in_flight() {
             ("prompt_in_flight", self.age())
-        } else if let Some(age) = self.agent_relay_age() {
+        } else if let Some(age) = self
+            .agent_relay_age()
+            .filter(|age| super::pool::relay_is_streaming(*age, relay_grace))
+        {
             ("agent_relay", age)
         } else {
             ("idle", self.age())
@@ -1934,6 +1938,25 @@ mod reader_loop_tests {
     }
 
     #[test]
+    fn wait_phase_relay_branch_uses_the_pool_grace_period() {
+        // `wait_phase()` gates its `agent_relay` branch through
+        // `pool::relay_is_streaming`, whose own boundary behaviour (fresh
+        // stamp streams, a stamp at or past the grace period does not) is
+        // covered by `crates/openab-core/src/acp/pool.rs`'s
+        // `relay_is_streaming_*` tests. This just pins the wiring: a fresh
+        // relay stamp is still within grace, so it reports `agent_relay`
+        // rather than falling back to `idle`.
+        let activity = SessionActivity::new();
+        activity.mark_agent_relay();
+        let age = activity.agent_relay_age().expect("relay was just stamped");
+        assert!(crate::acp::pool::relay_is_streaming(
+            age,
+            std::time::Duration::from_secs(crate::acp::pool::AGENT_RELAY_GRACE_SECS)
+        ));
+        assert_eq!(activity.wait_phase()["phase"], "agent_relay");
+    }
+
+    #[test]
     fn wait_phase_prefers_prompt_permission_wait_over_in_flight() {
         let activity = SessionActivity::new();
         activity.set_in_flight(true);
@@ -1961,9 +1984,11 @@ mod reader_loop_tests {
     fn wait_phase_elapsed_ms_tracks_the_open_wait() {
         let activity = SessionActivity::new();
         activity.begin_prompt_permission_wait();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let elapsed = activity.wait_phase()["phaseElapsedMs"].as_u64().unwrap();
-        assert!(elapsed >= 10, "elapsed was {elapsed}ms");
+        // A generous lower bound: CI runners can undercount a short sleep by a
+        // few ms, and this only needs to prove elapsed time is tracked at all.
+        assert!(elapsed >= 20, "elapsed was {elapsed}ms");
     }
 
     #[tokio::test]
