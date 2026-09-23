@@ -118,6 +118,16 @@ pub fn parse_jobs(raw: &str) -> BTreeMap<String, LoginCommand> {
     jobs
 }
 
+/// The job's own baseline, plus variables that change what an allowlisted program
+/// executes before it reads its input.
+fn reserved_env(key: &str) -> bool {
+    matches!(
+        key,
+        "PATH" | "HOME" | "TMPDIR" | "NODE_OPTIONS" | "BASH_ENV" | "ENV" | "SHELLOPTS"
+    ) || key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+}
+
 #[derive(Debug)]
 pub struct JobRequest {
     pub job_id: String,
@@ -164,6 +174,9 @@ pub fn parse_request(params: Option<&Value>, jobs: &RuntimeJobs) -> Result<JobRe
                 let value = value.as_str().ok_or("env values must be strings")?;
                 if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
                     return Err("env has an invalid entry");
+                }
+                if reserved_env(key) {
+                    return Err("env may not set PATH, HOME, TMPDIR or loader variables");
                 }
                 Ok((key.clone(), value.to_string()))
             })
@@ -372,6 +385,7 @@ pub async fn run(
     builder
         .args(&command.args)
         .env_clear()
+        .envs(request.env.iter().map(|(k, v)| (k, v)))
         .env(
             "PATH",
             std::env::var("PATH").unwrap_or_else(|_| FALLBACK_PATH.into()),
@@ -381,7 +395,6 @@ pub async fn run(
             std::env::var_os("HOME").unwrap_or_else(|| dir.clone().into_os_string()),
         )
         .env("TMPDIR", &dir)
-        .envs(request.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -534,6 +547,11 @@ mod tests {
             json!({"jobId":"a","job":"j","env":{"A=B":"x"}}),
             json!({"jobId":"a","job":"j","env":{"A":1}}),
             json!({"jobId":"a","job":"j","timeoutMs":-1}),
+            json!({"jobId":"a","job":"j","env":{"PATH":"/tmp/evil"}}),
+            json!({"jobId":"a","job":"j","env":{"HOME":"/"}}),
+            json!({"jobId":"a","job":"j","env":{"TMPDIR":"/"}}),
+            json!({"jobId":"a","job":"j","env":{"NODE_OPTIONS":"--require /x"}}),
+            json!({"jobId":"a","job":"j","env":{"LD_PRELOAD":"/x.so"}}),
         ] {
             assert!(parse_request(Some(&bad), &jobs).is_err(), "{bad}");
         }
@@ -553,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn the_child_sees_only_path_home_tmpdir_and_the_request_env() {
         let _serialized = TEST_GUARD.lock().await;
-        std::env::set_var("OPENAB_JOB_TEST_LEAK", "gateway-secret");
+        let gateway_only = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets this for tests");
         let jobs = RuntimeJobs::default().with_job("env", sh("cat >/dev/null; env"));
         let result = run(
             &jobs,
@@ -584,7 +602,7 @@ mod tests {
         ];
         assert!(names.iter().all(|n| allowed.contains(n)), "{names:?}");
         assert!(stdout.contains("NUPHOS_TOKEN=t0k"));
-        assert!(!stdout.contains("gateway-secret"));
+        assert!(!stdout.contains(&gateway_only));
         assert_eq!(result["exitCode"], 0);
     }
 

@@ -100,7 +100,9 @@ under the same `-32003` operator boundary. The caller names a job and never send
 ```
 
 The child starts with an empty environment plus `PATH`, `HOME`, `TMPDIR` (a fresh
-`0700` directory that is also its cwd and is removed afterwards) and the request's `env`.
+`0700` directory that is also its cwd and is removed afterwards) and the request's `env`,
+which may not set those three, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `SHELLOPTS` or any
+`LD_*`/`DYLD_*` variable.
 It runs in its own process group, and the whole group is killed on timeout, on
 `_openab/runtime/job/cancel {jobId}`, when the connection that started it closes, and
 once stdout exceeds `maxStdoutBytes` (`truncated: true`). `exitCode` is `-1` when the
