@@ -176,11 +176,15 @@ fn warn_force_evicting_hung(
 /// sorts as the *oldest* and is the first thing the eviction scan picks. The
 /// relay stamps `SessionActivity::mark_agent_relay` for every update it
 /// forwards, which is the only honest signal available without the mutex.
-const AGENT_RELAY_GRACE_SECS: u64 = 120;
+pub(crate) const AGENT_RELAY_GRACE_SECS: u64 = 120;
 
 /// True while the relay stamp is fresh enough that an agent-initiated turn is
 /// still streaming through the idle subscriber.
-fn relay_is_streaming(relay_age: std::time::Duration, grace: std::time::Duration) -> bool {
+///
+/// Shared with `SessionActivity::wait_phase()`, which must apply the same
+/// grace period so a session doesn't report `agent_relay` forever after its
+/// last forwarded update.
+pub(crate) fn relay_is_streaming(relay_age: std::time::Duration, grace: std::time::Duration) -> bool {
     relay_age < grace
 }
 
@@ -432,6 +436,7 @@ impl SessionPool {
                 let mut snapshot = activity.execution.snapshot();
                 snapshot["steeringSupported"] =
                     serde_json::json!(state.steering_handles.contains_key(thread_id));
+                snapshot["activityPhase"] = activity.wait_phase();
                 if loading && !activity.in_flight() {
                     snapshot["operation"] = serde_json::json!("loading");
                 }

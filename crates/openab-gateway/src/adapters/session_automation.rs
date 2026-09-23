@@ -8,6 +8,14 @@ use std::collections::BTreeSet;
 /// reporting the failure instead of silently hanging until that backstop fires.
 const CONTINUATION_TIMEOUT_SECS: u64 = 600;
 
+/// How often to log that a continuation is still pending, so a stall is visible
+/// well before `CONTINUATION_TIMEOUT_SECS` elapses. Shortened under test so the
+/// mid-wait log can be asserted without a slow test.
+#[cfg(not(test))]
+const CONTINUATION_PROGRESS_LOG_SECS: u64 = 60;
+#[cfg(test)]
+const CONTINUATION_PROGRESS_LOG_SECS: u64 = 1;
+
 #[derive(Default)]
 pub struct SessionAutomation(std::sync::Mutex<HashMap<String, Automation>>);
 #[derive(Default)]
@@ -345,9 +353,10 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
             json!({"error":{"message":"Continuation transport closed"}})
         };
         let cancel = Arc::new(tokio::sync::Notify::new());
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
-            async {
+        // Scoped so the joined future (which owns `output` via `forward`) is
+        // dropped once it settles, freeing `output` for reuse below.
+        let outcome = {
+            let joined = async {
                 tokio::join!(
                     handle_session_prompt(
                         &state,
@@ -362,9 +371,32 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
                     ),
                     forward
                 )
-            },
-        )
-        .await;
+            };
+            tokio::pin!(joined);
+            let deadline =
+                tokio::time::sleep(std::time::Duration::from_secs(CONTINUATION_TIMEOUT_SECS));
+            tokio::pin!(deadline);
+            let mut progress = tokio::time::interval(std::time::Duration::from_secs(
+                CONTINUATION_PROGRESS_LOG_SECS,
+            ));
+            progress.tick().await; // the first tick fires immediately; skip it
+            let mut progress_ticks: u64 = 0;
+            loop {
+                tokio::select! {
+                    result = &mut joined => break Ok(result),
+                    _ = &mut deadline => break Err(()),
+                    _ = progress.tick() => {
+                        progress_ticks += 1;
+                        warn!(
+                            channel = %redact_id(&channel),
+                            elapsed_secs = progress_ticks * CONTINUATION_PROGRESS_LOG_SECS,
+                            timeout_secs = CONTINUATION_TIMEOUT_SECS,
+                            "background continuation still waiting for the runtime"
+                        );
+                    }
+                }
+            }
+        };
         // The prompt installed its forwarding channel as the idle sink. Restore the
         // live connection output before dropping it; never overwrite a successor.
         if let Some(registry) = &state.acp_reply_registry {
@@ -392,7 +424,7 @@ async fn run(state: Arc<crate::AppState>, channel: String, generation: u64) {
             // of leaving the UI on "resuming" until the pool's own hung-session watchdog
             // eventually force-recovers it. Retry on the next tick.
             warn!(
-                channel = %channel,
+                channel = %redact_id(&channel),
                 timeout_secs = CONTINUATION_TIMEOUT_SECS,
                 "background continuation timed out waiting for the runtime"
             );
@@ -508,6 +540,101 @@ mod tests {
         assert!(
             !registry.lock().unwrap()[channel].out_tx.is_closed(),
             "idle route survives internal response forwarding"
+        );
+    }
+
+    /// `CONTINUATION_PROGRESS_LOG_SECS` is shortened under `cfg(test)` to 1s, so a
+    /// couple of seconds of real wait is enough to observe the mid-wait log fire
+    /// well before `CONTINUATION_TIMEOUT_SECS` (600s) without a slow test.
+    #[tokio::test]
+    async fn continuation_wait_logs_progress_before_the_hard_timeout() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct Cap(StdArc<StdMutex<Vec<u8>>>);
+        impl Write for Cap {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = StdArc::new(StdMutex::new(Vec::new()));
+        let cap = Cap(buf.clone());
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || cap.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        let (events, mut incoming) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(events);
+        state.acp_session_snapshot = Some(Arc::new(|_| {
+            Box::pin(async { json!({"state":"idle","operation":"none"}) })
+        }));
+        let registry = new_reply_registry();
+        state.acp_reply_registry = Some(registry.clone());
+        let state = Arc::new(state);
+        let channel = "acp_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let session = "sess_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let (output, _messages) = mpsc::unbounded_channel();
+        install_reply_sink(
+            &registry,
+            channel,
+            ReplySink {
+                turn_id: None,
+                tx: None,
+                session_id: session.into(),
+                out_tx: output,
+                owner: "client".into(),
+                generation: 1,
+                permission_relay: None,
+            },
+        );
+        state
+            .acp_session_automation
+            .configure(channel, vec![], None);
+        let update = json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"t","state":"completed"});
+        spawn_task(&state.acp_session_automation, channel, "t");
+        let generation = state
+            .acp_session_automation
+            .observe(channel, &update, &accepted(channel))
+            .unwrap();
+
+        let task = tokio::spawn(run(state.clone(), channel.into(), generation));
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let event: Value = serde_json::from_str(&payload).unwrap();
+
+        // Stay silent past a couple of the (test-shortened) 1s progress ticks
+        // before ever answering, so the mid-wait log has time to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+        let response: GatewayReply = serde_json::from_value(json!({
+            "schema":"openab.gateway.reply.v1", "platform":"acp", "channel":{"id":channel}, "reply_to":event["event_id"],
+            "content":{"type":"text","text":"continued"}, "command":"finish_turn:end_turn"
+        }))
+        .unwrap();
+        handle_reply(&response, &registry).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("background continuation still waiting for the runtime"),
+            "expected a mid-wait progress log before the hard timeout: {out}"
+        );
+        assert!(
+            !out.contains("background continuation timed out"),
+            "the hard timeout must not have fired: {out}"
         );
     }
 

@@ -621,6 +621,16 @@ fn route_idle_permission(
     IdlePermissionRoute::Handle
 }
 
+/// Below `prompt_inactivity_timeout` (default 1800s), start logging a silent
+/// turn's phase once it has been quiet this long, so a stall is visible in
+/// logs well before the hard timeout fires.
+const STALL_LOG_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Rate-limit stall logs when the phase hasn't changed: log at most once every
+/// this many liveness ticks, instead of every tick, so a long-but-normal quiet
+/// tool call doesn't flood logs.
+const STALL_LOG_EVERY_N_TICKS: u64 = 5;
+
 // --- AdapterRouter ---
 
 /// Shared logic for routing messages to ACP agents, managing sessions,
@@ -1080,6 +1090,12 @@ impl AdapterRouter {
                     let mut turn_result = TurnResult::default();
                     let mut last_activity = tokio::time::Instant::now();
                     let prompt_activity = conn.activity_handle();
+                    // Stall visibility (see #43/prod incident): once a turn has been
+                    // silent this long, log its phase each tick that phase changes (or
+                    // every STALL_LOG_EVERY_N_TICKS ticks otherwise) so a long stall is
+                    // visible in logs well before `prompt_inactivity_timeout` fires.
+                    let mut stall_last_logged_phase: Option<String> = None;
+                    let mut stall_ticks_past_threshold: u64 = 0;
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
@@ -1133,6 +1149,28 @@ impl AdapterRouter {
                                     ));
                                     conn.abandon_request(request_id).await;
                                     break;
+                                }
+                                let elapsed = last_activity.elapsed();
+                                if elapsed >= STALL_LOG_THRESHOLD {
+                                    stall_ticks_past_threshold += 1;
+                                    let phase = prompt_activity.wait_phase();
+                                    let phase_name = phase["phase"].as_str().unwrap_or("unknown");
+                                    let phase_changed =
+                                        stall_last_logged_phase.as_deref() != Some(phase_name);
+                                    if phase_changed
+                                        || stall_ticks_past_threshold
+                                            .is_multiple_of(STALL_LOG_EVERY_N_TICKS)
+                                    {
+                                        tracing::warn!(
+                                            platform = %thread_channel.platform,
+                                            elapsed_secs = elapsed.as_secs(),
+                                            phase = phase_name,
+                                            phase_elapsed_ms =
+                                                phase["phaseElapsedMs"].as_u64().unwrap_or(0),
+                                            "prompt turn still waiting past the stall threshold"
+                                        );
+                                        stall_last_logged_phase = Some(phase_name.to_string());
+                                    }
                                 }
                                 // Agent is alive with a prompt in flight but silent (e.g. a
                                 // long-running tool call). Emit a schema-valid
