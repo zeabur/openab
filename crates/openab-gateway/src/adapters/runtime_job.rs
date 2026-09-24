@@ -15,8 +15,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
-/// Every job slot this runtime allows is in use.
-pub const JOB_BUSY: i32 = -32005;
 /// The job could not start, or was cancelled before it finished.
 pub const JOB_FAILED: i32 = -32006;
 /// The requested job is not in this runtime's allowlist.
@@ -24,7 +22,6 @@ pub const JOB_UNKNOWN: i32 = -32007;
 
 const DEFAULT_MAX_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_MAX_STDOUT_BYTES: usize = 1 << 20;
-const DEFAULT_CONCURRENCY: usize = 4;
 /// How long stdout may still be drained after the job's group has been killed.
 const DRAIN_SECS: u64 = 5;
 const FALLBACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -34,7 +31,6 @@ pub struct RuntimeJobs {
     commands: BTreeMap<String, LoginCommand>,
     pub max_timeout: Duration,
     pub max_stdout_bytes: usize,
-    pub concurrency: usize,
 }
 
 impl Default for RuntimeJobs {
@@ -43,7 +39,6 @@ impl Default for RuntimeJobs {
             commands: BTreeMap::new(),
             max_timeout: Duration::from_millis(DEFAULT_MAX_TIMEOUT_MS),
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
-            concurrency: DEFAULT_CONCURRENCY,
         }
     }
 }
@@ -75,8 +70,6 @@ impl RuntimeJobs {
                 .unwrap_or(defaults.max_timeout),
             max_stdout_bytes: positive_env("OPENAB_RUNTIME_JOB_MAX_STDOUT_BYTES")
                 .unwrap_or(defaults.max_stdout_bytes),
-            concurrency: positive_env("OPENAB_RUNTIME_JOB_CONCURRENCY")
-                .unwrap_or(defaults.concurrency),
         }
     }
 
@@ -225,15 +218,11 @@ pub fn running_count() -> usize {
 fn claim(
     job_id: &str,
     connection: &str,
-    concurrency: usize,
 ) -> Result<(u64, tokio::sync::oneshot::Receiver<()>), (i32, String)> {
     let mut table = RUNNING.lock();
     let running = table.get_or_insert_with(HashMap::new);
     if running.contains_key(job_id) {
         return Err((-32602, "A job with this jobId is already running".into()));
-    }
-    if running.len() >= concurrency {
-        return Err((JOB_BUSY, "busy".into()));
     }
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -368,7 +357,7 @@ pub async fn run(
     let Some(command) = jobs.commands.get(&request.job) else {
         return Err((JOB_UNKNOWN, format!("Unknown runtime job: {}", request.job)));
     };
-    let (token, cancelled) = claim(&request.job_id, connection, jobs.concurrency)?;
+    let (token, cancelled) = claim(&request.job_id, connection)?;
     let mut guard = JobGuard {
         job_id: request.job_id.clone(),
         token,
@@ -675,33 +664,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jobs_past_the_concurrency_limit_are_busy() {
+    async fn many_jobs_run_at_once_and_each_job_id_runs_once() {
         let _serialized = TEST_GUARD.lock().await;
-        let mut jobs = RuntimeJobs::default().with_job("slow", sh("sleep 60"));
-        jobs.concurrency = 2;
-        let jobs = Arc::new(jobs);
+        let jobs = Arc::new(RuntimeJobs::default().with_job("slow", sh("sleep 60")));
+        let ids: Vec<String> = (0..16).map(|n| format!("many-{n}")).collect();
         let mut running = Vec::new();
-        for id in ["busy-a", "busy-b"] {
-            let jobs = jobs.clone();
+        for id in &ids {
+            let (jobs, id) = (jobs.clone(), id.clone());
             running.push(tokio::spawn(async move {
-                run(&jobs, request("slow", id, json!({})), "conn-busy").await
+                run(&jobs, request("slow", &id, json!({})), "conn-many").await
             }));
         }
-        while running_count() < 2 {
+        while running_count() < ids.len() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let refused = run(&jobs, request("slow", "busy-c", json!({})), "conn-busy")
-            .await
-            .unwrap_err();
-        assert_eq!(refused, (JOB_BUSY, "busy".to_string()));
-        let duplicate = run(&jobs, request("slow", "busy-a", json!({})), "conn-busy")
+        let duplicate = run(&jobs, request("slow", "many-0", json!({})), "conn-many")
             .await
             .unwrap_err();
         assert_eq!(duplicate.0, -32602);
 
-        assert!(cancel("busy-a"));
-        assert!(!cancel("busy-a"));
-        cancel_for_connection("conn-busy");
+        assert!(cancel("many-0"));
+        assert!(!cancel("many-0"));
+        cancel_for_connection("conn-many");
         for task in running {
             assert_eq!(task.await.unwrap().unwrap_err().0, JOB_FAILED);
         }
