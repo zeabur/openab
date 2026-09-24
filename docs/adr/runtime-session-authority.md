@@ -107,9 +107,8 @@ It runs in its own process group, and the whole group is killed on timeout, on
 `_openab/runtime/job/cancel {jobId}`, when the connection that started it closes, and
 once stdout exceeds `maxStdoutBytes` (`truncated: true`). `exitCode` is `-1` when the
 job ended by signal. stderr is discarded, and nothing a job receives or prints is logged.
-`timeoutMs` and `maxStdoutBytes` are clamped to the runtime's own maxima. Errors: `-32005`
-when `OPENAB_RUNTIME_JOB_CONCURRENCY` jobs already run, `-32007` for a job not in the
-list, `-32006` when the job cannot start or is cancelled, `-32602` for invalid params or a
+`timeoutMs` and `maxStdoutBytes` are clamped to the runtime's own maxima. Jobs are not
+limited in number. Errors: `-32007` for a job not in the list, `-32006` when the job cannot start or is cancelled, `-32602` for invalid params or a
 `jobId` that is already running.
 
 `_openab/runtime/state` gains `authenticated`. It is `true`/`false` when
