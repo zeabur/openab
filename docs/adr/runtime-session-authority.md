@@ -128,6 +128,14 @@ because a container may carry its own credential in a form OpenAB never sees. Th
 a client show that a self-hosted runtime needs signing in before a conversation fails
 against it, rather than after.
 
+`_openab/runtime/state` also carries `usage`, the container's own resource figures, so an
+operator can chart a runtime it did not provision without a metrics pipeline of its own:
+`cpuMillicores` (average since the previous read, from cgroup v2 `cpu.stat`, else
+`/proc/stat`; `null` on the first read), `memoryBytes` (working set: `memory.current` minus
+`inactive_file`, else `/proc/meminfo`), and `diskUsedBytes` / `diskTotalBytes` across
+`OPENAB_RUNTIME_DISK_PATHS`. Any figure OpenAB cannot read is `null`. They sit behind the
+same `-32003` operator boundary and are never added to the unauthenticated `/statusz`.
+
 Installing a credential into a process that has already read one has no effect, so a
 completed sign-in runs the pool's existing idle sweep. That sweep skips any session
 still holding a turn, and a runtime only signs in when it has no working credential, so
