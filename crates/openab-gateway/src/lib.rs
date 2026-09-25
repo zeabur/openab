@@ -826,7 +826,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 if adapters::runtime_credentials::console_enabled() {
                     app = app
                         .merge(adapters::runtime_pairing::routes())
-                        .merge(adapters::runtime_console::routes());
+                        .merge(adapters::runtime_console::routes())
+                        .merge(adapters::runtime_console_ui::routes());
                 }
                 acp_mounted = true;
             }
@@ -837,8 +838,17 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let acp_mounted = false;
 
     // Unauthenticated status page. Safe to expose with zero auth: it reports
-    // liveness and non-secret build facts only, never a key or credential.
-    app = app.route("/", get(move || status_page(acp_mounted)));
+    // liveness and non-secret build facts only, never a key or credential. With the
+    // runtime console on, the console page (which carries the same rows) replaces it.
+    #[cfg(feature = "acp")]
+    let console_page = acp_mounted && adapters::runtime_credentials::console_enabled();
+    #[cfg(not(feature = "acp"))]
+    let console_page = false;
+    app = if console_page {
+        app.route("/", get(move || console_index(acp_mounted)))
+    } else {
+        app.route("/", get(move || status_page(acp_mounted)))
+    };
 
     // Telegram adapter
     #[cfg(feature = "telegram")]
@@ -1378,7 +1388,18 @@ async fn health() -> &'static str {
 /// credential, so it is safe for anyone who has the base URL to load in a browser.
 ///
 /// Also mounted directly by the unified `openab run` router in `src/main.rs`.
-pub async fn status_page(acp_enabled: bool) -> axum::response::Html<String> {
+#[cfg(feature = "acp")]
+pub async fn console_index(acp_enabled: bool) -> axum::response::Response {
+    adapters::runtime_console_ui::index(acp_enabled).await
+}
+
+#[cfg(not(feature = "acp"))]
+pub async fn console_index(acp_enabled: bool) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    status_page(acp_enabled).await.into_response()
+}
+
+pub fn status_rows(acp_enabled: bool) -> String {
     let mut rows = String::new();
     if let Ok(label) = std::env::var("OPENAB_RUNTIME_LABEL") {
         if !label.is_empty() {
@@ -1397,7 +1418,11 @@ pub async fn status_page(acp_enabled: bool) -> axum::response::Html<String> {
         "<dt>ACP</dt><dd>{}</dd>",
         if acp_enabled { "enabled" } else { "disabled" }
     ));
+    rows
+}
 
+pub async fn status_page(acp_enabled: bool) -> axum::response::Html<String> {
+    let rows = status_rows(acp_enabled);
     axum::response::Html(format!(
         r#"<!doctype html>
 <html lang="en">

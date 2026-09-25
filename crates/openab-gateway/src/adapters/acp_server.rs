@@ -17,11 +17,11 @@ mod automation;
 pub use automation::{observe_runtime_reply, SessionAutomation};
 
 #[path = "runtime_login.rs"]
-mod runtime_login;
+pub(crate) mod runtime_login;
 pub use runtime_login::LoginCommand;
 
 #[path = "runtime_job.rs"]
-mod runtime_job;
+pub(crate) mod runtime_job;
 pub use runtime_job::RuntimeJobs;
 #[path = "runtime_usage.rs"]
 mod runtime_usage;

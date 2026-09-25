@@ -1591,7 +1591,8 @@ async fn main() -> anyhow::Result<()> {
                         if openab_gateway::adapters::runtime_credentials::console_enabled() {
                             app = app
                                 .merge(openab_gateway::adapters::runtime_pairing::routes())
-                                .merge(openab_gateway::adapters::runtime_console::routes());
+                                .merge(openab_gateway::adapters::runtime_console::routes())
+                                .merge(openab_gateway::adapters::runtime_console_ui::routes());
                         }
                         unified_acp_mounted = true;
                     }
@@ -1601,10 +1602,22 @@ async fn main() -> anyhow::Result<()> {
 
             // Unauthenticated status page — reports liveness and non-secret build
             // facts only, so it is safe to open at the base URL with no credential.
-            app = app.route(
-                "/",
-                axum::routing::get(move || openab_gateway::status_page(unified_acp_mounted)),
-            );
+            #[cfg(feature = "acp")]
+            let console_page = unified_acp_mounted
+                && openab_gateway::adapters::runtime_credentials::console_enabled();
+            #[cfg(not(feature = "acp"))]
+            let console_page = false;
+            app = if console_page {
+                app.route(
+                    "/",
+                    axum::routing::get(move || openab_gateway::console_index(unified_acp_mounted)),
+                )
+            } else {
+                app.route(
+                    "/",
+                    axum::routing::get(move || openab_gateway::status_page(unified_acp_mounted)),
+                )
+            };
 
             #[cfg(feature = "lineworks")]
             if let Some(ref lw) = gw_state.lineworks {
