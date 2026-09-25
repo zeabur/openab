@@ -363,7 +363,13 @@ impl CredentialStore {
         })
     }
 
-    pub fn create_pending(&self, label: String, client: BindingClient) -> IssuedBinding {
+    /// Fails when the binding cannot be written: keys that would stop working after a
+    /// restart are never handed out.
+    pub fn create_pending(
+        &self,
+        label: String,
+        client: BindingClient,
+    ) -> std::io::Result<IssuedBinding> {
         let now = Utc::now();
         let id = random_hex(12);
         let transport_key = format!("{TRANSPORT_PREFIX}{id}_{}", random_hex(32));
@@ -384,28 +390,41 @@ impl CredentialStore {
         let mut inner = self.inner.lock();
         self.prune_pending(&mut inner, now);
         inner.bindings.push(binding);
-        self.save_logged(&mut inner);
+        if let Err(e) = self.save(&inner) {
+            inner.bindings.pop();
+            error!(error = %e, "runtime credentials: could not write bindings");
+            return Err(e);
+        }
+        inner.last_flush = Instant::now();
+        inner.unflushed_use = false;
         info!(binding = %id, "runtime credentials: pending binding created");
-        IssuedBinding {
+        Ok(IssuedBinding {
             id,
             transport_key,
             control_key,
             pending_until,
-        }
+        })
     }
 
-    pub fn revoke(&self, id: &str) -> bool {
+    /// `Ok(false)` when there is no such binding. A revoke that cannot be written is
+    /// undone and reported, so a revoked key can never come back with a restart.
+    pub fn revoke(&self, id: &str) -> std::io::Result<bool> {
         let mut inner = self.inner.lock();
-        let before = inner.bindings.len();
-        inner.bindings.retain(|b| b.id != id);
-        if inner.bindings.len() == before {
-            return false;
+        let Some(index) = inner.bindings.iter().position(|b| b.id == id) else {
+            return Ok(false);
+        };
+        let removed = inner.bindings.remove(index);
+        if let Err(e) = self.save(&inner) {
+            inner.bindings.insert(index, removed);
+            error!(binding = %id, error = %e, "runtime credentials: could not write the revoke; binding kept");
+            return Err(e);
         }
-        self.save_logged(&mut inner);
+        inner.last_flush = Instant::now();
+        inner.unflushed_use = false;
         drop(inner);
         warn!(binding = %id, "runtime credentials: binding revoked");
         let _ = self.revocations.send(id.to_string());
-        true
+        Ok(true)
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -533,7 +552,9 @@ mod tests {
     #[test]
     fn issued_keys_authenticate_with_their_own_role() {
         let store = CredentialStore::in_memory(None, None);
-        let issued = store.create_pending("Team".into(), BindingClient::default());
+        let issued = store
+            .create_pending("Team".into(), BindingClient::default())
+            .unwrap();
         assert!(issued.transport_key.starts_with(TRANSPORT_PREFIX));
         assert!(issued.control_key.starts_with(CONTROL_PREFIX));
         assert_ne!(issued.transport_key, issued.control_key);
@@ -554,8 +575,12 @@ mod tests {
     #[test]
     fn first_use_activates_and_unused_pending_expires() {
         let store = CredentialStore::in_memory(None, None);
-        let used = store.create_pending("used".into(), BindingClient::default());
-        let unused = store.create_pending("unused".into(), BindingClient::default());
+        let used = store
+            .create_pending("used".into(), BindingClient::default())
+            .unwrap();
+        let unused = store
+            .create_pending("unused".into(), BindingClient::default())
+            .unwrap();
         assert_eq!(store.get(&used.id).unwrap().state, BindingState::Pending);
 
         store.authenticate(&used.control_key).unwrap();
@@ -574,11 +599,15 @@ mod tests {
     #[test]
     fn revoking_removes_only_that_binding_and_notifies() {
         let store = CredentialStore::in_memory(None, None);
-        let a = store.create_pending("a".into(), BindingClient::default());
-        let b = store.create_pending("b".into(), BindingClient::default());
+        let a = store
+            .create_pending("a".into(), BindingClient::default())
+            .unwrap();
+        let b = store
+            .create_pending("b".into(), BindingClient::default())
+            .unwrap();
         let mut rx = store.subscribe();
-        assert!(store.revoke(&a.id));
-        assert!(!store.revoke(&a.id));
+        assert!(store.revoke(&a.id).unwrap());
+        assert!(!store.revoke(&a.id).unwrap());
         assert_eq!(rx.try_recv().unwrap(), a.id);
         assert!(store.authenticate(&a.transport_key).is_none());
         assert!(store.authenticate(&a.control_key).is_none());
@@ -627,7 +656,7 @@ mod tests {
         );
         assert_eq!(store.authenticate(&control).unwrap().role, Role::Control);
 
-        assert!(store.revoke(LEGACY_BINDING_ID));
+        assert!(store.revoke(LEGACY_BINDING_ID).unwrap());
         let reopened = CredentialStore::open(dir.clone(), Some(&legacy), None, None).unwrap();
         assert!(
             reopened.list().is_empty(),
@@ -640,13 +669,15 @@ mod tests {
     fn bindings_persist_without_plaintext_keys() {
         let dir = temp_dir("persist");
         let store = CredentialStore::open(dir.clone(), None, None, None).unwrap();
-        let issued = store.create_pending(
-            "Team".into(),
-            BindingClient {
-                team_name: Some("Acme".into()),
-                ..Default::default()
-            },
-        );
+        let issued = store
+            .create_pending(
+                "Team".into(),
+                BindingClient {
+                    team_name: Some("Acme".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let raw = std::fs::read_to_string(dir.join(BINDINGS_FILE)).unwrap();
         assert!(!raw.contains(&issued.transport_key));
         assert!(!raw.contains(&issued.control_key));
@@ -663,6 +694,35 @@ mod tests {
         let binding = reopened.get(&issued.id).unwrap();
         assert_eq!(binding.client.team_name.as_deref(), Some("Acme"));
         assert!(reopened.authenticate(&issued.transport_key).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_revoke_that_cannot_be_written_is_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("readonly");
+        let store = CredentialStore::open(dir.clone(), None, None, None).unwrap();
+        let issued = store
+            .create_pending("a".into(), BindingClient::default())
+            .unwrap();
+        let mut rx = store.subscribe();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let revoked = store.revoke(&issued.id);
+        let created = store.create_pending("b".into(), BindingClient::default());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(revoked.is_err());
+        assert!(created.is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "no socket is closed for a revoke that did not happen"
+        );
+        assert!(store.authenticate(&issued.transport_key).is_some());
+        assert_eq!(store.list().len(), 1);
+        let reopened = CredentialStore::open(dir, None, None, None).unwrap();
+        assert!(reopened.contains(&issued.id));
+        assert_eq!(reopened.list().len(), 1);
     }
 
     #[test]

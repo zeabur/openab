@@ -10586,8 +10586,8 @@ mod acp_ws_integration {
     #[tokio::test]
     async fn each_binding_holds_its_own_role_and_revoking_one_closes_only_its_sockets() {
         let store = Arc::new(CredentialStore::in_memory(None, None));
-        let a = store.create_pending("a".into(), Default::default());
-        let b = store.create_pending("b".into(), Default::default());
+        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let b = store.create_pending("b".into(), Default::default()).unwrap();
         let url = serve_with_credentials(store.clone()).await;
 
         let mut a_transport = connect_bearer(&url, &a.transport_key).await.unwrap();
@@ -10614,7 +10614,7 @@ mod acp_ws_integration {
             "a binding's control key is an operator: {state}"
         );
 
-        assert!(store.revoke(&a.id));
+        assert!(store.revoke(&a.id).unwrap());
         for ws in [&mut a_transport, &mut a_control] {
             let close = loop {
                 match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
