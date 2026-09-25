@@ -293,22 +293,24 @@ async fn drive(
     };
 
     let status = tokio::select! {
-        status = child.wait() => status,
-        _ = cancelled => {
-            kill_group(pgid);
-            let _ = child.kill().await;
-            relay.abort();
-            return Err((LOGIN_FAILED, "Runtime sign-in was cancelled".to_string()));
-        }
+        status = child.wait() => Ok(status),
+        _ = cancelled => Err("Runtime sign-in was cancelled"),
         _ = tokio::time::sleep(std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS)) => {
-            kill_group(pgid);
-            let _ = child.kill().await;
-            relay.abort();
-            return Err((LOGIN_FAILED, "Runtime sign-in timed out".to_string()));
+            Err("Runtime sign-in timed out")
         }
     };
-    // Nothing reads stdin any more; a line sent while stdout drains must not be acknowledged.
+    // However the command ended, nothing reads stdin any more, so no later line may be
+    // acknowledged — not while stdout drains, nor while a stopped command is killed.
     record_child(attempt, pgid, None);
+    let status = match status {
+        Ok(status) => status,
+        Err(reason) => {
+            kill_group(pgid);
+            let _ = child.kill().await;
+            relay.abort();
+            return Err((LOGIN_FAILED, reason.to_string()));
+        }
+    };
     // End the group before waiting for EOF. A descendant that inherited stdout can hold
     // the pipe open long after the command itself exits, and by here the cancellation and
     // timeout arms are gone — so an unbounded drain would outlive both guarantees. Bytes
