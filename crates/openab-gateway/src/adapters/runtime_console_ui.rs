@@ -112,6 +112,12 @@ fn record_frame(attempt: &str, notification: &str) {
     bump();
 }
 
+/// Whether `attempt` is the sign-in this console started. The login slot is shared with
+/// `/acp`, so an attempt id alone does not make a sign-in the console's to drive.
+fn console_owns(attempt: &str) -> bool {
+    SIGNIN.lock().as_ref().is_some_and(|s| s.attempt == attempt)
+}
+
 fn busy() -> ApiError {
     ApiError(StatusCode::CONFLICT, "signin_busy")
 }
@@ -257,6 +263,9 @@ async fn signin_input(
     authorize_write(&ctx, &headers)?;
     let request: InputRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if !console_owns(&request.attempt_id) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_running"));
+    }
     runtime_login::send_input(&request.attempt_id, request.text.trim()).map_err(|(code, _)| {
         match code {
             runtime_login::LOGIN_NOT_RUNNING => ApiError(StatusCode::NOT_FOUND, "not_running"),
@@ -282,11 +291,8 @@ async fn signin_cancel(
     authorize_write(&ctx, &headers)?;
     let request: CancelRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let owned = SIGNIN
-        .lock()
-        .as_ref()
-        .is_some_and(|s| s.attempt == request.attempt_id);
-    let cancelled = owned && runtime_login::cancel(Some(&request.attempt_id));
+    let cancelled =
+        console_owns(&request.attempt_id) && runtime_login::cancel(Some(&request.attempt_id));
     Ok(Json(json!({"cancelled": cancelled})).into_response())
 }
 
@@ -505,6 +511,39 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (acp_tx, _acp_rx) = mpsc::unbounded_channel();
+        let acp_signin = tokio::spawn(async move {
+            let command = LoginCommand {
+                program: "cat".into(),
+                args: vec![],
+            };
+            runtime_login::run(&command, "acp-attempt", "acp_conn_other", &acp_tx, None).await
+        });
+        while !runtime_login::in_progress() {
+            tokio::task::yield_now().await;
+        }
+        for path in ["input", "cancel"] {
+            let (status, _, body) = request(
+                &app,
+                "POST",
+                &format!("/_openab/console/signin/{path}"),
+                Some(&cookie),
+                Some(&csrf),
+                json!({"attemptId": "acp-attempt", "text": "code#state"}),
+            )
+            .await;
+            match path {
+                "input" => assert_eq!(status, StatusCode::NOT_FOUND, "{body}"),
+                _ => assert!(body.contains(r#""cancelled":false"#), "{body}"),
+            }
+        }
+        assert!(
+            runtime_login::in_progress(),
+            "the /acp sign-in is untouched"
+        );
+        assert!(runtime_login::cancel(Some("acp-attempt")));
+        let _ = acp_signin.await;
     }
 
     #[test]
