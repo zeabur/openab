@@ -31,6 +31,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 parking_lot = "0.12"
 libc = "0.2"
 urlencoding = "2"
+rand = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"

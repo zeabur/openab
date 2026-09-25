@@ -15,6 +15,8 @@ pub mod line;
 pub mod lineworks;
 #[cfg(feature = "lineworks")]
 pub mod lineworks_flex;
+#[cfg(feature = "acp")]
+pub mod runtime_credentials;
 #[cfg(feature = "teams")]
 pub mod teams;
 #[cfg(feature = "telegram")]

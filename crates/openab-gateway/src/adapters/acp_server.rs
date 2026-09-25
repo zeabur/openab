@@ -26,6 +26,7 @@ pub use runtime_job::RuntimeJobs;
 #[path = "runtime_usage.rs"]
 mod runtime_usage;
 
+use super::runtime_credentials::{CredentialStore, Principal, Role};
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -44,6 +45,9 @@ use uuid::Uuid;
 /// ACP wire protocol MAJOR version (an integer), returned from `initialize`.
 /// Tracks the official schema — see `docs/acp-official-methods.md`.
 const ACP_PROTOCOL_VERSION: u32 = 1;
+
+/// WebSocket close code sent to a connection whose binding was revoked.
+pub const BINDING_REVOKED_CLOSE_CODE: u16 = 4401;
 
 /// Lightweight per-connection resource caps: turn unbounded client-driven growth into
 /// a deterministic overload error. Full backpressure (bounded outbound channel), idle
@@ -238,6 +242,9 @@ pub struct AcpConfig {
     /// Volumes whose used/total bytes `_openab/runtime/state` reports
     /// (`OPENAB_RUNTIME_DISK_PATHS`, comma-separated). Empty → disk usage is `null`.
     pub disk_paths: Vec<String>,
+    /// Per-binding credentials (`OPENAB_RUNTIME_CONSOLE`). When set, every `/acp` bearer is
+    /// resolved here, deployment keys included.
+    pub credentials: Option<Arc<CredentialStore>>,
 }
 
 impl AcpConfig {
@@ -253,6 +260,7 @@ impl AcpConfig {
             .ok()
             .filter(|k| !k.is_empty());
         match auth_key {
+            None if super::runtime_credentials::console_enabled() => {}
             None => warn!(
                 "OPENAB_ACP_AUTH_KEY not set — /acp is only served on a loopback bind; a \
                  non-loopback bind will refuse to mount it (set a key to expose it)"
@@ -289,6 +297,8 @@ impl AcpConfig {
         let auth_file = std::env::var("OPENAB_RUNTIME_AUTH_FILE")
             .ok()
             .filter(|path| !path.trim().is_empty());
+        let credentials =
+            super::runtime_credentials::from_env(auth_key.as_ref(), control_key.as_ref());
         Some(Self {
             auth_key,
             control_key,
@@ -304,6 +314,7 @@ impl AcpConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
+            credentials,
         })
     }
 }
@@ -347,12 +358,17 @@ fn bind_is_loopback(listen_addr: &str) -> bool {
 }
 
 /// Whether `/acp` may be mounted for the given auth key and bind address. A non-empty
-/// transport key always suffices. Without a key, fail-open is permitted ONLY on a
+/// transport key, or a credential store (which rejects every upgrade until a binding
+/// exists), always suffices. Without a key, fail-open is permitted ONLY on a
 /// loopback bind; any non-loopback bind (`0.0.0.0`, a LAN IP, a LoadBalancer) requires
 /// `OPENAB_ACP_AUTH_KEY` so an unauthenticated agent endpoint is never exposed to the
 /// network. Returns `Err(reason)` when the endpoint must not be mounted.
-pub fn acp_auth_ok_for_bind(auth_key: Option<&str>, listen_addr: &str) -> Result<(), String> {
-    if auth_key.map(|k| !k.is_empty()).unwrap_or(false) {
+pub fn acp_auth_ok_for_bind(
+    auth_key: Option<&str>,
+    credential_store: bool,
+    listen_addr: &str,
+) -> Result<(), String> {
+    if credential_store || auth_key.map(|k| !k.is_empty()).unwrap_or(false) {
         return Ok(());
     }
     if bind_is_loopback(listen_addr) {
@@ -891,6 +907,47 @@ impl JsonRpcResponse {
 // WebSocket upgrade handler: GET /acp
 // ---------------------------------------------------------------------------
 
+enum Resolution {
+    Authorized(Principal),
+    Unauthorized,
+    /// No credential is configured at all: the keyless loopback mode.
+    Keyless,
+}
+
+/// Who a bearer token belongs to. With a credential store every token, deployment keys
+/// included, is resolved there; otherwise the static transport and control keys apply.
+fn resolve_principal(acp: Option<&AcpConfig>, token: Option<&str>) -> Resolution {
+    use subtle::ConstantTimeEq;
+    if let Some(store) = acp.and_then(|c| c.credentials.as_ref()) {
+        return token
+            .and_then(|t| store.authenticate(t))
+            .map_or(Resolution::Unauthorized, Resolution::Authorized);
+    }
+    let control = acp.and_then(|c| c.control_key.as_ref());
+    if token
+        .zip(control)
+        .is_some_and(|(t, key)| bool::from(t.as_bytes().ct_eq(key.as_bytes())))
+    {
+        return Resolution::Authorized(Principal {
+            binding_id: None,
+            role: Role::Control,
+        });
+    }
+    match acp.and_then(|c| c.auth_key.as_ref()) {
+        Some(expected) => {
+            if token.is_some_and(|t| bool::from(t.as_bytes().ct_eq(expected.as_bytes()))) {
+                Resolution::Authorized(Principal {
+                    binding_id: None,
+                    role: Role::Transport,
+                })
+            } else {
+                Resolution::Unauthorized
+            }
+        }
+        None => Resolution::Keyless,
+    }
+}
+
 pub async fn ws_upgrade(
     State(state): State<Arc<crate::AppState>>,
     headers: axum::http::HeaderMap,
@@ -900,54 +957,43 @@ pub async fn ws_upgrade(
     // the legacy `?token=` query fallback was dropped in R17-F2. See `ws_bearer_token`.
     let token = ws_bearer_token(&headers);
 
-    let runtime_control = token
-        .zip(state.acp.as_ref().and_then(|c| c.control_key.as_ref()))
-        .is_some_and(|(token, key)| {
-            use subtle::ConstantTimeEq;
-            bool::from(token.as_bytes().ct_eq(key.as_bytes()))
-        });
-    let expected = state.acp.as_ref().and_then(|c| c.auth_key.as_ref());
-    if runtime_control {
-        // The operator credential delegates all-session control to a trusted broker.
-    } else if let Some(expected) = expected {
-        let valid = match token {
-            Some(t) => {
-                // Constant-time comparison to prevent timing attacks
-                use subtle::ConstantTimeEq;
-                t.as_bytes().ct_eq(expected.as_bytes()).into()
-            }
-            None => false,
-        };
-        if !valid {
+    let principal = match resolve_principal(state.acp.as_ref(), token) {
+        Resolution::Authorized(principal) => principal,
+        Resolution::Unauthorized => {
             warn!("ACP WebSocket rejected: invalid or missing token");
             return StatusCode::UNAUTHORIZED.into_response();
         }
-    } else {
-        // Keyless loopback mode: the bearer check above is skipped, so a browser could
-        // reach us cross-origin (WS handshakes bypass the same-origin policy). Reject a
-        // browser-set `Origin` that isn't allowlisted; a non-browser client (no `Origin`)
-        // is allowed.
-        let origin = headers.get("origin").and_then(|v| v.to_str().ok());
-        let allowed = state
-            .acp
-            .as_ref()
-            .map(|c| c.allowed_origins.as_slice())
-            .unwrap_or(&[]);
-        if !acp_origin_ok(origin, allowed) {
-            warn!(
-                "ACP WebSocket rejected: browser Origin {:?} not in OPENAB_ACP_ALLOWED_ORIGINS \
-                 (keyless loopback mode)",
-                origin
-            );
-            return StatusCode::FORBIDDEN.into_response();
+        Resolution::Keyless => {
+            // Keyless loopback mode: the bearer check above is skipped, so a browser could
+            // reach us cross-origin (WS handshakes bypass the same-origin policy). Reject a
+            // browser-set `Origin` that isn't allowlisted; a non-browser client (no `Origin`)
+            // is allowed.
+            let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+            let allowed = state
+                .acp
+                .as_ref()
+                .map(|c| c.allowed_origins.as_slice())
+                .unwrap_or(&[]);
+            if !acp_origin_ok(origin, allowed) {
+                warn!(
+                    "ACP WebSocket rejected: browser Origin {:?} not in OPENAB_ACP_ALLOWED_ORIGINS \
+                     (keyless loopback mode)",
+                    origin
+                );
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Principal {
+                binding_id: None,
+                role: Role::Transport,
+            }
         }
-    }
+    };
 
     // Echo the `acp.v1` subprotocol so a browser that offered it (alongside its
     // `openab.bearer.<token>` entry) completes the handshake. Clients that offer no
     // subprotocol are unaffected.
     ws.protocols([ACP_SUBPROTOCOL])
-        .on_upgrade(move |socket| handle_acp_connection(state, socket, runtime_control))
+        .on_upgrade(move |socket| handle_acp_connection(state, socket, principal))
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,8 +1808,20 @@ pub async fn publish_runtime_snapshot(state: &crate::AppState, channel: &str) {
 async fn handle_acp_connection(
     state: Arc<crate::AppState>,
     socket: WebSocket,
-    runtime_control: bool,
+    principal: Principal,
 ) {
+    let runtime_control = principal.role == Role::Control;
+    let credentials = state.acp.as_ref().and_then(|c| c.credentials.clone());
+    let mut revocations = credentials
+        .as_ref()
+        .filter(|_| principal.binding_id.is_some())
+        .map(|store| store.subscribe());
+    // A revoke that landed between the handshake and the subscription above.
+    let revoked_before_accept = principal
+        .binding_id
+        .as_deref()
+        .zip(credentials.as_ref())
+        .is_some_and(|(id, store)| !store.contains(id));
     let (mut ws_tx, mut ws_rx) = socket.split();
     let connection_id = format!("acp_conn_{}", Uuid::new_v4());
     // Age of this connection, from the same counter that orders attaches. A resume's authority to
@@ -1845,19 +1903,48 @@ async fn handle_acp_connection(
     // Forward outbound messages to WebSocket. Single choke point for every outbound
     // frame, so trace here rather than at each send site.
     let send_conn = connection_id.clone();
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if trace {
-                debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
-            }
-            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
-                break;
+    let (close_tx, mut close_rx) = oneshot::channel::<()>();
+    let mut send_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if trace {
+                        debug!(connection = %send_conn, dir = "out", frame = %trace_frame(&msg), "ACP frame");
+                    }
+                    if ws_tx.send(Message::Text(msg.into())).await.is_err() {
+                        break;
+                    }
+                }
+                close = &mut close_rx => {
+                    if close.is_ok() {
+                        let _ = ws_tx
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: BINDING_REVOKED_CLOSE_CODE,
+                                reason: "binding revoked".into(),
+                            })))
+                            .await;
+                    }
+                    break;
+                }
             }
         }
     });
 
     // Process incoming messages
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    let mut revoked = revoked_before_accept;
+    while !revoked {
+        let next = match credentials.as_ref() {
+            Some(store) => tokio::select! {
+                msg = ws_rx.next() => msg,
+                () = store.revoked(principal.binding_id.as_deref(), &mut revocations) => {
+                    revoked = true;
+                    break;
+                }
+            },
+            None => ws_rx.next().await,
+        };
+        let Some(Ok(msg)) = next else { break };
         let Message::Text(text) = msg else {
             continue;
         };
@@ -2827,6 +2914,12 @@ async fn handle_acp_connection(
         // Clean up finished tasks (both sets)
         prompt_tasks.retain(|h| !h.is_finished());
         establish_tasks.retain(|h| !h.is_finished());
+    }
+
+    if revoked {
+        info!(connection = %connection_id, "ACP connection closed: its binding was revoked");
+        let _ = close_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut send_task).await;
     }
 
     // Drain any in-flight server-initiated requests: dropping each oneshot sender makes the
@@ -4368,18 +4461,20 @@ mod acp_conformance {
     fn acp_auth_gate_requires_key_off_loopback() {
         use super::acp_auth_ok_for_bind;
         // a non-empty key suffices on any bind
-        assert!(acp_auth_ok_for_bind(Some("k"), "0.0.0.0:8080").is_ok());
-        assert!(acp_auth_ok_for_bind(Some("k"), "127.0.0.1:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(Some("k"), false, "0.0.0.0:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(Some("k"), false, "127.0.0.1:8080").is_ok());
         // no key: loopback binds are allowed
-        assert!(acp_auth_ok_for_bind(None, "127.0.0.1:8080").is_ok());
-        assert!(acp_auth_ok_for_bind(None, "localhost:8080").is_ok());
-        assert!(acp_auth_ok_for_bind(None, "[::1]:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(None, false, "127.0.0.1:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(None, false, "localhost:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(None, false, "[::1]:8080").is_ok());
         // no key: non-loopback binds are refused
-        assert!(acp_auth_ok_for_bind(None, "0.0.0.0:8080").is_err());
-        assert!(acp_auth_ok_for_bind(None, "192.168.1.10:8080").is_err());
+        assert!(acp_auth_ok_for_bind(None, false, "0.0.0.0:8080").is_err());
+        assert!(acp_auth_ok_for_bind(None, false, "192.168.1.10:8080").is_err());
         // an empty key is treated as no key
-        assert!(acp_auth_ok_for_bind(Some(""), "0.0.0.0:8080").is_err());
-        assert!(acp_auth_ok_for_bind(Some(""), "127.0.0.1:8080").is_ok());
+        assert!(acp_auth_ok_for_bind(Some(""), false, "0.0.0.0:8080").is_err());
+        assert!(acp_auth_ok_for_bind(Some(""), false, "127.0.0.1:8080").is_ok());
+        // a credential store mounts /acp anywhere: it rejects every upgrade until a binding exists
+        assert!(acp_auth_ok_for_bind(None, true, "0.0.0.0:8080").is_ok());
     }
 
     #[test]
@@ -7330,6 +7425,7 @@ mod acp_ws_integration {
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
+            credentials: None,
         });
         let reply_registry = new_reply_registry();
         state.acp_reply_registry = Some(reply_registry.clone());
@@ -7359,6 +7455,7 @@ mod acp_ws_integration {
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
+            credentials: None,
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"state":"active","steeringSupported":true}) })
@@ -7429,6 +7526,7 @@ mod acp_ws_integration {
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
+            credentials: None,
         });
         let registry = new_reply_registry();
         state.acp_reply_registry = Some(registry.clone());
@@ -7485,6 +7583,7 @@ mod acp_ws_integration {
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
+            credentials: None,
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"epoch":"provider","state":"active","operation":"prompt"}) })
@@ -7559,6 +7658,7 @@ mod acp_ws_integration {
             auth_file: Some(credential.display().to_string()),
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
+            credentials: None,
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let suspends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7673,6 +7773,7 @@ mod acp_ws_integration {
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
+            credentials: None,
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let app = axum::Router::new()
@@ -7749,6 +7850,7 @@ mod acp_ws_integration {
             auth_file: None,
             runtime_jobs: jobs,
             disk_paths: vec![],
+            credentials: None,
         });
         let app = axum::Router::new()
             .route("/acp", axum::routing::get(ws_upgrade))
@@ -10419,6 +10521,157 @@ mod acp_ws_integration {
             .unwrap()
             .expect("the surviving tunnel must carry a call");
         assert_eq!(got["content"][0]["text"], json!("clicked"));
+    }
+
+    async fn serve_with_credentials(store: Arc<CredentialStore>) -> String {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut state = crate::AppState::test_default(tx);
+        state.acp = Some(AcpConfig {
+            auth_key: None,
+            control_key: None,
+            allowed_origins: vec![],
+            login_command: None,
+            auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
+            credentials: Some(store),
+        });
+        let app = axum::Router::new()
+            .route("/acp", axum::routing::get(ws_upgrade))
+            .with_state(Arc::new(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("ws://{addr}/acp")
+    }
+
+    async fn connect_bearer(url: &str, token: &str) -> Result<Ws, u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Err(response.status().as_u16())
+            }
+            Err(e) => panic!("unexpected handshake error: {e}"),
+        }
+    }
+
+    async fn initialize(ws: &mut Ws) {
+        send(
+            ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+        )
+        .await;
+        assert!(recv(ws).await["result"].is_object());
+    }
+
+    #[tokio::test]
+    async fn a_credential_store_without_bindings_rejects_every_upgrade() {
+        let url = serve_with_credentials(Arc::new(CredentialStore::in_memory(None, None))).await;
+        assert_eq!(connect_bearer(&url, "anything").await.err(), Some(401));
+        match tokio_tungstenite::connect_async(url.as_str()).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 401)
+            }
+            _ => panic!("a keyless upgrade must be refused when a credential store is configured"),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_binding_holds_its_own_role_and_revoking_one_closes_only_its_sockets() {
+        let store = Arc::new(CredentialStore::in_memory(None, None));
+        let a = store.create_pending("a".into(), Default::default());
+        let b = store.create_pending("b".into(), Default::default());
+        let url = serve_with_credentials(store.clone()).await;
+
+        let mut a_transport = connect_bearer(&url, &a.transport_key).await.unwrap();
+        let mut a_control = connect_bearer(&url, &a.control_key).await.unwrap();
+        let mut b_transport = connect_bearer(&url, &b.transport_key).await.unwrap();
+        for ws in [&mut a_transport, &mut a_control, &mut b_transport] {
+            initialize(ws).await;
+        }
+
+        send(
+            &mut a_transport,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/state"}),
+        )
+        .await;
+        assert_eq!(recv(&mut a_transport).await["error"]["code"], -32003);
+        send(
+            &mut a_control,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/state"}),
+        )
+        .await;
+        let state = recv(&mut a_control).await;
+        assert_ne!(
+            state["error"]["code"], -32003,
+            "a binding's control key is an operator: {state}"
+        );
+
+        assert!(store.revoke(&a.id));
+        for ws in [&mut a_transport, &mut a_control] {
+            let close = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+                    .await
+                    .expect("a revoked binding's socket must close")
+                {
+                    Some(Ok(WsMessage::Close(frame))) => break frame,
+                    Some(Ok(_)) => continue,
+                    other => panic!("expected a close frame, got {other:?}"),
+                }
+            };
+            let frame = close.expect("the close carries a reason");
+            assert_eq!(u16::from(frame.code), BINDING_REVOKED_CLOSE_CODE);
+        }
+        assert_eq!(
+            connect_bearer(&url, &a.transport_key).await.err(),
+            Some(401)
+        );
+
+        send(
+            &mut b_transport,
+            json!({"jsonrpc":"2.0","id":3,"method":"_openab/runtime/state"}),
+        )
+        .await;
+        assert_eq!(
+            recv(&mut b_transport).await["id"],
+            3,
+            "the other binding keeps its socket"
+        );
+        assert!(connect_bearer(&url, &b.transport_key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deployment_keys_still_work_beside_the_store() {
+        let transport = "t".repeat(40);
+        let control = "c".repeat(40);
+        let store = Arc::new(CredentialStore::in_memory(
+            Some(transport.clone()),
+            Some(control.clone()),
+        ));
+        let url = serve_with_credentials(store).await;
+        let mut ws = connect_bearer(&url, &transport).await.unwrap();
+        initialize(&mut ws).await;
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/state"}),
+        )
+        .await;
+        assert_eq!(recv(&mut ws).await["error"]["code"], -32003);
+        let mut operator = connect_bearer(&url, &control).await.unwrap();
+        initialize(&mut operator).await;
+        send(
+            &mut operator,
+            json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/state"}),
+        )
+        .await;
+        assert_ne!(recv(&mut operator).await["error"]["code"], -32003);
     }
 }
 

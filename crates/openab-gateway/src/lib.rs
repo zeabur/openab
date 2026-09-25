@@ -815,7 +815,11 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         .unwrap_or(false)
     {
         let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
-        match adapters::acp_server::acp_auth_ok_for_bind(acp_key.as_deref(), &listen_addr) {
+        match adapters::acp_server::acp_auth_ok_for_bind(
+            acp_key.as_deref(),
+            adapters::runtime_credentials::console_enabled(),
+            &listen_addr,
+        ) {
             Ok(()) => {
                 info!("ACP server endpoint enabled at /acp");
                 app = app.route("/acp", get(adapters::acp_server::ws_upgrade));
