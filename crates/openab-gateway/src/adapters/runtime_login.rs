@@ -101,6 +101,11 @@ fn claim(attempt: &str, connection: &str) -> Option<tokio::sync::oneshot::Receiv
     Some(rx)
 }
 
+/// Whether any sign-in, from any connection or the console, holds the slot now.
+pub fn in_progress() -> bool {
+    IN_FLIGHT.lock().is_some()
+}
+
 fn record_child(attempt: &str, pgid: Option<i32>, input: Option<Sender<String>>) {
     let mut slot = IN_FLIGHT.lock();
     if let Some(entry) = slot.as_mut() {

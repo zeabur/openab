@@ -94,6 +94,7 @@ pub struct RuntimeConsole {
     setup_window: Duration,
     config: RwLock<Option<Config>>,
     sessions: Mutex<HashMap<String, Session>>,
+    sessions_ended: tokio::sync::watch::Sender<u64>,
     logins: RateLimiter,
     setup: tokio::sync::Mutex<()>,
 }
@@ -290,6 +291,7 @@ impl RuntimeConsole {
             setup_window,
             config: RwLock::new(config),
             sessions: Mutex::new(HashMap::new()),
+            sessions_ended: tokio::sync::watch::channel(0).0,
             logins: RateLimiter::new(5, 30, Duration::from_secs(60)),
             setup: tokio::sync::Mutex::new(()),
         })
@@ -414,6 +416,7 @@ impl RuntimeConsole {
 
     fn end_other_sessions(&self, keep: &str) {
         self.sessions.lock().retain(|key, _| key == keep);
+        self.sessions_ended.send_modify(|n| *n += 1);
     }
 
     /// End every session the request presents, not only the one that authorized it.
@@ -422,6 +425,21 @@ impl RuntimeConsole {
         for token in session_tokens(headers) {
             sessions.remove(&sha256_hex(token.as_bytes()));
         }
+        drop(sessions);
+        self.sessions_ended.send_modify(|n| *n += 1);
+    }
+
+    /// Whether the session behind `key` still exists and has not expired. Unlike
+    /// `session`, it does not count as activity.
+    pub(crate) fn session_alive(&self, key: &str) -> bool {
+        self.sessions.lock().get(key).is_some_and(|s| {
+            s.last_seen.elapsed() < SESSION_IDLE && s.created.elapsed() < SESSION_MAX
+        })
+    }
+
+    /// Notified whenever sessions are ended, so long-lived responses can stop.
+    pub(crate) fn sessions_ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sessions_ended.subscribe()
     }
 
     fn public_url(&self, headers: &HeaderMap) -> (Option<String>, &'static str) {
