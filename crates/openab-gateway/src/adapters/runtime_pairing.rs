@@ -267,7 +267,9 @@ async fn exchange(
         paired_by: clean(raw.paired_by),
         runtime_record_id: clean(raw.runtime_record_id),
     };
-    let issued = store.create_pending(binding_label(&client), client);
+    let Ok(issued) = store.create_pending(binding_label(&client), client) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "store_failed");
+    };
     info!(binding = %issued.id, "pairing code exchanged for a pending binding");
     ok(json!({
         "bindingId": issued.id,
@@ -308,7 +310,9 @@ async fn revoke_self(State(state): State<Arc<crate::AppState>>, headers: HeaderM
     let Some(id) = principal.binding_id else {
         return error(StatusCode::CONFLICT, "not_revocable");
     };
-    store.revoke(&id);
+    if store.revoke(&id).is_err() {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "store_failed");
+    }
     info!(binding = %id, "binding revoked by its holder");
     ok(json!({"revoked": true}))
 }
