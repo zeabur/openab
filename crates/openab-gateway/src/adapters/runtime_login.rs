@@ -13,7 +13,8 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tracing::{info, warn};
 
 /// Cap on one NDJSON frame from the login command, matching the operator-side parser.
@@ -24,6 +25,8 @@ const LOGIN_TIMEOUT_SECS: u64 = 15 * 60;
 const RELAY_DRAIN_SECS: u64 = 5;
 /// Cap on one line of operator input, such as an authorization code pasted back.
 const MAX_LOGIN_INPUT_BYTES: usize = 4096;
+/// Lines accepted ahead of a command that is not reading them.
+const LOGIN_INPUT_QUEUE: usize = 4;
 /// Notification carrying one frame the login command printed.
 pub const LOGIN_FRAME_METHOD: &str = "_openab/runtime/login/frame";
 
@@ -69,7 +72,7 @@ struct InFlight {
     attempt: String,
     connection: String,
     pgid: Option<i32>,
-    input: Option<UnboundedSender<String>>,
+    input: Option<Sender<String>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -98,12 +101,12 @@ fn claim(attempt: &str, connection: &str) -> Option<tokio::sync::oneshot::Receiv
     Some(rx)
 }
 
-fn record_child(attempt: &str, pgid: Option<i32>, input: UnboundedSender<String>) {
+fn record_child(attempt: &str, pgid: Option<i32>, input: Option<Sender<String>>) {
     let mut slot = IN_FLIGHT.lock();
     if let Some(entry) = slot.as_mut() {
         if entry.attempt == attempt {
             entry.pgid = pgid;
-            entry.input = Some(input);
+            entry.input = input;
         }
     }
 }
@@ -120,18 +123,26 @@ pub fn send_input(attempt: &str, text: &str) -> Result<(), (i32, String)> {
         return Err((-32602, "Invalid input".to_string()));
     }
     let slot = IN_FLIGHT.lock();
-    let sent = slot
+    let Some(input) = slot
         .as_ref()
         .filter(|entry| entry.attempt == attempt)
         .and_then(|entry| entry.input.as_ref())
-        .is_some_and(|input| input.send(format!("{text}\n")).is_ok());
-    if sent {
-        Ok(())
-    } else {
-        Err((
+    else {
+        return Err((
             LOGIN_NOT_RUNNING,
             "No runtime sign-in with this attemptId is running".to_string(),
-        ))
+        ));
+    };
+    match input.try_send(format!("{text}\n")) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err((
+            LOGIN_BUSY,
+            "The sign-in command is not reading its input".to_string(),
+        )),
+        Err(TrySendError::Closed(_)) => Err((
+            LOGIN_NOT_RUNNING,
+            "No runtime sign-in with this attemptId is running".to_string(),
+        )),
     }
 }
 
@@ -262,7 +273,7 @@ async fn drive(
     })?;
     let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
     // The writer ends when the slot drops its sender, which every exit path does.
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(LOGIN_INPUT_QUEUE);
     let mut stdin = child.stdin.take().expect("stdin is piped");
     tokio::spawn(async move {
         while let Some(line) = input_rx.recv().await {
@@ -271,7 +282,7 @@ async fn drive(
             }
         }
     });
-    record_child(attempt, pgid, input_tx);
+    record_child(attempt, pgid, Some(input_tx));
     info!(attempt = %attempt, "runtime sign-in started");
 
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -296,6 +307,8 @@ async fn drive(
             return Err((LOGIN_FAILED, "Runtime sign-in timed out".to_string()));
         }
     };
+    // Nothing reads stdin any more; a line sent while stdout drains must not be acknowledged.
+    record_child(attempt, pgid, None);
     // End the group before waiting for EOF. A descendant that inherited stdout can hold
     // the pipe open long after the command itself exits, and by here the cancellation and
     // timeout arms are gone — so an unbounded drain would outlive both guarantees. Bytes
@@ -444,6 +457,58 @@ mod tests {
             send_input("attempt-i", "late").unwrap_err().0,
             LOGIN_NOT_RUNNING
         );
+    }
+
+    #[tokio::test]
+    async fn input_for_a_command_that_does_not_read_it_is_bounded() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let deaf = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+        };
+        let running = {
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move { run(&deaf, "attempt-q", "conn-1", &out_tx, None).await })
+        };
+        while IN_FLIGHT
+            .lock()
+            .as_ref()
+            .is_none_or(|entry| entry.input.is_none())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let line = "x".repeat(MAX_LOGIN_INPUT_BYTES);
+        let mut refused = None;
+        // The pipe buffer absorbs some lines before the queue itself fills.
+        for _ in 0..1000 {
+            if let Err((code, _)) = send_input("attempt-q", &line) {
+                refused = Some(code);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        assert_eq!(refused, Some(LOGIN_BUSY));
+        assert!(cancel(Some("attempt-q")));
+        let _ = running.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_exited_command_acknowledges_no_more_input() {
+        let _serialized = TEST_GUARD.lock().await;
+        assert!(claim("attempt-x", "conn-1").is_some());
+        let (input, _reader) = tokio::sync::mpsc::channel(LOGIN_INPUT_QUEUE);
+        record_child("attempt-x", None, Some(input));
+        send_input("attempt-x", "code#state").unwrap();
+
+        // What `drive` does the moment the command exits, before it drains stdout.
+        record_child("attempt-x", None, None);
+        assert_eq!(
+            send_input("attempt-x", "code#state").unwrap_err().0,
+            LOGIN_NOT_RUNNING
+        );
+        release("attempt-x");
     }
 
     #[tokio::test]
