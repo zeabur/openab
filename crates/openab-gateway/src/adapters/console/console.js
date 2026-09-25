@@ -250,16 +250,27 @@
     $('signin-device').hidden = true;
   }
 
+  function webUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+    } catch {
+      return null;
+    }
+  }
+
   function onFrame(frame) {
-    if (frame.type === 'authorize' && frame.url) {
-      $('signin-url').href = frame.url;
+    const authorizeUrl = webUrl(frame.url);
+    const verifyUrl = webUrl(frame.verificationUri);
+    if (frame.type === 'authorize' && authorizeUrl) {
+      $('signin-url').href = authorizeUrl;
       $('signin-link').hidden = false;
       $('signin-input-form').hidden = false;
       $('signin-message').textContent = 'Open the sign-in page, approve access, then paste the code it shows.';
-    } else if (frame.type === 'device' && frame.verificationUri) {
+    } else if (frame.type === 'device' && verifyUrl) {
       $('signin-code').textContent = frame.userCode || '';
-      $('signin-verify').href = frame.verificationUri;
-      $('signin-verify').textContent = frame.verificationUri;
+      $('signin-verify').href = verifyUrl;
+      $('signin-verify').textContent = verifyUrl;
       $('signin-device').hidden = false;
       $('signin-message').textContent = 'Waiting for you to approve the sign-in…';
     } else if (frame.type === 'authenticated') {

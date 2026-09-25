@@ -22,6 +22,8 @@ const CONSOLE_JS: &str = include_str!("console/console.js");
 const CONSOLE_CSS: &str = include_str!("console/console.css");
 const MAX_BUFFERED_FRAMES: usize = 32;
 const TOOLS_TIMEOUT_MS: u64 = 60_000;
+/// How often an idle event stream rechecks that its session has not expired.
+const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 /// Frame fields the page may see. Anything else a login command prints (a credential,
 /// for a command run without `--install`) never leaves the process.
 const FRAME_FIELDS: &[&str] = &[
@@ -64,6 +66,14 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
     let mut response = ([(header::CONTENT_TYPE, content_type)], body).into_response();
     security_headers(&mut response);
     response
+}
+
+/// What an open sign-in event stream is bound to: it ends as soon as its session does.
+struct StreamWatch {
+    console: Arc<super::runtime_console::RuntimeConsole>,
+    session: String,
+    signin: watch::Receiver<u64>,
+    sessions: watch::Receiver<u64>,
 }
 
 struct Signin {
@@ -192,24 +202,28 @@ async fn signin_events(
     Query(query): Query<AttemptQuery>,
 ) -> ApiResult {
     let ctx = ctx(&state)?;
-    if ctx.console.session(&headers).is_none() {
+    let Some(session) = ctx.console.session(&headers) else {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "login_required"));
-    }
-    let known = SIGNIN
-        .lock()
-        .as_ref()
-        .is_some_and(|s| s.attempt == query.attempt_id);
-    if !known {
+    };
+    if !console_owns(&query.attempt_id) {
         return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
     }
-    let changed = signin_changed().subscribe();
+    let watch = StreamWatch {
+        sessions: ctx.console.sessions_ended(),
+        console: ctx.console,
+        session: session.key,
+        signin: signin_changed().subscribe(),
+    };
     let stream = futures_util::stream::unfold(
-        (query.attempt_id, 0usize, false, changed),
-        |(attempt, mut sent, finished, mut changed)| async move {
+        (query.attempt_id, 0usize, false, watch),
+        |(attempt, mut sent, finished, mut watch)| async move {
             if finished {
                 return None;
             }
             loop {
+                if !watch.console.session_alive(&watch.session) {
+                    return None;
+                }
                 let next = {
                     let slot = SIGNIN.lock();
                     let signin = slot.as_ref().filter(|s| s.attempt == attempt)?;
@@ -231,11 +245,13 @@ async fn signin_events(
                     sent += 1;
                     return Some((
                         Ok::<_, std::convert::Infallible>(event),
-                        (attempt, sent, done, changed),
+                        (attempt, sent, done, watch),
                     ));
                 }
-                if changed.changed().await.is_err() {
-                    return None;
+                tokio::select! {
+                    changed = watch.signin.changed() => if changed.is_err() { return None },
+                    changed = watch.sessions.changed() => if changed.is_err() { return None },
+                    () = tokio::time::sleep(SESSION_RECHECK) => {}
                 }
             }
         },
@@ -544,6 +560,138 @@ mod tests {
         );
         assert!(runtime_login::cancel(Some("acp-attempt")));
         let _ = acp_signin.await;
+    }
+
+    #[tokio::test]
+    async fn a_signin_stream_ends_when_its_session_does() {
+        use crate::adapters::acp_server::{AcpConfig, LoginCommand, RuntimeJobs};
+        use crate::adapters::runtime_console::RuntimeConsole;
+        use crate::adapters::runtime_credentials::{temp_dir, CredentialStore};
+        use futures_util::StreamExt;
+        use tower::ServiceExt;
+
+        let _guard = runtime_login::TEST_GUARD.lock().await;
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        let mut state = crate::AppState::test_default(tx);
+        state.acp = Some(AcpConfig {
+            auth_key: None,
+            control_key: None,
+            allowed_origins: vec![],
+            login_command: Some(LoginCommand {
+                program: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    r#"printf '{"type":"device","userCode":"AB-CD","verificationUri":"https://example.test"}\n'; read line; printf '{"type":"authenticated"}\n'"#.into(),
+                ],
+            }),
+            auth_file: None,
+            runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
+            credentials: Some(Arc::new(CredentialStore::in_memory(None, None))),
+            console: Some(Arc::new(
+                RuntimeConsole::open(
+                    temp_dir("signin-session"),
+                    None,
+                    None,
+                    std::time::Duration::from_secs(60),
+                )
+                .unwrap(),
+            )),
+        });
+        let app = super::super::runtime_console::routes()
+            .merge(routes())
+            .with_state(Arc::new(state));
+
+        let (_, headers, _) = request(
+            &app,
+            "POST",
+            "/_openab/console/setup",
+            None,
+            None,
+            json!({"password": "correct-horse-battery"}),
+        )
+        .await;
+        let cookie = headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let (_, _, body) = request(
+            &app,
+            "GET",
+            "/_openab/console/state",
+            Some(&cookie),
+            None,
+            Value::Null,
+        )
+        .await;
+        let csrf = serde_json::from_str::<Value>(&body).unwrap()["csrfToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, _, body) = request(
+            &app,
+            "POST",
+            "/_openab/console/signin/start",
+            Some(&cookie),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        let attempt = serde_json::from_str::<Value>(&body).unwrap()["attemptId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let events = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/_openab/console/signin/events?attemptId={attempt}"
+                    ))
+                    .header("host", "agent.test")
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut stream = events.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+            .await
+            .expect("the device frame arrives")
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("AB-CD"));
+
+        let (status, _, _) = request(
+            &app,
+            "POST",
+            "/_openab/console/logout",
+            Some(&cookie),
+            Some(&csrf),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rest = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut rest = String::new();
+            while let Some(chunk) = stream.next().await {
+                rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            }
+            rest
+        })
+        .await
+        .expect("the stream ends with its session");
+        assert!(
+            !rest.contains("event:"),
+            "nothing more after logout: {rest}"
+        );
+
+        assert!(runtime_login::cancel(Some(&attempt)));
     }
 
     #[test]
