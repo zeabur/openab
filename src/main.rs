@@ -1579,6 +1579,7 @@ async fn main() -> anyhow::Result<()> {
                 let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
                 match openab_gateway::adapters::acp_server::acp_auth_ok_for_bind(
                     acp_key.as_deref(),
+                    openab_gateway::adapters::runtime_credentials::console_enabled(),
                     &listen_addr,
                 ) {
                     Ok(()) => {
