@@ -23,6 +23,8 @@ pub use runtime_login::LoginCommand;
 #[path = "runtime_job.rs"]
 mod runtime_job;
 pub use runtime_job::RuntimeJobs;
+#[path = "runtime_usage.rs"]
+mod runtime_usage;
 
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
@@ -233,6 +235,9 @@ pub struct AcpConfig {
     /// Allowlisted commands `_openab/runtime/job` may run (`OPENAB_RUNTIME_JOBS`) and the
     /// limits that bound them.
     pub runtime_jobs: RuntimeJobs,
+    /// Volumes whose used/total bytes `_openab/runtime/state` reports
+    /// (`OPENAB_RUNTIME_DISK_PATHS`, comma-separated). Empty → disk usage is `null`.
+    pub disk_paths: Vec<String>,
 }
 
 impl AcpConfig {
@@ -291,6 +296,14 @@ impl AcpConfig {
             login_command,
             auth_file,
             runtime_jobs: RuntimeJobs::from_env(),
+            disk_paths: std::env::var("OPENAB_RUNTIME_DISK_PATHS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -2326,11 +2339,20 @@ async fn handle_acp_connection(
                             snapshots.push(snapshot);
                         }
                     }
+                    let usage = runtime_usage::snapshot(
+                        state
+                            .acp
+                            .as_ref()
+                            .map(|acp| acp.disk_paths.clone())
+                            .unwrap_or_default(),
+                    )
+                    .await;
                     JsonRpcResponse::success(
                         id,
                         json!({
                             "sessions": snapshots,
                             "authenticated": runtime_authenticated(&state),
+                            "usage": usage,
                         }),
                     )
                 } else {
@@ -7307,6 +7329,7 @@ mod acp_ws_integration {
             login_command: None,
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
         });
         let reply_registry = new_reply_registry();
         state.acp_reply_registry = Some(reply_registry.clone());
@@ -7335,6 +7358,7 @@ mod acp_ws_integration {
             login_command: None,
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"state":"active","steeringSupported":true}) })
@@ -7404,6 +7428,7 @@ mod acp_ws_integration {
             login_command: None,
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
         });
         let registry = new_reply_registry();
         state.acp_reply_registry = Some(registry.clone());
@@ -7459,6 +7484,7 @@ mod acp_ws_integration {
             login_command: None,
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"epoch":"provider","state":"active","operation":"prompt"}) })
@@ -7532,6 +7558,7 @@ mod acp_ws_integration {
             }),
             auth_file: Some(credential.display().to_string()),
             runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let suspends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7587,7 +7614,21 @@ mod acp_ws_integration {
             json!({"jsonrpc":"2.0","id":9,"method":"_openab/runtime/state","params":{}}),
         )
         .await;
-        assert_eq!(recv(&mut operator).await["result"]["authenticated"], false);
+        let runtime_state = recv(&mut operator).await;
+        assert_eq!(runtime_state["result"]["authenticated"], false);
+        let usage = &runtime_state["result"]["usage"];
+        for key in [
+            "cpuMillicores",
+            "memoryBytes",
+            "diskUsedBytes",
+            "diskTotalBytes",
+        ] {
+            assert!(usage.get(key).is_some(), "{runtime_state}");
+        }
+        assert!(
+            usage["diskTotalBytes"].is_null(),
+            "no disk paths configured"
+        );
 
         send(&mut operator, login).await;
         let frame = recv(&mut operator).await;
@@ -7631,6 +7672,7 @@ mod acp_ws_integration {
             }),
             auth_file: None,
             runtime_jobs: RuntimeJobs::default(),
+            disk_paths: vec![],
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let app = axum::Router::new()
@@ -7706,6 +7748,7 @@ mod acp_ws_integration {
             login_command: None,
             auth_file: None,
             runtime_jobs: jobs,
+            disk_paths: vec![],
         });
         let app = axum::Router::new()
             .route("/acp", axum::routing::get(ws_upgrade))
