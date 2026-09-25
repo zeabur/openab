@@ -211,15 +211,18 @@ pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     source.is_some_and(|source| source == host)
 }
 
-fn read_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+/// Every console session token the request carries, under either cookie name. A
+/// browser that has used the console over both http and https can hold one of each.
+fn session_tokens(headers: &HeaderMap) -> Vec<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(key, _)| *key == name)
+        .filter(|(key, value)| (*key == SECURE_COOKIE || *key == PLAIN_COOKIE) && !value.is_empty())
         .map(|(_, value)| value)
+        .collect()
 }
 
 fn session_cookie(headers: &HeaderMap, token: &str, max_age: u64) -> HeaderValue {
@@ -388,28 +391,37 @@ impl RuntimeConsole {
     }
 
     pub(crate) fn session(&self, headers: &HeaderMap) -> Option<SessionInfo> {
-        let token =
-            read_cookie(headers, SECURE_COOKIE).or_else(|| read_cookie(headers, PLAIN_COOKIE))?;
-        let key = sha256_hex(token.as_bytes());
         let mut sessions = self.sessions.lock();
-        let session = sessions.get_mut(&key)?;
-        if session.last_seen.elapsed() >= SESSION_IDLE || session.created.elapsed() >= SESSION_MAX {
-            sessions.remove(&key);
-            return None;
+        for token in session_tokens(headers) {
+            let key = sha256_hex(token.as_bytes());
+            let Some(session) = sessions.get_mut(&key) else {
+                continue;
+            };
+            if session.last_seen.elapsed() >= SESSION_IDLE
+                || session.created.elapsed() >= SESSION_MAX
+            {
+                sessions.remove(&key);
+                continue;
+            }
+            session.last_seen = Instant::now();
+            return Some(SessionInfo {
+                key,
+                csrf: session.csrf.clone(),
+            });
         }
-        session.last_seen = Instant::now();
-        Some(SessionInfo {
-            key,
-            csrf: session.csrf.clone(),
-        })
+        None
     }
 
     fn end_other_sessions(&self, keep: &str) {
         self.sessions.lock().retain(|key, _| key == keep);
     }
 
-    fn end_session(&self, key: &str) {
-        self.sessions.lock().remove(key);
+    /// End every session the request presents, not only the one that authorized it.
+    fn end_presented_sessions(&self, headers: &HeaderMap) {
+        let mut sessions = self.sessions.lock();
+        for token in session_tokens(headers) {
+            sessions.remove(&sha256_hex(token.as_bytes()));
+        }
     }
 
     fn public_url(&self, headers: &HeaderMap) -> (Option<String>, &'static str) {
@@ -702,12 +714,18 @@ async fn logout_handler(
     headers: HeaderMap,
 ) -> ApiResult {
     let ctx = ctx(&state)?;
-    let session = authorize_write(&ctx, &headers)?;
-    ctx.console.end_session(&session.key);
+    authorize_write(&ctx, &headers)?;
+    ctx.console.end_presented_sessions(&headers);
     let mut response = Json(json!({"ok": true})).into_response();
-    response
-        .headers_mut()
-        .insert(header::SET_COOKIE, session_cookie(&headers, "", 0));
+    for expired in [
+        format!("{SECURE_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"),
+        format!("{PLAIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+    ] {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&expired).expect("cookie is ASCII"),
+        );
+    }
     Ok(response)
 }
 
@@ -848,8 +866,10 @@ async fn revoke_handler(
 ) -> ApiResult {
     let ctx = ctx(&state)?;
     authorize_write(&ctx, &headers)?;
-    if !ctx.store.revoke(&id) {
-        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    match ctx.store.revoke(&id) {
+        Ok(true) => {}
+        Ok(false) => return Err(ApiError(StatusCode::NOT_FOUND, "not_found")),
+        Err(_) => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "write_failed")),
     }
     Ok(Json(json!({"revoked": true})).into_response())
 }
@@ -1073,7 +1093,9 @@ mod tests {
         let code = minted.body["code"].as_str().unwrap();
         assert!(store.pairing.consume(code));
 
-        let issued = store.create_pending("Acme".into(), Default::default());
+        let issued = store
+            .create_pending("Acme".into(), Default::default())
+            .unwrap();
         let state = client.refresh_csrf().await;
         assert_eq!(state["bindings"][0]["id"], issued.id);
         assert!(state["bindings"][0].get("transportKeySha256").is_none());
@@ -1210,6 +1232,61 @@ mod tests {
             )
             .await;
         assert_eq!(login.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logout_ends_every_session_the_browser_presents() {
+        let store = Arc::new(CredentialStore::in_memory(None, None));
+        let console = new_console(temp_dir("logout"), Duration::from_secs(60));
+        let app = new_app(console, store);
+        let mut plain = Client::new(app.clone());
+        plain
+            .call(
+                "POST",
+                "/_openab/console/setup",
+                json!({"password": "correct-horse-battery"}),
+            )
+            .await;
+        let plain_cookie = plain.cookie.clone().unwrap();
+        let mut secure = Client::new(app.clone());
+        secure.https = true;
+        secure
+            .call(
+                "POST",
+                "/_openab/console/login",
+                json!({"password": "correct-horse-battery"}),
+            )
+            .await;
+        let secure_cookie = secure.cookie.clone().unwrap();
+
+        let mut both = Client::new(app.clone());
+        both.cookie = Some(format!("{secure_cookie}; {plain_cookie}"));
+        both.refresh_csrf().await;
+        let saved = both.cookie.clone();
+        let logout = both
+            .call("POST", "/_openab/console/logout", Value::Null)
+            .await;
+        assert_eq!(logout.status, StatusCode::OK);
+        let expired: Vec<_> = logout
+            .headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(expired
+            .iter()
+            .any(|c| c.starts_with("__Host-nuphos_console=;")));
+        assert!(expired.iter().any(|c| c.starts_with("nuphos_console=;")));
+
+        for cookie in [plain_cookie, secure_cookie, saved.unwrap()] {
+            let mut probe = Client::new(app.clone());
+            probe.cookie = Some(cookie);
+            let state = probe
+                .call("GET", "/_openab/console/state", Value::Null)
+                .await
+                .body;
+            assert_eq!(state["phase"], "login", "every presented session ended");
+        }
     }
 
     #[tokio::test]
