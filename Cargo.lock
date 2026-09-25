@@ -2622,6 +2622,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-tungstenite 0.21.0",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "urlencoding",

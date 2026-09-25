@@ -1588,6 +1588,9 @@ async fn main() -> anyhow::Result<()> {
                             "/acp",
                             axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
                         );
+                        if openab_gateway::adapters::runtime_credentials::console_enabled() {
+                            app = app.merge(openab_gateway::adapters::runtime_pairing::routes());
+                        }
                         unified_acp_mounted = true;
                     }
                     Err(e) => error!("unified: ACP endpoint NOT mounted: {e}"),
