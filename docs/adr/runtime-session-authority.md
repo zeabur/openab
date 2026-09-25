@@ -88,6 +88,16 @@ same credential file and the loser would silently win; a second request is refus
 it, kill the command's whole process group — a provider CLI launches children that hold
 the pipes open, so signalling only the parent leaves the sign-in running.
 
+Some providers end their browser flow with a code the user pastes back instead of a
+device code the CLI polls for. `_openab/runtime/login/input` with
+`{"attemptId": "…", "text": "…"}` writes `text` and a newline to the running command's
+stdin and answers `{"delivered": true}`. It sits behind the same `-32003` operator
+boundary; `text` must be one line of at most 4 KiB (`-32602` otherwise), and an
+`attemptId` that is not the running sign-in, or whose command has already exited, gets
+`-32008`. At most a few lines wait for a command that is not reading them; beyond that
+the method answers `-32005`. Input is never logged. A command that reads no stdin is
+otherwise unaffected.
+
 `_openab/runtime/job` runs one of the jobs the image lists in `OPENAB_RUNTIME_JOBS`,
 under the same `-32003` operator boundary. The caller names a job and never sends argv:
 

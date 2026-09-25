@@ -1980,6 +1980,7 @@ async fn handle_acp_connection(
                     | "_openab/runtime/state"
                     | "_openab/runtime/login"
                     | "_openab/runtime/login/cancel"
+                    | "_openab/runtime/login/input"
                     | "_openab/runtime/job"
                     | "_openab/runtime/job/cancel"
                     | "_openab/session/requests"
@@ -2337,7 +2338,9 @@ async fn handle_acp_connection(
                 };
                 let _ = out_tx.send(serde_json::to_string(&response).unwrap());
             }
-            "_openab/runtime/login" | "_openab/runtime/login/cancel" => {
+            "_openab/runtime/login"
+            | "_openab/runtime/login/cancel"
+            | "_openab/runtime/login/input" => {
                 let cancelling = req.method.ends_with("/cancel");
                 let attempt = req
                     .params
@@ -2358,6 +2361,22 @@ async fn handle_acp_connection(
                 if cancelling {
                     let signalled = runtime_login::cancel(attempt.as_deref());
                     let response = JsonRpcResponse::success(id, json!({"cancelled": signalled}));
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if req.method.ends_with("/input") {
+                    let text = req
+                        .params
+                        .as_ref()
+                        .and_then(|params| params["text"].as_str())
+                        .unwrap_or_default();
+                    let response = match runtime_login::send_input(
+                        attempt.as_deref().unwrap_or_default(),
+                        text,
+                    ) {
+                        Ok(()) => JsonRpcResponse::success(id, json!({"delivered": true})),
+                        Err((code, message)) => JsonRpcResponse::error(id, code, message),
+                    };
                     let _ = out_tx.send(serde_json::to_string(&response).unwrap());
                     continue;
                 }
@@ -7546,6 +7565,13 @@ mod acp_ws_integration {
         send(&mut ordinary, initialize.clone()).await;
         let _ = recv(&mut ordinary).await;
         send(&mut ordinary, login.clone()).await;
+        let refused = recv(&mut ordinary).await;
+        assert_eq!(refused["error"]["code"], -32003, "{refused}");
+        send(
+            &mut ordinary,
+            json!({"jsonrpc":"2.0","id":3,"method":"_openab/runtime/login/input","params":{"attemptId":"attempt-ws","text":"code#state"}}),
+        )
+        .await;
         let refused = recv(&mut ordinary).await;
         assert_eq!(refused["error"]["code"], -32003, "{refused}");
 
