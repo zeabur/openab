@@ -226,17 +226,17 @@ struct ExchangeRequest {
     client: BindingClient,
 }
 
+/// The team name, else the backend's host, whether the origin carries a scheme or not.
 fn binding_label(client: &BindingClient) -> String {
+    let host = client.backend_origin.as_deref().and_then(|origin| {
+        let rest = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        (!host.is_empty()).then(|| host.to_string())
+    });
     client
         .team_name
         .clone()
-        .or_else(|| {
-            client
-                .backend_origin
-                .as_deref()
-                .and_then(|o| o.split("://").nth(1))
-                .map(|host| host.trim_end_matches('/').to_string())
-        })
+        .or(host)
         .unwrap_or_else(|| "Nuphos".into())
 }
 
@@ -337,6 +337,33 @@ mod tests {
         assert_eq!(base32(b""), "");
         assert_eq!(base32(b"f"), "MY");
         assert_eq!(base32(b"foobar"), "MZXW6YTBOI");
+    }
+
+    #[test]
+    fn a_binding_is_labelled_by_team_else_backend_host() {
+        let origin = |o: &str| BindingClient {
+            backend_origin: Some(o.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            binding_label(&origin("https://api.nuphos.example/")),
+            "api.nuphos.example"
+        );
+        assert_eq!(
+            binding_label(&origin("api.nuphos.example")),
+            "api.nuphos.example"
+        );
+        assert_eq!(
+            binding_label(&origin("api.nuphos.example:8443/x")),
+            "api.nuphos.example:8443"
+        );
+        assert_eq!(binding_label(&origin("")), "Nuphos");
+        let named = BindingClient {
+            team_name: Some("Acme".into()),
+            ..origin("https://api.nuphos.example")
+        };
+        assert_eq!(binding_label(&named), "Acme");
+        assert_eq!(binding_label(&BindingClient::default()), "Nuphos");
     }
 
     #[test]
