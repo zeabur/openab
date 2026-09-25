@@ -32,6 +32,7 @@ parking_lot = "0.12"
 libc = "0.2"
 urlencoding = "2"
 rand = "0.8"
+argon2 = "0.5"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -16,6 +16,8 @@ pub mod lineworks;
 #[cfg(feature = "lineworks")]
 pub mod lineworks_flex;
 #[cfg(feature = "acp")]
+pub mod runtime_console;
+#[cfg(feature = "acp")]
 pub mod runtime_credentials;
 #[cfg(feature = "acp")]
 pub mod runtime_pairing;

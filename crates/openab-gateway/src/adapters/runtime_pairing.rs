@@ -63,14 +63,6 @@ impl RateLimiter {
         *count += 1;
         true
     }
-
-    /// Whether `key` could still make an attempt, without counting one.
-    pub fn would_allow(&self, key: &str) -> bool {
-        let state = self.state.lock();
-        let (started, total, per_key) = &*state;
-        started.elapsed() >= self.window
-            || (*total < self.global && per_key.get(key).copied().unwrap_or(0) < self.per_key)
-    }
 }
 
 pub fn base32(bytes: &[u8]) -> String {
@@ -397,7 +389,6 @@ mod tests {
         assert!(limiter.allow("a") && limiter.allow("a"));
         assert!(!limiter.allow("a"));
         assert!(limiter.allow("b"));
-        assert!(!limiter.would_allow("c"));
         assert!(!limiter.allow("c"), "the global budget is spent");
     }
 
@@ -413,6 +404,7 @@ mod tests {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: Some(store),
+            console: None,
         });
         routes().with_state(Arc::new(state))
     }

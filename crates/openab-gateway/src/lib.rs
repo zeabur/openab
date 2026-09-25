@@ -824,7 +824,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 info!("ACP server endpoint enabled at /acp");
                 app = app.route("/acp", get(adapters::acp_server::ws_upgrade));
                 if adapters::runtime_credentials::console_enabled() {
-                    app = app.merge(adapters::runtime_pairing::routes());
+                    app = app
+                        .merge(adapters::runtime_pairing::routes())
+                        .merge(adapters::runtime_console::routes());
                 }
                 acp_mounted = true;
             }

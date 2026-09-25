@@ -1589,7 +1589,9 @@ async fn main() -> anyhow::Result<()> {
                             axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
                         );
                         if openab_gateway::adapters::runtime_credentials::console_enabled() {
-                            app = app.merge(openab_gateway::adapters::runtime_pairing::routes());
+                            app = app
+                                .merge(openab_gateway::adapters::runtime_pairing::routes())
+                                .merge(openab_gateway::adapters::runtime_console::routes());
                         }
                         unified_acp_mounted = true;
                     }
