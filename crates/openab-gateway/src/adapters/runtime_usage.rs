@@ -21,7 +21,21 @@ struct CpuReading {
 
 static LAST_CPU: Mutex<Option<CpuReading>> = parking_lot::const_mutex(None);
 
-pub fn snapshot(disk_paths: &[String]) -> Value {
+/// Off the async worker: a configured network or FUSE mount can stall `statvfs`.
+pub async fn snapshot(disk_paths: Vec<String>) -> Value {
+    tokio::task::spawn_blocking(move || read_snapshot(&disk_paths))
+        .await
+        .unwrap_or_else(|_| {
+            json!({
+                "cpuMillicores": null,
+                "memoryBytes": null,
+                "diskUsedBytes": null,
+                "diskTotalBytes": null,
+            })
+        })
+}
+
+fn read_snapshot(disk_paths: &[String]) -> Value {
     let cgroup = Path::new(CGROUP_ROOT);
     let proc = Path::new(PROC_ROOT);
     let millicores = cpu_usage_usec(cgroup, proc)

@@ -2339,14 +2339,20 @@ async fn handle_acp_connection(
                             snapshots.push(snapshot);
                         }
                     }
+                    let usage = runtime_usage::snapshot(
+                        state
+                            .acp
+                            .as_ref()
+                            .map(|acp| acp.disk_paths.clone())
+                            .unwrap_or_default(),
+                    )
+                    .await;
                     JsonRpcResponse::success(
                         id,
                         json!({
                             "sessions": snapshots,
                             "authenticated": runtime_authenticated(&state),
-                            "usage": runtime_usage::snapshot(
-                                state.acp.as_ref().map_or(&[][..], |acp| &acp.disk_paths),
-                            ),
+                            "usage": usage,
                         }),
                     )
                 } else {
