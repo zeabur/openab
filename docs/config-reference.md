@@ -978,12 +978,42 @@ are read at startup; the methods they enable require `OPENAB_ACP_CONTROL_KEY` (s
 
 `GET /` serves a small unauthenticated HTML page confirming the process is up. It
 reports only non-secret facts — never a key, token or credential — so it is safe to
-open at the base URL with no password.
+open at the base URL with no password. With `OPENAB_RUNTIME_CONSOLE=true` the runtime
+console replaces it at `GET /` and keeps the same rows.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAB_RUNTIME_LABEL` | _(empty)_ | Free-form display label for the status page, e.g. `Claude Code` or `Codex`. Unset → the "Runtime" row is omitted. |
 | `OPENAB_RUNTIME_VERSION` | _(empty)_ | Display version for the status page, e.g. an image's release tag. Unset → the "Version" row is omitted. |
+
+### Runtime console
+
+Off by default. With `OPENAB_RUNTIME_CONSOLE=true` (and `OPENAB_ACP_ENABLED=true`), `GET /`
+becomes a password-protected console for the runtime's owner, and `/acp` authenticates
+against per-binding credentials instead of one shared key. The owner sets a password on
+first visit, then hands out single-use pairing codes; each application that exchanges
+one gets its own transport and control key, which the owner can revoke at any time. See
+`docs/adr/runtime-console-and-bindings.md`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAB_RUNTIME_CONSOLE` | `false` | Enable the console, pairing and per-binding `/acp` credentials. With it on, `/acp` is mounted on any bind (it rejects every upgrade until a binding or deployment key exists). |
+| `OPENAB_RUNTIME_STATE_DIR` | `$HOME/.openab-runtime` | Directory for `console.json` (password hash, setup time, public URL), `bindings.json` (key digests only) and `instance-id`. Created `0700`; files are `0600`. Put it on a persistent volume. |
+| `OPENAB_RUNTIME_LEGACY_KEY_FILE` | `<state dir>/auth-key` | A runtime password file from before the console. On first start it becomes the console password and a revocable `legacy-password` binding, so applications already using it keep working. Never rewritten. |
+| `OPENAB_RUNTIME_SETUP_WINDOW_SECS` | `1800` | How long after process start an uninitialized runtime accepts setup. After that setup is locked until the process restarts. |
+| `OPENAB_RUNTIME_PAIRING_TTL_SECS` | `600` | Lifetime of a pairing code. Codes are single-use, held in memory only, and at most 5 are outstanding. |
+| `OPENAB_RUNTIME_PUBLIC_URL` | _(empty)_ | The `/acp` URL pairing codes point at, e.g. `wss://agent.example.com/acp`. The console's own setting wins; unset → derived from the request's `X-Forwarded-Proto` and `Host`. |
+| `OPENAB_RUNTIME_CONNECT_URL_TEMPLATE` | _(empty)_ | Deep link opened after a code is minted, with `{url}`, `{code}` and `{exp}` (unix seconds) substituted, e.g. `nuphos://connect-runtime?url={url}&code={code}&exp={exp}`. Unset → the console shows the URL and code to copy. |
+| `OPENAB_RUNTIME_TOOLS_JOB` | `tools` | The `OPENAB_RUNTIME_JOBS` entry whose JSON stdout the console shows as the tool list. |
+
+`OPENAB_ACP_AUTH_KEY` and `OPENAB_ACP_CONTROL_KEY` keep working with the console on, as
+deployment principals the console lists but cannot revoke. With no `console.json`, the
+deployment key is also the console password until the owner changes it.
+
+To reset a forgotten console password, stop the runtime, delete `console.json` (and the
+legacy key file, if present) from the state directory and start it again: setup reopens
+for the setup window. Existing bindings keep working; delete `bindings.json` too to
+revoke them all.
 
 ### Platform Adapters
 
