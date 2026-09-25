@@ -18,12 +18,15 @@ use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+use super::runtime_pairing::PairingCodes;
+
 pub const TRANSPORT_PREFIX: &str = "nrt_";
 pub const CONTROL_PREFIX: &str = "nrc_";
 /// Must match `deriveRuntimeControlKey` in the Nuphos backend and the nuphos-runtime entrypoint.
 const LEGACY_CONTROL_CONTEXT: &[u8] = b"nuphos-runtime-control-v1";
 const LEGACY_BINDING_ID: &str = "legacy";
 const BINDINGS_FILE: &str = "bindings.json";
+const INSTANCE_ID_FILE: &str = "instance-id";
 const PENDING_TTL_SECS: i64 = 15 * 60;
 const LAST_USED_FLUSH: Duration = Duration::from_secs(5 * 60);
 
@@ -111,6 +114,8 @@ struct Inner {
 
 pub struct CredentialStore {
     dir: Option<PathBuf>,
+    instance_id: String,
+    pub pairing: PairingCodes,
     env_transport: Option<String>,
     env_control: Option<String>,
     inner: Mutex<Inner>,
@@ -197,6 +202,28 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
+fn load_instance_id(dir: &Path) -> std::io::Result<String> {
+    let path = dir.join(INSTANCE_ID_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if !existing.trim().is_empty() => return Ok(existing.trim().to_string()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let tmp = write_private_temp(&path, id.as_bytes())?;
+    // `hard_link` refuses to replace an existing file, so a concurrent writer's id wins.
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(id),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(std::fs::read_to_string(&path)?.trim().to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl CredentialStore {
     /// A store that persists nothing. For tests and for callers that only need env principals.
     pub fn in_memory(env_transport: Option<String>, env_control: Option<String>) -> Self {
@@ -210,8 +237,14 @@ impl CredentialStore {
         bindings: Vec<Binding>,
     ) -> Self {
         let (revocations, _) = broadcast::channel(64);
+        let instance_id = dir
+            .as_deref()
+            .and_then(|d| load_instance_id(d).map_err(|e| error!(error = %e, "runtime instance id could not be stored; using one for this process only")).ok())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         Self {
             dir,
+            instance_id,
+            pairing: PairingCodes::from_env(),
             env_transport: env_transport.filter(|k| !k.is_empty()),
             env_control: env_control.filter(|k| !k.is_empty()),
             inner: Mutex::new(Inner {
@@ -298,6 +331,12 @@ impl CredentialStore {
         if inner.bindings.len() != before {
             self.save_logged(inner);
         }
+    }
+
+    /// This runtime's stable identity, created once per state directory. It lets an
+    /// application recognise the same runtime behind a different URL.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     pub fn has_env_transport(&self) -> bool {
@@ -723,6 +762,15 @@ mod tests {
         let reopened = CredentialStore::open(dir, None, None, None).unwrap();
         assert!(reopened.contains(&issued.id));
         assert_eq!(reopened.list().len(), 1);
+    }
+
+    #[test]
+    fn the_instance_id_survives_a_restart() {
+        let dir = temp_dir("instance");
+        let first = CredentialStore::open(dir.clone(), None, None, None).unwrap();
+        let second = CredentialStore::open(dir, None, None, None).unwrap();
+        assert_eq!(first.instance_id(), second.instance_id());
+        assert!(uuid::Uuid::parse_str(first.instance_id()).is_ok());
     }
 
     #[test]
