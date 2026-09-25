@@ -7,11 +7,12 @@
 //! application can render the device prompt without ever holding the credential.
 //!
 //! OpenAB stays provider-agnostic: it knows only how to run
-//! `OPENAB_RUNTIME_LOGIN_COMMAND` and relay whatever JSON objects it prints.
+//! `OPENAB_RUNTIME_LOGIN_COMMAND`, relay whatever JSON objects it prints, and hand it
+//! the lines the operator sends back through `_openab/runtime/login/input`.
 
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
@@ -21,6 +22,8 @@ const MAX_LOGIN_FRAME_BYTES: usize = 128 * 1024;
 const LOGIN_TIMEOUT_SECS: u64 = 15 * 60;
 /// How long the pipe may still be drained after the command's group has been killed.
 const RELAY_DRAIN_SECS: u64 = 5;
+/// Cap on one line of operator input, such as an authorization code pasted back.
+const MAX_LOGIN_INPUT_BYTES: usize = 4096;
 /// Notification carrying one frame the login command printed.
 pub const LOGIN_FRAME_METHOD: &str = "_openab/runtime/login/frame";
 
@@ -30,6 +33,8 @@ pub const LOGIN_BUSY: i32 = -32005;
 pub const LOGIN_UNSUPPORTED: i32 = -32601;
 /// The command could not run, or ended without signing in.
 pub const LOGIN_FAILED: i32 = -32006;
+/// No sign-in with this `attemptId` is running, so there is nothing to hand input to.
+pub const LOGIN_NOT_RUNNING: i32 = -32008;
 
 /// The program and arguments `OPENAB_RUNTIME_LOGIN_COMMAND` names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +69,7 @@ struct InFlight {
     attempt: String,
     connection: String,
     pgid: Option<i32>,
+    input: Option<UnboundedSender<String>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -86,17 +92,46 @@ fn claim(attempt: &str, connection: &str) -> Option<tokio::sync::oneshot::Receiv
         attempt: attempt.to_string(),
         connection: connection.to_string(),
         pgid: None,
+        input: None,
         cancel: Some(tx),
     });
     Some(rx)
 }
 
-fn record_pgid(attempt: &str, pgid: Option<i32>) {
+fn record_child(attempt: &str, pgid: Option<i32>, input: UnboundedSender<String>) {
     let mut slot = IN_FLIGHT.lock();
     if let Some(entry) = slot.as_mut() {
         if entry.attempt == attempt {
             entry.pgid = pgid;
+            entry.input = Some(input);
         }
+    }
+}
+
+/// One line of input for the command: bounded, and without a line break of its own.
+pub fn valid_input(text: &str) -> bool {
+    !text.is_empty() && text.len() <= MAX_LOGIN_INPUT_BYTES && !text.contains(['\n', '\r'])
+}
+
+/// Write one line to the running sign-in's stdin — for a provider whose browser flow
+/// ends in a code the user pastes back. Never logged, for the same reason frames are not.
+pub fn send_input(attempt: &str, text: &str) -> Result<(), (i32, String)> {
+    if !valid_input(text) {
+        return Err((-32602, "Invalid input".to_string()));
+    }
+    let slot = IN_FLIGHT.lock();
+    let sent = slot
+        .as_ref()
+        .filter(|entry| entry.attempt == attempt)
+        .and_then(|entry| entry.input.as_ref())
+        .is_some_and(|input| input.send(format!("{text}\n")).is_ok());
+    if sent {
+        Ok(())
+    } else {
+        Err((
+            LOGIN_NOT_RUNNING,
+            "No runtime sign-in with this attemptId is running".to_string(),
+        ))
     }
 }
 
@@ -210,7 +245,7 @@ async fn drive(
     let mut builder = tokio::process::Command::new(&command.program);
     builder
         .args(&command.args)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         // Provider output can carry secrets and is not ours to interpret; only the
         // command's own NDJSON frames leave this process.
         .stderr(std::process::Stdio::null())
@@ -226,7 +261,17 @@ async fn drive(
         )
     })?;
     let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
-    record_pgid(attempt, pgid);
+    // The writer ends when the slot drops its sender, which every exit path does.
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    tokio::spawn(async move {
+        while let Some(line) = input_rx.recv().await {
+            if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    record_child(attempt, pgid, input_tx);
     info!(attempt = %attempt, "runtime sign-in started");
 
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -359,6 +404,46 @@ mod tests {
         let second: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
         assert_eq!(second["params"]["frame"]["type"], "authenticated");
         assert!(IN_FLIGHT.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn operator_input_reaches_the_running_command_as_one_line() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let echo = LoginCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "read line; printf '{\"type\":\"got\",\"line\":\"%s\"}\\n' \"$line\"".into(),
+            ],
+        };
+        let running = {
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move { run(&echo, "attempt-i", "conn-1", &out_tx, None).await })
+        };
+        while IN_FLIGHT
+            .lock()
+            .as_ref()
+            .is_none_or(|entry| entry.input.is_none())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(send_input("attempt-i", "two\nlines").unwrap_err().0, -32602);
+        assert_eq!(send_input("attempt-i", "").unwrap_err().0, -32602);
+        assert_eq!(
+            send_input("someone-else", "code#state").unwrap_err().0,
+            LOGIN_NOT_RUNNING
+        );
+        send_input("attempt-i", "code#state").unwrap();
+
+        assert_eq!(running.await.unwrap().unwrap()["exitCode"], 0);
+        let frame: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(frame["params"]["frame"]["line"], "code#state");
+        assert_eq!(
+            send_input("attempt-i", "late").unwrap_err().0,
+            LOGIN_NOT_RUNNING
+        );
     }
 
     #[tokio::test]
