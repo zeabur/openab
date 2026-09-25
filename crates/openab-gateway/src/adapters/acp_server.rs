@@ -245,6 +245,7 @@ pub struct AcpConfig {
     /// Per-binding credentials (`OPENAB_RUNTIME_CONSOLE`). When set, every `/acp` bearer is
     /// resolved here, deployment keys included.
     pub credentials: Option<Arc<CredentialStore>>,
+    pub console: Option<Arc<super::runtime_console::RuntimeConsole>>,
 }
 
 impl AcpConfig {
@@ -299,6 +300,9 @@ impl AcpConfig {
             .filter(|path| !path.trim().is_empty());
         let credentials =
             super::runtime_credentials::from_env(auth_key.as_ref(), control_key.as_ref());
+        let console = credentials
+            .as_ref()
+            .and_then(|_| super::runtime_console::from_env(auth_key.as_ref()));
         Some(Self {
             auth_key,
             control_key,
@@ -315,6 +319,7 @@ impl AcpConfig {
                 })
                 .unwrap_or_default(),
             credentials,
+            console,
         })
     }
 }
@@ -323,7 +328,7 @@ impl AcpConfig {
 /// `OPENAB_RUNTIME_AUTH_FILE` is configured — an operator who cannot answer the question
 /// must not be told "signed out", because a container can carry its own credential in a
 /// form OpenAB never sees.
-fn runtime_authenticated(state: &crate::AppState) -> Option<bool> {
+pub(crate) fn runtime_authenticated(state: &crate::AppState) -> Option<bool> {
     let path = state.acp.as_ref()?.auth_file.as_ref()?;
     Some(std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0))
 }
@@ -7426,6 +7431,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         let reply_registry = new_reply_registry();
         state.acp_reply_registry = Some(reply_registry.clone());
@@ -7456,6 +7462,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"state":"active","steeringSupported":true}) })
@@ -7527,6 +7534,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         let registry = new_reply_registry();
         state.acp_reply_registry = Some(registry.clone());
@@ -7584,6 +7592,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         state.acp_session_snapshot = Some(Arc::new(|_| {
             Box::pin(async { json!({"epoch":"provider","state":"active","operation":"prompt"}) })
@@ -7659,6 +7668,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let suspends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7774,6 +7784,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         state.acp_session_inventory = Some(Arc::new(|| Box::pin(async { vec![] })));
         let app = axum::Router::new()
@@ -7851,6 +7862,7 @@ mod acp_ws_integration {
             runtime_jobs: jobs,
             disk_paths: vec![],
             credentials: None,
+            console: None,
         });
         let app = axum::Router::new()
             .route("/acp", axum::routing::get(ws_upgrade))
@@ -10535,6 +10547,7 @@ mod acp_ws_integration {
             runtime_jobs: RuntimeJobs::default(),
             disk_paths: vec![],
             credentials: Some(store),
+            console: None,
         });
         let app = axum::Router::new()
             .route("/acp", axum::routing::get(ws_upgrade))
