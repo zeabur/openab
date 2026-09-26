@@ -2294,12 +2294,16 @@ async fn handle_acp_connection(
                             continue;
                         }
                     };
-                if let Some(channel) = req
+                let requested = req
                     .params
                     .as_ref()
                     .and_then(|p| p["sessionId"].as_str())
-                    .and_then(derive_channel_id)
-                {
+                    .unwrap_or_default();
+                let over_cap = {
+                    let guard = sessions.lock().await;
+                    !guard.contains_key(requested) && guard.len() >= MAX_SESSIONS_PER_CONNECTION
+                };
+                if let Some(channel) = derive_channel_id(requested).filter(|_| !over_cap) {
                     if !scope.claim(&channel) {
                         let resp = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
                         let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -10785,6 +10789,39 @@ mod acp_ws_integration {
             call(&mut b_transport, 20, "session/resume", resume(&sess_a)).await["result"]
                 .is_object(),
             "a revoked binding's sessions are released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_refused_by_the_session_cap_claims_nothing() {
+        let store = Arc::new(CredentialStore::in_memory(None, None));
+        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let url = serve_with_credentials(store.clone()).await;
+        let mut ws = connect_bearer(&url, &a.transport_key).await.unwrap();
+        initialize(&mut ws).await;
+        for n in 0..MAX_SESSIONS_PER_CONNECTION {
+            let session = format!("sess_{}", Uuid::new_v4());
+            let resumed = call(
+                &mut ws,
+                100 + n as u64,
+                "session/resume",
+                json!({"sessionId": session, "cwd": "/tmp"}),
+            )
+            .await;
+            assert!(resumed["result"].is_object(), "{resumed}");
+        }
+        let refused = format!("sess_{}", Uuid::new_v4());
+        let response = call(
+            &mut ws,
+            1,
+            "session/resume",
+            json!({"sessionId": refused, "cwd": "/tmp"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], ACP_OVERLOADED);
+        assert_eq!(
+            store.sessions.owner(&derive_channel_id(&refused).unwrap()),
+            None
         );
     }
 
