@@ -918,6 +918,7 @@ impl JsonRpcResponse {
 struct SessionScope {
     binding: Option<String>,
     store: Option<Arc<CredentialStore>>,
+    attached: Option<AcpReplyRegistry>,
 }
 
 impl SessionScope {
@@ -938,17 +939,43 @@ impl SessionScope {
                 .is_some_and(|c| self.owns(&c))
     }
 
-    /// Takes an unowned channel for this binding. False when another binding owns it.
-    fn claim(&self, channel: &str) -> bool {
-        match (&self.binding, &self.store) {
-            (None, _) => true,
-            (Some(binding), Some(store)) => store.sessions.claim(channel, binding),
-            (Some(_), None) => false,
+    /// Takes an unowned channel for this binding, or says why it cannot.
+    fn claim_or_refusal(&self, channel: &str) -> Option<(i32, &'static str)> {
+        match self.claim(channel) {
+            Ok(true) => None,
+            Err(_) => Some((-32603, OWNERSHIP_UNRECORDED)),
+            Ok(false) => {
+                let owned = self
+                    .store
+                    .as_ref()
+                    .is_some_and(|store| store.sessions.owner(channel).is_some());
+                Some(if owned {
+                    (-32003, FOREIGN_SESSION)
+                } else {
+                    (ACP_OVERLOADED, BINDING_SESSIONS_IN_USE)
+                })
+            }
         }
+    }
+
+    fn claim(&self, channel: &str) -> std::io::Result<bool> {
+        let (Some(binding), Some(store)) = (&self.binding, &self.store) else {
+            return Ok(self.binding.is_none());
+        };
+        store.sessions.claim(channel, binding, |c| {
+            self.attached.as_ref().is_some_and(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(c)
+            })
+        })
     }
 }
 
 const FOREIGN_SESSION: &str = "Session belongs to another runtime binding";
+const OWNERSHIP_UNRECORDED: &str = "Session ownership could not be recorded";
+const BINDING_SESSIONS_IN_USE: &str = "Too many sessions in use for this runtime binding";
 
 enum Resolution {
     Authorized(Principal),
@@ -1858,6 +1885,7 @@ async fn handle_acp_connection(
     let scope = SessionScope {
         binding: principal.session_scope().map(str::to_owned),
         store: credentials.clone(),
+        attached: state.acp_reply_registry.clone(),
     };
     let mut revocations = credentials
         .as_ref()
@@ -2227,8 +2255,13 @@ async fn handle_acp_connection(
                 };
                 let (resp, channel_id) =
                     handle_session_new(&sessions, id.clone(), http_mcp_servers, session_meta).await;
-                scope.claim(&channel_id);
                 let session_id = channel_id.replacen("acp_", "sess_", 1);
+                if let Some((code, message)) = scope.claim_or_refusal(&channel_id) {
+                    sessions.lock().await.remove(&session_id);
+                    let resp = JsonRpcResponse::error(id, code, message);
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
                 if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                     session.permission_relay = permission_relay_handle.clone();
                 }
@@ -2304,8 +2337,8 @@ async fn handle_acp_connection(
                     !guard.contains_key(requested) && guard.len() >= MAX_SESSIONS_PER_CONNECTION
                 };
                 if let Some(channel) = derive_channel_id(requested).filter(|_| !over_cap) {
-                    if !scope.claim(&channel) {
-                        let resp = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
+                    if let Some((code, message)) = scope.claim_or_refusal(&channel) {
+                        let resp = JsonRpcResponse::error(id, code, message);
                         let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                         continue;
                     }

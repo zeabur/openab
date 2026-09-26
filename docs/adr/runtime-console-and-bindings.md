@@ -57,7 +57,10 @@ recognise the same runtime behind a different URL.
 A session belongs to the binding that created it, or to the first binding that resumes a
 session nobody owns (one created before this ledger existed, or one whose binding was
 revoked). Ownership is kept in `OPENAB_RUNTIME_STATE_DIR/session-owners.json` so a
-restart does not hand sessions to whoever resumes first. A binding, with either of its
+restart does not hand sessions to whoever resumes first; a claim that cannot be written
+is refused (`-32603`) rather than kept only in memory. Each binding keeps at most 4096
+claims: past that its oldest session not attached to a connection is released, and a new
+session is refused (`-32000`) when all of them are attached. A binding, with either of its
 keys, only sees and acts on its own sessions: `_openab/runtime/state` lists only them,
 and `session/resume`, `session/cancel`, `_openab/session/state`, `_openab/session/steer`,
 `_openab/session/requests` and the session config methods answer `-32003` for another
