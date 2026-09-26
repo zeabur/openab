@@ -27,6 +27,7 @@ pub use runtime_job::RuntimeJobs;
 mod runtime_usage;
 
 use super::runtime_credentials::{CredentialStore, Principal, Role};
+use super::session_owners::Claim;
 use crate::schema::*;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -942,25 +943,20 @@ impl SessionScope {
     /// Takes an unowned channel for this binding, or says why it cannot.
     fn claim_or_refusal(&self, channel: &str) -> Option<(i32, &'static str)> {
         match self.claim(channel) {
-            Ok(true) => None,
+            Ok(Claim::Owned) => None,
+            Ok(Claim::Foreign) => Some((-32003, FOREIGN_SESSION)),
+            Ok(Claim::Full) => Some((ACP_OVERLOADED, BINDING_SESSIONS_IN_USE)),
             Err(_) => Some((-32603, OWNERSHIP_UNRECORDED)),
-            Ok(false) => {
-                let owned = self
-                    .store
-                    .as_ref()
-                    .is_some_and(|store| store.sessions.owner(channel).is_some());
-                Some(if owned {
-                    (-32003, FOREIGN_SESSION)
-                } else {
-                    (ACP_OVERLOADED, BINDING_SESSIONS_IN_USE)
-                })
-            }
         }
     }
 
-    fn claim(&self, channel: &str) -> std::io::Result<bool> {
+    fn claim(&self, channel: &str) -> std::io::Result<Claim> {
         let (Some(binding), Some(store)) = (&self.binding, &self.store) else {
-            return Ok(self.binding.is_none());
+            return Ok(if self.binding.is_none() {
+                Claim::Owned
+            } else {
+                Claim::Foreign
+            });
         };
         store.sessions.claim(channel, binding, |c| {
             self.attached.as_ref().is_some_and(|registry| {
@@ -10856,6 +10852,61 @@ mod acp_ws_integration {
             store.sessions.owner(&derive_channel_id(&refused).unwrap()),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_binding_with_every_session_attached_is_refused_a_new_one() {
+        let mut store = CredentialStore::in_memory(None, None);
+        store.sessions = super::super::session_owners::SessionOwners::default()
+            .with_limits(1, std::time::Duration::ZERO);
+        let store = Arc::new(store);
+        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let url = serve_with_credentials_and(store.clone(), |state| {
+            state.acp_reply_registry = Some(new_reply_registry());
+        })
+        .await;
+        let mut ws = connect_bearer(&url, &a.transport_key).await.unwrap();
+        initialize(&mut ws).await;
+        let new_session = json!({"cwd": "/tmp", "mcpServers": []});
+
+        let first = call(&mut ws, 2, "session/new", new_session.clone()).await;
+        assert!(first["result"]["sessionId"].is_string(), "{first}");
+        let second = call(&mut ws, 3, "session/new", new_session).await;
+        assert_eq!(second["error"]["code"], ACP_OVERLOADED, "{second}");
+        assert_eq!(second["error"]["message"], BINDING_SESSIONS_IN_USE);
+        assert_eq!(store.sessions.claimed_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_ownership_cannot_be_written_is_refused() {
+        let dir = std::env::temp_dir().join(format!("openab-acp-owners-{}", Uuid::new_v4()));
+        let store = Arc::new(CredentialStore::open(dir.clone(), None, None, None).unwrap());
+        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let url = serve_with_credentials(store.clone()).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+
+        let mut ws = connect_bearer(&url, &a.transport_key).await.unwrap();
+        initialize(&mut ws).await;
+        let created = call(
+            &mut ws,
+            2,
+            "session/new",
+            json!({"cwd": "/tmp", "mcpServers": []}),
+        )
+        .await;
+        assert_eq!(created["error"]["code"], -32603, "{created}");
+        assert_eq!(created["error"]["message"], OWNERSHIP_UNRECORDED);
+        let resumed = call(
+            &mut ws,
+            3,
+            "session/resume",
+            json!({"sessionId": format!("sess_{}", Uuid::new_v4()), "cwd": "/tmp"}),
+        )
+        .await;
+        assert_eq!(resumed["error"]["message"], OWNERSHIP_UNRECORDED);
+        assert_eq!(store.sessions.claimed_count(), 0);
+        let _ = std::fs::remove_file(dir);
     }
 
     #[test]
