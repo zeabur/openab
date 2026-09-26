@@ -34,6 +34,9 @@ pub mod wecom;
 pub mod session_snapshot;
 
 #[cfg(feature = "acp")]
+pub mod session_owners;
+
+#[cfg(feature = "acp")]
 pub mod session_requests;
 
 #[cfg(feature = "acp")]

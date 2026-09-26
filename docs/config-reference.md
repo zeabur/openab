@@ -998,7 +998,7 @@ one gets its own transport and control key, which the owner can revoke at any ti
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAB_RUNTIME_CONSOLE` | `false` | Enable the console, pairing and per-binding `/acp` credentials. With it on, `/acp` is mounted on any bind (it rejects every upgrade until a binding or deployment key exists). |
-| `OPENAB_RUNTIME_STATE_DIR` | `$HOME/.openab-runtime` | Directory for `console.json` (password hash, setup time, public URL), `bindings.json` (key digests only) and `instance-id`. Created `0700`; files are `0600`. Put it on a persistent volume. |
+| `OPENAB_RUNTIME_STATE_DIR` | `$HOME/.openab-runtime` | Directory for `console.json` (password hash, setup time, public URL), `bindings.json` (key digests only), `session-owners.json` (which binding owns each session) and `instance-id`. Created `0700`; files are `0600`. Put it on a persistent volume. |
 | `OPENAB_RUNTIME_LEGACY_KEY_FILE` | `<state dir>/auth-key` | A runtime password file from before the console. On first start it becomes the console password and a revocable `legacy-password` binding, so applications already using it keep working. Never rewritten. |
 | `OPENAB_RUNTIME_SETUP_WINDOW_SECS` | `1800` | How long after process start an uninitialized runtime accepts setup. After that setup is locked until the process restarts. |
 | `OPENAB_RUNTIME_PAIRING_TTL_SECS` | `600` | Lifetime of a pairing code. Codes are single-use, held in memory only, and at most 5 are outstanding. |
