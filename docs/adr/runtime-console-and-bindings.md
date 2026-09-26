@@ -52,6 +52,21 @@ application calls it when it forgets the runtime.
 `runtimeInstanceId` is a UUID created once per state directory. It lets an application
 recognise the same runtime behind a different URL.
 
+### Session scope
+
+A session belongs to the binding that created it, or to the first binding that resumes a
+session nobody owns (one created before this ledger existed, or one whose binding was
+revoked). Ownership is kept in `OPENAB_RUNTIME_STATE_DIR/session-owners.json` so a
+restart does not hand sessions to whoever resumes first. A binding, with either of its
+keys, only sees and acts on its own sessions: `_openab/runtime/state` lists only them,
+and `session/resume`, `session/cancel`, `_openab/session/state`, `_openab/session/steer`,
+`_openab/session/requests` and the session config methods answer `-32003` for another
+binding's session. Revoking a binding releases its sessions. Deployment keys and the
+`legacy-password` binding are single-tenant and keep seeing every session.
+
+Each snapshot in `_openab/runtime/state` carries its `sessionId`, so an application can
+match it against its own records.
+
 ### Console
 
 `GET /` serves a static page (HTML, CSS and JS embedded in the binary) and
@@ -85,11 +100,11 @@ recognise the same runtime behind a different URL.
 
 ## Consequences
 
-- Every binding shares one runtime: its filesystem, its sessions and its provider
-  account. A binding's control key can see and steer every session on the runtime, as
-  the single control key could before. Scoping the control channel per binding is a
-  possible follow-up; until then, connect a runtime only to applications that may
-  share it.
+- Bindings no longer see or act on each other's sessions, but they still share one
+  runtime: one filesystem, one provider sign-in and account, and runtime-wide jobs and
+  sign-in. An agent working for one binding can read and change files another
+  binding's agent wrote, and every binding spends the same provider account. Session
+  scope is not a sandbox; connect a runtime only to applications that may share it.
 - A pairing code handed to the wrong application binds the runtime to it. The code is
   short-lived and single-use, the binding shows up immediately in the console with the
   team and user it names, stays pending until first use, and can be revoked in one

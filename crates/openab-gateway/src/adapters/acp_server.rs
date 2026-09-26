@@ -912,6 +912,44 @@ impl JsonRpcResponse {
 // WebSocket upgrade handler: GET /acp
 // ---------------------------------------------------------------------------
 
+/// The sessions a connection may see and act on: every session for a single-tenant
+/// principal, otherwise only those its binding owns.
+#[derive(Clone)]
+struct SessionScope {
+    binding: Option<String>,
+    store: Option<Arc<CredentialStore>>,
+}
+
+impl SessionScope {
+    fn owns(&self, channel: &str) -> bool {
+        match (&self.binding, &self.store) {
+            (None, _) => true,
+            (Some(binding), Some(store)) => {
+                store.sessions.owner(channel).as_deref() == Some(binding.as_str())
+            }
+            (Some(_), None) => false,
+        }
+    }
+
+    fn owns_session(&self, session_id: Option<&str>) -> bool {
+        self.binding.is_none()
+            || session_id
+                .and_then(derive_channel_id)
+                .is_some_and(|c| self.owns(&c))
+    }
+
+    /// Takes an unowned channel for this binding. False when another binding owns it.
+    fn claim(&self, channel: &str) -> bool {
+        match (&self.binding, &self.store) {
+            (None, _) => true,
+            (Some(binding), Some(store)) => store.sessions.claim(channel, binding),
+            (Some(_), None) => false,
+        }
+    }
+}
+
+const FOREIGN_SESSION: &str = "Session belongs to another runtime binding";
+
 enum Resolution {
     Authorized(Principal),
     Unauthorized,
@@ -1817,6 +1855,10 @@ async fn handle_acp_connection(
 ) {
     let runtime_control = principal.role == Role::Control;
     let credentials = state.acp.as_ref().and_then(|c| c.credentials.clone());
+    let scope = SessionScope {
+        binding: principal.session_scope().map(str::to_owned),
+        store: credentials.clone(),
+    };
     let mut revocations = credentials
         .as_ref()
         .filter(|_| principal.binding_id.is_some())
@@ -2185,6 +2227,7 @@ async fn handle_acp_connection(
                 };
                 let (resp, channel_id) =
                     handle_session_new(&sessions, id.clone(), http_mcp_servers, session_meta).await;
+                scope.claim(&channel_id);
                 let session_id = channel_id.replacen("acp_", "sess_", 1);
                 if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                     session.permission_relay = permission_relay_handle.clone();
@@ -2251,6 +2294,22 @@ async fn handle_acp_connection(
                             continue;
                         }
                     };
+                let requested = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p["sessionId"].as_str())
+                    .unwrap_or_default();
+                let over_cap = {
+                    let guard = sessions.lock().await;
+                    !guard.contains_key(requested) && guard.len() >= MAX_SESSIONS_PER_CONNECTION
+                };
+                if let Some(channel) = derive_channel_id(requested).filter(|_| !over_cap) {
+                    if !scope.claim(&channel) {
+                        let resp = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
+                        let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                        continue;
+                    }
+                }
                 let permission_relay = permission_relay_requested(req.params.as_ref());
                 let permission_relay_handle = permission_relay.then(|| ClientRequestHandle {
                     out_tx: out_tx.clone(),
@@ -2423,11 +2482,13 @@ async fn handle_acp_connection(
                 } else if let Some(inventory) = &state.acp_session_inventory {
                     let mut channels = inventory().await;
                     channels.extend(state.acp_session_operations.channels());
+                    channels.retain(|channel| scope.owns(channel));
                     channels.sort();
                     channels.dedup();
                     let mut snapshots = Vec::new();
                     for channel in channels {
-                        if let Some(snapshot) = read_runtime_snapshot(&state, &channel).await {
+                        if let Some(mut snapshot) = read_runtime_snapshot(&state, &channel).await {
+                            snapshot["sessionId"] = json!(channel.replacen("acp_", "sess_", 1));
                             snapshots.push(snapshot);
                         }
                     }
@@ -2582,6 +2643,11 @@ async fn handle_acp_connection(
                 } else if let Some(params) = req.params.as_ref() {
                     if let Some(channel) = params["sessionId"].as_str().and_then(derive_channel_id)
                     {
+                        if !scope.owns(&channel) {
+                            let response = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
+                            let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
                         let snapshot = read_runtime_snapshot(&state, &channel).await;
                         if params["operation"] == "register"
                             && !snapshot.as_ref().is_some_and(|s| s["state"] == "active")
@@ -2610,11 +2676,16 @@ async fn handle_acp_connection(
                 let state = state.clone();
                 let out_tx = out_tx.clone();
                 let params = req.params.clone();
+                let scope = scope.clone();
                 tokio::spawn(async move {
                     let response = if !runtime_control {
                         JsonRpcResponse::error(id, -32003, "Runtime operator credential required")
                     } else if !initialized {
                         JsonRpcResponse::error(id, -32002, "Not initialized")
+                    } else if !scope
+                        .owns_session(params.as_ref().and_then(|p| p["sessionId"].as_str()))
+                    {
+                        JsonRpcResponse::error(id, -32003, FOREIGN_SESSION)
                     } else if let Some(params) = params.as_ref() {
                         let message_id = params["messageId"]
                             .as_str()
@@ -2704,6 +2775,11 @@ async fn handle_acp_connection(
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(Value::as_str);
+                if !scope.owns_session(session_id) {
+                    let response = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
+                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
                 if snapshots_enabled.load(Ordering::Acquire)
                     && !runtime_control
                     && !sessions
@@ -2847,6 +2923,11 @@ async fn handle_acp_connection(
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
                 }
+                if !scope.owns_session(req.params.as_ref().and_then(|p| p["sessionId"].as_str())) {
+                    let resp = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
+                    let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
                 // Keep the reader free to accept cancellations and permission
                 // replies while a setting is being acknowledged by the agent.
                 if prompt_tasks.len() >= MAX_INFLIGHT_PROMPTS {
@@ -2870,6 +2951,13 @@ async fn handle_acp_connection(
                 }));
             }
             "session/cancel" => {
+                if !scope.owns_session(req.params.as_ref().and_then(|p| p["sessionId"].as_str())) {
+                    if !is_notification {
+                        let response = JsonRpcResponse::error(id, -32003, FOREIGN_SESSION);
+                        let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+                    }
+                    continue;
+                }
                 if !runtime_control {
                     let session_id = req
                         .params
@@ -10536,6 +10624,13 @@ mod acp_ws_integration {
     }
 
     async fn serve_with_credentials(store: Arc<CredentialStore>) -> String {
+        serve_with_credentials_and(store, |_| {}).await
+    }
+
+    async fn serve_with_credentials_and(
+        store: Arc<CredentialStore>,
+        configure: impl FnOnce(&mut crate::AppState),
+    ) -> String {
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let mut state = crate::AppState::test_default(tx);
         state.acp = Some(AcpConfig {
@@ -10549,6 +10644,7 @@ mod acp_ws_integration {
             credentials: Some(store),
             console: None,
         });
+        configure(&mut state);
         let app = axum::Router::new()
             .route("/acp", axum::routing::get(ws_upgrade))
             .with_state(Arc::new(state));
@@ -10558,6 +10654,189 @@ mod acp_ws_integration {
             let _ = axum::serve(listener, app).await;
         });
         format!("ws://{addr}/acp")
+    }
+
+    async fn call(ws: &mut Ws, id: u64, method: &str, params: Value) -> Value {
+        send(
+            ws,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        loop {
+            let frame = recv(ws).await;
+            if frame["id"] == id {
+                return frame;
+            }
+        }
+    }
+
+    fn listed_sessions(state: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = state["result"]["sessions"]
+            .as_array()
+            .expect("runtime state lists sessions")
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn bindings_cannot_see_or_act_on_each_others_sessions() {
+        let deployment_control = "c".repeat(40);
+        let store = Arc::new(CredentialStore::in_memory(
+            None,
+            Some(deployment_control.clone()),
+        ));
+        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let b = store.create_pending("b".into(), Default::default()).unwrap();
+        let sess_a = format!("sess_{}", Uuid::new_v4());
+        let sess_b = format!("sess_{}", Uuid::new_v4());
+        let channels = vec![
+            derive_channel_id(&sess_a).unwrap(),
+            derive_channel_id(&sess_b).unwrap(),
+        ];
+        let url = serve_with_credentials_and(store.clone(), move |state| {
+            state.acp_session_snapshot = Some(Arc::new(|_| {
+                Box::pin(async { json!({"epoch":"p","state":"active","operation":"prompt"}) })
+            }));
+            state.acp_session_inventory = Some(Arc::new(move || {
+                let channels = channels.clone();
+                Box::pin(async move { channels })
+            }));
+        })
+        .await;
+
+        let mut a_transport = connect_bearer(&url, &a.transport_key).await.unwrap();
+        let mut a_control = connect_bearer(&url, &a.control_key).await.unwrap();
+        let mut b_transport = connect_bearer(&url, &b.transport_key).await.unwrap();
+        let mut b_control = connect_bearer(&url, &b.control_key).await.unwrap();
+        let mut operator = connect_bearer(&url, &deployment_control).await.unwrap();
+        for ws in [
+            &mut a_transport,
+            &mut a_control,
+            &mut b_transport,
+            &mut b_control,
+            &mut operator,
+        ] {
+            initialize(ws).await;
+        }
+        let resume = |session: &str| json!({"sessionId": session, "cwd": "/tmp"});
+
+        assert!(
+            call(&mut a_transport, 2, "session/resume", resume(&sess_a)).await["result"]
+                .is_object()
+        );
+        assert!(
+            call(&mut b_transport, 2, "session/resume", resume(&sess_b)).await["result"]
+                .is_object()
+        );
+        assert_eq!(
+            call(&mut b_transport, 3, "session/resume", resume(&sess_a)).await["error"]["code"],
+            -32003,
+            "a binding cannot take over another binding's session"
+        );
+
+        let a_state = call(&mut a_control, 2, "_openab/runtime/state", json!({})).await;
+        assert_eq!(listed_sessions(&a_state), vec![sess_a.clone()]);
+        let b_state = call(&mut b_control, 2, "_openab/runtime/state", json!({})).await;
+        assert_eq!(listed_sessions(&b_state), vec![sess_b.clone()]);
+        let everything = call(&mut operator, 2, "_openab/runtime/state", json!({})).await;
+        let mut both = vec![sess_a.clone(), sess_b.clone()];
+        both.sort();
+        assert_eq!(listed_sessions(&everything), both);
+
+        let text = json!([{"type":"text","text":"hi"}]);
+        let foreign = [
+            (
+                "_openab/session/steer",
+                json!({"sessionId": sess_a, "messageId": Uuid::new_v4().to_string(), "prompt": text}),
+            ),
+            (
+                "_openab/session/requests",
+                json!({"sessionId": sess_a, "operation": "resolve", "requestId": "r"}),
+            ),
+            ("_openab/session/state", json!({"sessionId": sess_a})),
+            (
+                "_openab/session/config_options",
+                json!({"sessionId": sess_a}),
+            ),
+            ("session/cancel", json!({"sessionId": sess_a})),
+        ];
+        for (n, (method, params)) in foreign.into_iter().enumerate() {
+            let response = call(&mut b_control, 10 + n as u64, method, params.clone()).await;
+            assert_eq!(
+                response["error"]["message"], FOREIGN_SESSION,
+                "{method}: {response}"
+            );
+            let response = call(&mut b_transport, 10 + n as u64, method, params).await;
+            assert_eq!(response["error"]["code"], -32003, "{method}: {response}");
+        }
+        assert_eq!(
+            call(
+                &mut a_control,
+                3,
+                "_openab/session/state",
+                json!({"sessionId": sess_a})
+            )
+            .await["result"]["state"],
+            "active",
+            "a binding still reaches its own session"
+        );
+
+        assert!(store.revoke(&a.id).unwrap());
+        assert!(
+            call(&mut b_transport, 20, "session/resume", resume(&sess_a)).await["result"]
+                .is_object(),
+            "a revoked binding's sessions are released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_refused_by_the_session_cap_claims_nothing() {
+        let store = Arc::new(CredentialStore::in_memory(None, None));
+        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let url = serve_with_credentials(store.clone()).await;
+        let mut ws = connect_bearer(&url, &a.transport_key).await.unwrap();
+        initialize(&mut ws).await;
+        for n in 0..MAX_SESSIONS_PER_CONNECTION {
+            let session = format!("sess_{}", Uuid::new_v4());
+            let resumed = call(
+                &mut ws,
+                100 + n as u64,
+                "session/resume",
+                json!({"sessionId": session, "cwd": "/tmp"}),
+            )
+            .await;
+            assert!(resumed["result"].is_object(), "{resumed}");
+        }
+        let refused = format!("sess_{}", Uuid::new_v4());
+        let response = call(
+            &mut ws,
+            1,
+            "session/resume",
+            json!({"sessionId": refused, "cwd": "/tmp"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], ACP_OVERLOADED);
+        assert_eq!(
+            store.sessions.owner(&derive_channel_id(&refused).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_legacy_binding_is_single_tenant() {
+        let principal = Principal {
+            binding_id: Some("legacy".into()),
+            role: Role::Control,
+        };
+        assert_eq!(principal.session_scope(), None);
+        let paired = Principal {
+            binding_id: Some("abc".into()),
+            role: Role::Transport,
+        };
+        assert_eq!(paired.session_scope(), Some("abc"));
     }
 
     async fn connect_bearer(url: &str, token: &str) -> Result<Ws, u16> {

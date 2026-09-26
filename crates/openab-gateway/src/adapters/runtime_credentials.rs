@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use super::runtime_pairing::PairingCodes;
+use super::session_owners::SessionOwners;
 
 pub const TRANSPORT_PREFIX: &str = "nrt_";
 pub const CONTROL_PREFIX: &str = "nrc_";
@@ -41,6 +42,16 @@ pub enum Role {
 pub struct Principal {
     pub binding_id: Option<String>,
     pub role: Role,
+}
+
+impl Principal {
+    /// The binding whose sessions this principal is confined to. Deployment keys and the
+    /// legacy-password binding are single-tenant and see every session.
+    pub fn session_scope(&self) -> Option<&str> {
+        self.binding_id
+            .as_deref()
+            .filter(|id| *id != LEGACY_BINDING_ID)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +127,7 @@ pub struct CredentialStore {
     dir: Option<PathBuf>,
     instance_id: String,
     pub pairing: PairingCodes,
+    pub sessions: SessionOwners,
     env_transport: Option<String>,
     env_control: Option<String>,
     inner: Mutex<Inner>,
@@ -227,7 +239,13 @@ fn load_instance_id(dir: &Path) -> std::io::Result<String> {
 impl CredentialStore {
     /// A store that persists nothing. For tests and for callers that only need env principals.
     pub fn in_memory(env_transport: Option<String>, env_control: Option<String>) -> Self {
-        Self::with_bindings(None, env_transport, env_control, Vec::new())
+        Self::with_bindings(
+            None,
+            env_transport,
+            env_control,
+            Vec::new(),
+            SessionOwners::default(),
+        )
     }
 
     fn with_bindings(
@@ -235,6 +253,7 @@ impl CredentialStore {
         env_transport: Option<String>,
         env_control: Option<String>,
         bindings: Vec<Binding>,
+        sessions: SessionOwners,
     ) -> Self {
         let (revocations, _) = broadcast::channel(64);
         let instance_id = dir
@@ -245,6 +264,7 @@ impl CredentialStore {
             dir,
             instance_id,
             pairing: PairingCodes::from_env(),
+            sessions,
             env_transport: env_transport.filter(|k| !k.is_empty()),
             env_control: env_control.filter(|k| !k.is_empty()),
             inner: Mutex::new(Inner {
@@ -280,7 +300,8 @@ impl CredentialStore {
             }
             Err(e) => return Err(e.into()),
         };
-        let store = Self::with_bindings(Some(dir), env_transport, env_control, bindings);
+        let sessions = SessionOwners::open(&dir)?;
+        let store = Self::with_bindings(Some(dir), env_transport, env_control, bindings, sessions);
         if imported {
             store.save(&store.inner.lock())?;
             info!("runtime credentials: imported the legacy runtime password as a binding");
@@ -461,6 +482,7 @@ impl CredentialStore {
         inner.last_flush = Instant::now();
         inner.unflushed_use = false;
         drop(inner);
+        self.sessions.release_binding(id);
         warn!(binding = %id, "runtime credentials: binding revoked");
         let _ = self.revocations.send(id.to_string());
         Ok(true)
