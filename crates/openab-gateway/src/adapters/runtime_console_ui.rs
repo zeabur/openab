@@ -82,8 +82,8 @@ struct Signin {
     result: Option<Value>,
 }
 
-/// The console's sign-in, if one has run since start. Only one can run at a time: the
-/// runtime's single login slot is shared with sign-ins started over `/acp`.
+/// The console's latest sign-in, if one has run since start. Starting another, here or
+/// over `/acp`, stops it.
 static SIGNIN: parking_lot::Mutex<Option<Signin>> = parking_lot::Mutex::new(None);
 static SIGNIN_CHANGED: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
 
@@ -111,25 +111,23 @@ fn record_frame(attempt: &str, notification: &str) {
     let Ok(message) = serde_json::from_str::<Value>(notification) else {
         return;
     };
-    let frame = visible_frame(&message["params"]["frame"]);
+    let frame = &message["params"]["frame"];
     let mut slot = SIGNIN.lock();
     if let Some(signin) = slot.as_mut().filter(|s| s.attempt == attempt) {
-        if signin.frames.len() < MAX_BUFFERED_FRAMES {
-            signin.frames.push(frame);
+        if frame["type"] == runtime_login::EXITED_FRAME {
+            signin.result = Some(json!({"ok": frame["exitCode"] == 0}));
+        } else if signin.frames.len() < MAX_BUFFERED_FRAMES {
+            signin.frames.push(visible_frame(frame));
         }
     }
     drop(slot);
     bump();
 }
 
-/// Whether `attempt` is the sign-in this console started. The login slot is shared with
-/// `/acp`, so an attempt id alone does not make a sign-in the console's to drive.
+/// Whether `attempt` is the sign-in this console started. Sign-ins started over `/acp`
+/// share the runtime, so an attempt id alone does not make one the console's to drive.
 fn console_owns(attempt: &str) -> bool {
     SIGNIN.lock().as_ref().is_some_and(|s| s.attempt == attempt)
-}
-
-fn busy() -> ApiError {
-    ApiError(StatusCode::CONFLICT, "signin_busy")
 }
 
 async fn signin_start(State(state): State<Arc<crate::AppState>>, headers: HeaderMap) -> ApiResult {
@@ -138,54 +136,34 @@ async fn signin_start(State(state): State<Arc<crate::AppState>>, headers: Header
     let Some(command) = state.acp.as_ref().and_then(|c| c.login_command.clone()) else {
         return Err(ApiError(StatusCode::BAD_REQUEST, "signin_unsupported"));
     };
-    if runtime_login::in_progress() {
-        return Err(busy());
-    }
     let attempt = random_hex(16);
-    {
-        let mut slot = SIGNIN.lock();
-        if slot.as_ref().is_some_and(|s| s.result.is_none()) {
-            return Err(busy());
-        }
-        *slot = Some(Signin {
-            attempt: attempt.clone(),
-            frames: Vec::new(),
-            result: None,
-        });
-    }
+    *SIGNIN.lock() = Some(Signin {
+        attempt: attempt.clone(),
+        frames: Vec::new(),
+        result: None,
+    });
     bump();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     let relay_attempt = attempt.clone();
-    let relay = tokio::spawn(async move {
+    tokio::spawn(async move {
         while let Some(notification) = out_rx.recv().await {
             record_frame(&relay_attempt, &notification);
         }
     });
-    let on_success = state.acp_runtime_suspend.clone();
-    let run_attempt = attempt.clone();
-    tokio::spawn(async move {
-        let outcome = runtime_login::run(
-            &command,
-            &run_attempt,
-            &format!("console:{run_attempt}"),
-            &out_tx,
-            on_success,
-        )
-        .await;
-        drop(out_tx);
-        let _ = relay.await;
-        let result = match outcome {
-            Ok(value) => json!({"ok": value["exitCode"] == 0}),
-            Err((code, _)) if code == runtime_login::LOGIN_BUSY => {
-                json!({"ok": false, "error": "signin_busy"})
-            }
-            Err(_) => json!({"ok": false, "error": "signin_failed"}),
-        };
-        if let Some(signin) = SIGNIN.lock().as_mut().filter(|s| s.attempt == run_attempt) {
-            signin.result = Some(result);
+    runtime_login::start(
+        &command,
+        &attempt,
+        &format!("console:{attempt}"),
+        out_tx,
+        state.acp_runtime_suspend.clone(),
+    )
+    .map_err(|_| {
+        if let Some(signin) = SIGNIN.lock().as_mut().filter(|s| s.attempt == attempt) {
+            signin.result = Some(json!({"ok": false}));
         }
         bump();
-    });
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "signin_failed")
+    })?;
     info!("runtime console: provider sign-in started");
     Ok(Json(json!({"attemptId": attempt})).into_response())
 }
@@ -285,7 +263,6 @@ async fn signin_input(
     runtime_login::send_input(&request.attempt_id, request.text.trim()).map_err(|(code, _)| {
         match code {
             runtime_login::LOGIN_NOT_RUNNING => ApiError(StatusCode::NOT_FOUND, "not_running"),
-            runtime_login::LOGIN_BUSY => busy(),
             _ => ApiError(StatusCode::BAD_REQUEST, "invalid_input"),
         }
     })?;
@@ -529,16 +506,17 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (acp_tx, _acp_rx) = mpsc::unbounded_channel();
-        let acp_signin = tokio::spawn(async move {
-            let command = LoginCommand {
+        runtime_login::start(
+            &LoginCommand {
                 program: "cat".into(),
                 args: vec![],
-            };
-            runtime_login::run(&command, "acp-attempt", "acp_conn_other", &acp_tx, None).await
-        });
-        while !runtime_login::in_progress() {
-            tokio::task::yield_now().await;
-        }
+            },
+            "acp-attempt",
+            "acp_conn_other",
+            acp_tx,
+            None,
+        )
+        .unwrap();
         for path in ["input", "cancel"] {
             let (status, _, body) = request(
                 &app,
@@ -555,11 +533,9 @@ mod tests {
             }
         }
         assert!(
-            runtime_login::in_progress(),
+            runtime_login::cancel(Some("acp-attempt")),
             "the /acp sign-in is untouched"
         );
-        assert!(runtime_login::cancel(Some("acp-attempt")));
-        let _ = acp_signin.await;
     }
 
     #[tokio::test]

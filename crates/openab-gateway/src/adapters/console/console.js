@@ -19,7 +19,6 @@
     setup_locked: 'The setup window has closed. Restart the agent to reopen it.',
     too_many_codes: 'Too many unused pairing codes. Wait for one to expire.',
     invalid_url: 'Enter an http(s):// or ws(s):// address.',
-    signin_busy: 'A sign-in started from Nuphos is in progress. Finish or cancel it there first.',
     signin_failed: 'The sign-in did not complete. Try again.',
     signin_unsupported: 'This agent has no sign-in command.',
     tools_unsupported: 'This agent does not report its tools.',

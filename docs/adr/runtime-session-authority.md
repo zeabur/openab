@@ -72,10 +72,13 @@ seeded from outside it. `_openab/runtime/login` closes that gap under the same o
 boundary as the rest of this ADR: it is refused without `OPENAB_ACP_CONTROL_KEY`, with
 the same `-32003` as inventory and the request store.
 
-The method runs `OPENAB_RUNTIME_LOGIN_COMMAND` inside the container and relays each
+The method starts `OPENAB_RUNTIME_LOGIN_COMMAND` inside the container, answers
+`{"started": true}` once it runs, and relays each
 JSON object the command prints on stdout as an `_openab/runtime/login/frame`
 notification, tagged with the caller's `attemptId`. OpenAB does not interpret those
-frames and never logs them: they carry a device code, and a provider may put the
+frames; it appends one of its own last, `{"type": "exited", "exitCode": N}`, with `-1`
+when the command was stopped or its output could not be read. A device flow waits on a
+person, so it never holds a request open. OpenAB never logs frames: they carry a device code, and a provider may put the
 credential itself in one. The credential belongs to the container — a command that
 installs it locally and reports only that it succeeded keeps it off the wire entirely,
 and that is the shape a runtime nobody provisioned should use. Frames are bounded at
@@ -83,9 +86,9 @@ and that is the shape a runtime nobody provisioned should use. Frames are bounde
 than growing a buffer the command controls.
 
 One sign-in runs at a time per runtime, because two device flows would race to write the
-same credential file and the loser would silently win; a second request is refused with
-`-32005`. `_openab/runtime/login/cancel`, and the close of the connection that started
-it, kill the command's whole process group — a provider CLI launches children that hold
+same credential file. The newest wins: starting a sign-in stops the one running, so an
+attempt its operator abandoned can never lock the next one out. That, `_openab/runtime/login/cancel`,
+and the close of the connection that started it, kill the command's whole process group — a provider CLI launches children that hold
 the pipes open, so signalling only the parent leaves the sign-in running.
 
 Some providers end their browser flow with a code the user pastes back instead of a
@@ -95,7 +98,7 @@ stdin and answers `{"delivered": true}`. It sits behind the same `-32003` operat
 boundary; `text` must be one line of at most 4 KiB (`-32602` otherwise), and an
 `attemptId` that is not the running sign-in, or whose command has already exited, gets
 `-32008`. At most a few lines wait for a command that is not reading them; beyond that
-the method answers `-32005`. Input is never logged. A command that reads no stdin is
+the method answers `-32006`. Input is never logged. A command that reads no stdin is
 otherwise unaffected.
 
 `_openab/runtime/job` runs one of the jobs the image lists in `OPENAB_RUNTIME_JOBS`,
