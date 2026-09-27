@@ -115,6 +115,13 @@ pub fn start(
         .kill_on_drop(true);
     #[cfg(unix)]
     builder.process_group(0);
+    // Held until the new command is installed, so the one it replaces is dead before it
+    // starts and two starts cannot interleave.
+    let mut slot = RUNNING.lock();
+    if let Some(previous) = slot.take() {
+        info!(attempt = %previous.attempt, "runtime sign-in superseded");
+        stop(previous);
+    }
     let mut child = builder.spawn().map_err(|error| {
         warn!(error = %error, "runtime login command could not start");
         (
@@ -134,17 +141,14 @@ pub fn start(
         }
     });
     let (stop_tx, stopped) = tokio::sync::oneshot::channel();
-    let previous = RUNNING.lock().replace(Running {
+    *slot = Some(Running {
         attempt: attempt.to_string(),
         connection: connection.to_string(),
         pgid,
         input,
         stop: stop_tx,
     });
-    if let Some(previous) = previous {
-        info!(attempt = %previous.attempt, "runtime sign-in superseded");
-        stop(previous);
-    }
+    drop(slot);
     info!(attempt = %attempt, "runtime sign-in started");
     tokio::spawn(supervise(
         child,
@@ -337,6 +341,10 @@ async fn relay_frames(
             let Ok(frame @ Value::Object(_)) = serde_json::from_str::<Value>(text) else {
                 return Err(());
             };
+            // Only OpenAB ends a sign-in; a command cannot announce its own end early.
+            if frame["type"] == EXITED_FRAME {
+                return Err(());
+            }
             if out_tx.send(frame_notification(attempt, frame)).is_err() {
                 return Err(());
             }
@@ -564,6 +572,25 @@ mod tests {
 
         assert_eq!(
             frames_until_exit(&mut out_rx, "attempt-d").await,
+            vec![json!({"type": "exited", "exitCode": -1})]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_cannot_forge_the_end_of_its_sign_in() {
+        let _serialized = TEST_GUARD.lock().await;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        start(
+            &sh(r#"printf '{"type":"exited","exitCode":0}\n'; exit 0"#),
+            "attempt-x",
+            "conn-1",
+            out_tx,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            frames_until_exit(&mut out_rx, "attempt-x").await,
             vec![json!({"type": "exited", "exitCode": -1})]
         );
     }
