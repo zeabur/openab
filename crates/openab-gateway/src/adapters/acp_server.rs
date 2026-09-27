@@ -2598,26 +2598,17 @@ async fn handle_acp_connection(
                     let _ = out_tx.send(serde_json::to_string(&response).unwrap());
                     continue;
                 };
-                // A device flow outlives every other request on this connection, so it
-                // owns a task; the reader stays free for its cancel.
-                let out_tx = out_tx.clone();
-                let connection_id = connection_id.clone();
-                let on_success = state.acp_runtime_suspend.clone();
-                prompt_tasks.push(tokio::spawn(async move {
-                    let response = match runtime_login::run(
-                        &command,
-                        &attempt,
-                        &connection_id,
-                        &out_tx,
-                        on_success,
-                    )
-                    .await
-                    {
-                        Ok(result) => JsonRpcResponse::success(id, result),
-                        Err((code, message)) => JsonRpcResponse::error(id, code, message),
-                    };
-                    let _ = out_tx.send(serde_json::to_string(&response).unwrap());
-                }));
+                let response = match runtime_login::start(
+                    &command,
+                    &attempt,
+                    &connection_id,
+                    out_tx.clone(),
+                    state.acp_runtime_suspend.clone(),
+                ) {
+                    Ok(()) => JsonRpcResponse::success(id, json!({"started": true})),
+                    Err((code, message)) => JsonRpcResponse::error(id, code, message),
+                };
+                let _ = out_tx.send(serde_json::to_string(&response).unwrap());
             }
             "_openab/runtime/job" | "_openab/runtime/job/cancel" => {
                 if !runtime_control {
@@ -7858,15 +7849,34 @@ mod acp_ws_integration {
         );
 
         send(&mut operator, login).await;
-        let frame = recv(&mut operator).await;
-        assert_eq!(frame["method"], runtime_login::LOGIN_FRAME_METHOD);
-        assert_eq!(frame["params"]["attemptId"], "attempt-ws");
-        assert_eq!(frame["params"]["frame"]["userCode"], "ABCD-1234");
-        let completion = recv(&mut operator).await;
-        assert_eq!(completion["id"], 2);
-        assert_eq!(completion["result"]["exitCode"], 0);
+        let mut started = None;
+        let mut frames = Vec::new();
+        while frames
+            .last()
+            .is_none_or(|frame: &Value| frame["type"] != "exited")
+        {
+            let message = recv(&mut operator).await;
+            if message["id"] == 2 {
+                started = Some(message);
+                continue;
+            }
+            assert_eq!(message["method"], runtime_login::LOGIN_FRAME_METHOD);
+            assert_eq!(message["params"]["attemptId"], "attempt-ws");
+            frames.push(message["params"]["frame"].clone());
+        }
+        if started.is_none() {
+            started = Some(recv(&mut operator).await);
+        }
+        // The call answers once the command runs; the device flow outlives it.
+        assert_eq!(started.unwrap()["result"]["started"], true);
         // The credential stayed in the container — only the device frame crossed the wire.
-        assert!(completion["result"].get("authJson").is_none());
+        assert_eq!(
+            frames,
+            vec![
+                json!({"type": "device", "userCode": "ABCD-1234"}),
+                json!({"type": "exited", "exitCode": 0}),
+            ]
+        );
         assert_eq!(suspends.load(Ordering::SeqCst), 1);
 
         send(
@@ -7878,9 +7888,8 @@ mod acp_ws_integration {
         let _ = std::fs::remove_file(&credential);
     }
 
-    /// The sign-in slot is runtime-wide, so a connection that dies mid-flow must hand it
-    /// back. Releasing it from the login task instead raced that connection's teardown,
-    /// and a lost race refused every later sign-in until the process restarted.
+    /// A connection that dies mid-flow ends its sign-in, and nothing it left behind
+    /// stands in the way of the next one.
     #[tokio::test]
     async fn a_dropped_connection_hands_its_sign_in_slot_to_the_next_one() {
         let _serialized = runtime_login::TEST_GUARD.lock().await;
@@ -7936,11 +7945,13 @@ mod acp_ws_integration {
             json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/login","params":{"attemptId":"abandoned"}}),
         )
         .await;
-        // The device frame proves the command is running, so the slot is genuinely taken.
-        assert_eq!(
-            recv(&mut abandoned).await["params"]["attemptId"],
-            "abandoned"
-        );
+        // The device frame proves the command is running.
+        loop {
+            let message = recv(&mut abandoned).await;
+            if message["params"]["attemptId"] == "abandoned" {
+                break;
+            }
+        }
         drop(abandoned);
 
         let mut successor = open().await;
@@ -7950,9 +7961,13 @@ mod acp_ws_integration {
             json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/login","params":{"attemptId":"successor"}}),
         )
         .await;
-        let frame = recv(&mut successor).await;
-
-        assert_eq!(frame["params"]["attemptId"], "successor", "{frame}");
+        loop {
+            let message = recv(&mut successor).await;
+            if message["params"]["frame"]["type"] == "device" {
+                assert_eq!(message["params"]["attemptId"], "successor", "{message}");
+                break;
+            }
+        }
         send(
             &mut successor,
             json!({"jsonrpc":"2.0","id":3,"method":"_openab/runtime/login/cancel","params":{"attemptId":"successor"}}),
@@ -7961,7 +7976,8 @@ mod acp_ws_integration {
         loop {
             let message = recv(&mut successor).await;
 
-            if message["id"] == 2 {
+            if message["params"]["frame"]["type"] == "exited" {
+                assert_eq!(message["params"]["frame"]["exitCode"], -1);
                 break;
             }
         }
@@ -10717,8 +10733,12 @@ mod acp_ws_integration {
             None,
             Some(deployment_control.clone()),
         ));
-        let a = store.create_pending("a".into(), Default::default()).unwrap();
-        let b = store.create_pending("b".into(), Default::default()).unwrap();
+        let a = store
+            .create_pending("a".into(), Default::default())
+            .unwrap();
+        let b = store
+            .create_pending("b".into(), Default::default())
+            .unwrap();
         let sess_a = format!("sess_{}", Uuid::new_v4());
         let sess_b = format!("sess_{}", Uuid::new_v4());
         let channels = vec![
@@ -10824,7 +10844,9 @@ mod acp_ws_integration {
     #[tokio::test]
     async fn a_resume_refused_by_the_session_cap_claims_nothing() {
         let store = Arc::new(CredentialStore::in_memory(None, None));
-        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let a = store
+            .create_pending("a".into(), Default::default())
+            .unwrap();
         let url = serve_with_credentials(store.clone()).await;
         let mut ws = connect_bearer(&url, &a.transport_key).await.unwrap();
         initialize(&mut ws).await;
@@ -10860,7 +10882,9 @@ mod acp_ws_integration {
         store.sessions = super::super::session_owners::SessionOwners::default()
             .with_limits(1, std::time::Duration::ZERO);
         let store = Arc::new(store);
-        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let a = store
+            .create_pending("a".into(), Default::default())
+            .unwrap();
         let url = serve_with_credentials_and(store.clone(), |state| {
             state.acp_reply_registry = Some(new_reply_registry());
         })
@@ -10881,7 +10905,9 @@ mod acp_ws_integration {
     async fn a_session_whose_ownership_cannot_be_written_is_refused() {
         let dir = std::env::temp_dir().join(format!("openab-acp-owners-{}", Uuid::new_v4()));
         let store = Arc::new(CredentialStore::open(dir.clone(), None, None, None).unwrap());
-        let a = store.create_pending("a".into(), Default::default()).unwrap();
+        let a = store
+            .create_pending("a".into(), Default::default())
+            .unwrap();
         let url = serve_with_credentials(store.clone()).await;
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::write(&dir, b"not a directory").unwrap();
@@ -10962,8 +10988,12 @@ mod acp_ws_integration {
     #[tokio::test]
     async fn each_binding_holds_its_own_role_and_revoking_one_closes_only_its_sockets() {
         let store = Arc::new(CredentialStore::in_memory(None, None));
-        let a = store.create_pending("a".into(), Default::default()).unwrap();
-        let b = store.create_pending("b".into(), Default::default()).unwrap();
+        let a = store
+            .create_pending("a".into(), Default::default())
+            .unwrap();
+        let b = store
+            .create_pending("b".into(), Default::default())
+            .unwrap();
         let url = serve_with_credentials(store.clone()).await;
 
         let mut a_transport = connect_bearer(&url, &a.transport_key).await.unwrap();

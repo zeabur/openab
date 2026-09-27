@@ -94,9 +94,9 @@ match it against its own records.
 - **Connect.** Minting a code returns the code, its expiry, the public `/acp` URL and,
   when `OPENAB_RUNTIME_CONNECT_URL_TEMPLATE` is set, a deep link into the application.
 - **Bindings** are listed live with their display metadata and can be revoked.
-- **Provider sign-in** runs `OPENAB_RUNTIME_LOGIN_COMMAND` through the same single
-  runtime-wide login slot as `_openab/runtime/login`, so a console sign-in and one
-  started over `/acp` exclude each other and the loser is told the runtime is busy.
+- **Provider sign-in** runs `OPENAB_RUNTIME_LOGIN_COMMAND` through the same
+  runtime-wide login as `_openab/runtime/login`: whichever starts last, here or over
+  `/acp`, stops the other.
   Frames reach the page over SSE with only display fields; a credential a command
   prints never leaves the process.
 - **Tools** come from the `OPENAB_RUNTIME_TOOLS_JOB` runtime job's JSON output.
