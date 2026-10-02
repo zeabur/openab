@@ -36,9 +36,6 @@ impl Terminals {
             if self.running.contains_key(id) {
                 return Err("Terminal already exists".into());
             }
-            if self.running.len() >= 16 {
-                return Err("Too many terminals".into());
-            }
             #[cfg(unix)]
             {
                 let tx = unix::start(id, params, output).map_err(|_| "Could not start terminal")?;
@@ -75,6 +72,9 @@ mod unix {
         process::Stdio,
     };
     use tokio::io::unix::AsyncFd;
+
+    // Shared across every ACP connection and backend replica connected to this process.
+    static CAPACITY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 
     fn size(value: &Value, fallback: u16) -> u16 {
         value
@@ -177,6 +177,9 @@ mod unix {
         params: &Value,
         output: UnboundedSender<String>,
     ) -> io::Result<mpsc::Sender<Value>> {
+        let permit = CAPACITY
+            .try_acquire()
+            .map_err(|_| io::Error::other("Too many terminals"))?;
         let session = params["sessionId"]
             .as_str()
             .filter(|s| super::super::runtime_login::valid_attempt_id(s))
@@ -230,6 +233,7 @@ mod unix {
         let (tx, mut rx) = mpsc::channel::<Value>(32);
         let id = id.to_string();
         tokio::spawn(async move {
+            let _permit = permit;
             let frame = |value: Value| {
                 output.send(json!({"jsonrpc":"2.0","method":FRAME_METHOD,"params":{"terminalId":id,"frame":value}}).to_string())
             };
@@ -292,6 +296,48 @@ mod tests {
     use super::*;
     use base64::Engine;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn pty_capacity_is_shared_across_connections_and_released_on_exit() {
+        let _guard = super::super::runtime_login::TEST_GUARD.lock().await;
+        let root = std::env::temp_dir().join(format!("runtime-pty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("OPENAB_RUNTIME_TERMINAL_CWD", &root);
+        std::env::set_var("OPENAB_RUNTIME_TERMINAL_HOME", &root);
+        let (out, mut frames) = mpsc::unbounded_channel();
+        let params = json!({"terminalId":"same-id-on-each-socket","sessionId":"conversation"});
+        let mut sockets = Vec::new();
+        for _ in 0..16 {
+            let mut socket = Terminals::new();
+            socket.request("/start", &params, out.clone()).unwrap();
+            sockets.push(socket);
+        }
+        let mut spare = Terminals::new();
+        assert!(spare.request("/start", &params, out.clone()).is_err());
+        drop(sockets.pop());
+        async fn exited(frames: &mut mpsc::UnboundedReceiver<String>) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let value: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                    if value["params"]["frame"]["type"] == "exit" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        exited(&mut frames).await;
+        spare.request("/start", &params, out).unwrap();
+        drop(spare);
+        drop(sockets);
+        for _ in 0..16 {
+            exited(&mut frames).await;
+        }
+        std::env::remove_var("OPENAB_RUNTIME_TERMINAL_CWD");
+        std::env::remove_var("OPENAB_RUNTIME_TERMINAL_HOME");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn duplicate_and_future_acknowledgements_do_not_release_output() {

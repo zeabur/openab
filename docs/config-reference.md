@@ -1035,3 +1035,5 @@ Each platform is auto-enabled when its env vars are present:
 > ⚠️ **Google Chat JWT**: When `GOOGLE_CHAT_AUDIENCE` is unset, webhook requests are **not** verified via JWT. Set this to your Google Chat app's project number or service account email in production to enable request authentication. If `GOOGLE_CHAT_SA_KEY_FILE` is set but the file cannot be read, the adapter starts without token authentication (warn logged).
 
 Terminal data frames carry a monotonic `sequence`; `/ack` echoes the highest received sequence. Duplicate, stale and future acknowledgements do not release output credit.
+
+Interactive PTYs share a runtime-process limit of 16 across all ACP connections. A slot remains held until the PTY process is reaped; opening another connection cannot bypass this limit.
