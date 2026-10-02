@@ -8110,7 +8110,7 @@ mod acp_ws_integration {
                 let value = recv(&mut operator).await;
                 if let Some(data) = value["params"]["frame"]["data"].as_str() {
                     text.push_str(&String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()));
-                    send(&mut operator,json!({"jsonrpc":"2.0","id":id,"method":"_openab/runtime/terminal/ack","params":{"terminalId":"one"}})).await;
+                    send(&mut operator,json!({"jsonrpc":"2.0","id":id,"method":"_openab/runtime/terminal/ack","params":{"terminalId":"one","sequence":value["params"]["frame"]["sequence"]}})).await;
                     id += 1;
                 }
             }

@@ -104,14 +104,14 @@ mod unix {
         let home = root
             .join(".nuphos/session-homes")
             .join(format!("{:x}", Sha256::digest(session.as_bytes())));
+        use std::os::unix::fs::PermissionsExt;
         for dir in [home.parent().unwrap(), home.as_path()] {
             std::fs::create_dir_all(dir)?;
             if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
                 return Err(io::Error::other("Invalid session home"));
             }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
         let home = home.to_string_lossy().into_owned();
         let mut env = std::collections::HashMap::from([
             ("HOME".into(), home.clone()),
@@ -234,21 +234,24 @@ mod unix {
                 output.send(json!({"jsonrpc":"2.0","method":FRAME_METHOD,"params":{"terminalId":id,"frame":value}}).to_string())
             };
             let mut buffer = [0u8; 4096];
-            let mut pending_output = 0usize;
+            let mut sent = 0u64;
+            let mut acknowledged = 0u64;
             loop {
                 tokio::select! {
 
                     input = rx.recv() => {
                         let Some(input) = input else { break; };
                         if input["method"].as_str().is_some_and(|s|s.ends_with("/ack")) {
-                            pending_output = pending_output.saturating_sub(1);
+                            if let Some(sequence) = input["params"]["sequence"].as_u64() {
+                                if sequence > acknowledged && sequence <= sent { acknowledged = sequence; }
+                            }
                         } else if input["method"].as_str().is_some_and(|s|s.ends_with("/resize")) {
                             if resize(master.get_ref().as_raw_fd(),&input["params"]).is_err() { break; }
                         } else if let Some(data) = input["params"]["data"].as_str() {
                             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(1), write_input(&master, data.as_bytes())).await, Ok(Ok(()))) { break; }
                         }
                     }
-                    ready = master.readable(), if pending_output < 8 => {
+                    ready = master.readable(), if sent - acknowledged < 8 => {
                         let Ok(mut ready) = ready else { break; };
                         let result = ready.try_io(|fd| {
                             let n = unsafe { libc::read(fd.get_ref().as_raw_fd(),buffer.as_mut_ptr().cast(),buffer.len()) };
@@ -257,8 +260,8 @@ mod unix {
                         match result {
                             Ok(Ok(n)) if n > 0 => {
                                 use base64::Engine;
-                                pending_output += 1;
-                                if frame(json!({"type":"data","data":base64::engine::general_purpose::STANDARD.encode(&buffer[..n])})).is_err() { break; }
+                                sent += 1;
+                                if frame(json!({"type":"data","sequence":sent,"data":base64::engine::general_purpose::STANDARD.encode(&buffer[..n])})).is_err() { break; }
                             }
                             Ok(_) => break,
                             Err(_) => {}
@@ -291,6 +294,72 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn duplicate_and_future_acknowledgements_do_not_release_output() {
+        // Runtime login and terminal tests share process-global environment variables.
+        let _guard = super::super::runtime_login::TEST_GUARD.lock().await;
+        let root = std::env::temp_dir().join(format!("runtime-pty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("OPENAB_RUNTIME_TERMINAL_CWD", &root);
+        std::env::set_var("OPENAB_RUNTIME_TERMINAL_HOME", &root);
+        let (out, mut frames) = mpsc::unbounded_channel();
+        let tx = unix::start("flow", &json!({"sessionId":"conversation"}), out).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(root.join(".nuphos/session-homes"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        tx.send(json!({"method":"/input","params":{"data":"yes output\n"}}))
+            .await
+            .unwrap();
+        for expected in 1..=8 {
+            let raw = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let value: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(value["params"]["frame"]["sequence"], expected);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), frames.recv())
+                .await
+                .is_err()
+        );
+        tx.send(json!({"method":"/ack","params":{"sequence":1}}))
+            .await
+            .unwrap();
+        let raw = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["params"]["frame"]["sequence"], 9);
+        for sequence in [1, 1, 0, 1000] {
+            tx.send(json!({"method":"/ack","params":{"sequence":sequence}}))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), frames.recv())
+                .await
+                .is_err()
+        );
+        drop(tx);
+        let raw = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["params"]["frame"]["type"], "exit");
+        std::env::remove_var("OPENAB_RUNTIME_TERMINAL_CWD");
+        std::env::remove_var("OPENAB_RUNTIME_TERMINAL_HOME");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn pty_input_resize_interrupt_and_disconnect() {
         let _guard = super::super::runtime_login::TEST_GUARD.lock().await;
         let root = std::env::temp_dir().join(format!("runtime-pty-{}", uuid::Uuid::new_v4()));
@@ -316,7 +385,7 @@ mod tests {
                 while !text.contains(needle) {
                     let value: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
                     if let Some(data) = value["params"]["frame"]["data"].as_str() {
-                        tx.send(json!({"method":"/ack"})).await.unwrap();
+                        tx.send(json!({"method":"/ack","params":{"sequence":value["params"]["frame"]["sequence"]}})).await.unwrap();
                         text.push_str(&String::from_utf8_lossy(
                             &base64::engine::general_purpose::STANDARD
                                 .decode(data)

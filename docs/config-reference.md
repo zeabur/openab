@@ -1033,3 +1033,5 @@ Each platform is auto-enabled when its env vars are present:
 > ⚠️ **Production checklist**: Set `GATEWAY_ALLOW_ALL_CHANNELS=false` and `GATEWAY_ALLOW_ALL_USERS=false` with explicit allowlists. The defaults are permissive for development convenience.
 >
 > ⚠️ **Google Chat JWT**: When `GOOGLE_CHAT_AUDIENCE` is unset, webhook requests are **not** verified via JWT. Set this to your Google Chat app's project number or service account email in production to enable request authentication. If `GOOGLE_CHAT_SA_KEY_FILE` is set but the file cannot be read, the adapter starts without token authentication (warn logged).
+
+Terminal data frames carry a monotonic `sequence`; `/ack` echoes the highest received sequence. Duplicate, stale and future acknowledgements do not release output credit.
