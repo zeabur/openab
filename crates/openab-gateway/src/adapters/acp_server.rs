@@ -20,6 +20,9 @@ pub use automation::{observe_runtime_reply, SessionAutomation};
 pub(crate) mod runtime_login;
 pub use runtime_login::LoginCommand;
 
+#[path = "runtime_terminal.rs"]
+mod runtime_terminal;
+
 #[path = "runtime_job.rs"]
 pub(crate) mod runtime_job;
 pub use runtime_job::RuntimeJobs;
@@ -419,6 +422,17 @@ pub(crate) fn acp_trace_enabled() -> bool {
 /// Truncate a frame for trace logging so a large prompt/reply doesn't dump a huge line
 /// (and doesn't record the *complete* content). Keeps the first `CAP` scalar values.
 fn trace_frame(s: &str) -> std::borrow::Cow<'_, str> {
+    if serde_json::from_str::<Value>(s)
+        .ok()
+        .and_then(|v| {
+            v["method"]
+                .as_str()
+                .map(|m| m.starts_with("_openab/runtime/terminal/"))
+        })
+        .unwrap_or(false)
+    {
+        return std::borrow::Cow::Borrowed("[runtime terminal frame redacted]");
+    }
     const CAP: usize = 512;
     let total = s.chars().count();
     if total <= CAP {
@@ -1923,6 +1937,7 @@ async fn handle_acp_connection(
     // Monotonic id source for server-initiated requests (mcp/connect, mcp/message).
     let next_req_id = Arc::new(AtomicU64::new(1));
     let mut initialized = false;
+    let mut terminals = runtime_terminal::Terminals::new();
 
     // Track spawned prompt tasks so we can abort on disconnect
     let mut prompt_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -2152,6 +2167,11 @@ async fn handle_acp_connection(
                     | "_openab/runtime/login"
                     | "_openab/runtime/login/cancel"
                     | "_openab/runtime/login/input"
+                    | "_openab/runtime/terminal/start"
+                    | "_openab/runtime/terminal/ack"
+                    | "_openab/runtime/terminal/input"
+                    | "_openab/runtime/terminal/resize"
+                    | "_openab/runtime/terminal/close"
                     | "_openab/runtime/job"
                     | "_openab/runtime/job/cancel"
                     | "_openab/session/requests"
@@ -2167,6 +2187,10 @@ async fn handle_acp_connection(
         match req.method.as_str() {
             "initialize" => {
                 let mut resp = handle_initialize(&req, mcp_enabled);
+                if let Some(result) = resp.result.as_mut() {
+                    result["agentCapabilities"]["_meta"]["dev.openab/runtimeTerminal"] =
+                        json!(runtime_terminal::enabled());
+                }
                 if state.acp_pool_config.is_some() {
                     if let Some(result) = resp.result.as_mut() {
                         result["agentCapabilities"]["_meta"]["dev.openab/sessionConfig"] =
@@ -2539,6 +2563,27 @@ async fn handle_acp_connection(
                     )
                 } else {
                     JsonRpcResponse::error(id, -32601, "Runtime inventory unavailable")
+                };
+                let _ = out_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            "_openab/runtime/terminal/start"
+            | "_openab/runtime/terminal/ack"
+            | "_openab/runtime/terminal/input"
+            | "_openab/runtime/terminal/resize"
+            | "_openab/runtime/terminal/close" => {
+                let response = if !runtime_control {
+                    JsonRpcResponse::error(id, -32003, "Runtime operator credential required")
+                } else if !initialized {
+                    JsonRpcResponse::error(id, -32002, "Not initialized")
+                } else {
+                    match terminals.request(
+                        &req.method,
+                        req.params.as_ref().unwrap_or(&Value::Null),
+                        out_tx.clone(),
+                    ) {
+                        Ok(value) => JsonRpcResponse::success(id, value),
+                        Err(message) => JsonRpcResponse::error(id, -32006, &message),
+                    }
                 };
                 let _ = out_tx.send(serde_json::to_string(&response).unwrap());
             }
@@ -3044,6 +3089,7 @@ async fn handle_acp_connection(
 
     // A device sign-in this connection started has nobody left to answer its prompt.
     // The Kubernetes exec channel it replaces died with its request; match that.
+    drop(terminals);
     runtime_login::cancel_for_connection(&connection_id);
     runtime_job::cancel_for_connection(&connection_id);
 
@@ -8022,6 +8068,57 @@ mod acp_ws_integration {
         .await;
         let initialized = recv(&mut ws).await;
         (ws, initialized)
+    }
+
+    #[tokio::test]
+    async fn runtime_terminal_requires_operator_and_redacts_input() {
+        let address = serve_runtime_jobs(RuntimeJobs::default()).await;
+        let (mut ordinary, _) = open_with_key(address, "ordinary-fixture").await;
+        let request = json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/terminal/input","params":{"terminalId":"one","data":"secret-password"}});
+        send(&mut ordinary, request.clone()).await;
+        assert_eq!(recv(&mut ordinary).await["error"]["code"], -32003);
+        assert!(!trace_frame(&request.to_string()).contains("secret-password"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_terminal_streams_over_the_operator_socket() {
+        use base64::Engine;
+        let _guard = runtime_login::TEST_GUARD.lock().await;
+        let root = std::env::temp_dir().join(format!("terminal-ws-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("OPENAB_RUNTIME_TERMINAL_CWD", &root);
+        std::env::set_var("OPENAB_RUNTIME_TERMINAL_HOME", &root);
+        let address = serve_runtime_jobs(RuntimeJobs::default()).await;
+        let (mut operator, initialized) =
+            open_with_key(address, "operator-fixture-key-that-is-long-enough").await;
+        assert_eq!(
+            initialized["result"]["agentCapabilities"]["_meta"]["dev.openab/runtimeTerminal"],
+            true
+        );
+        send(&mut operator,json!({"jsonrpc":"2.0","id":2,"method":"_openab/runtime/terminal/start","params":{"terminalId":"one","sessionId":"conversation"}})).await;
+        loop {
+            if recv(&mut operator).await["id"] == 2 {
+                break;
+            }
+        }
+        send(&mut operator,json!({"jsonrpc":"2.0","id":3,"method":"_openab/runtime/terminal/input","params":{"terminalId":"one","data":"printf '\\nOVER_ACP\\n'\n"}})).await;
+        let mut text = String::new();
+        let mut id = 4;
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            while !text.contains("\r\nOVER_ACP\r\n") {
+                let value = recv(&mut operator).await;
+                if let Some(data) = value["params"]["frame"]["data"].as_str() {
+                    text.push_str(&String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()));
+                    send(&mut operator,json!({"jsonrpc":"2.0","id":id,"method":"_openab/runtime/terminal/ack","params":{"terminalId":"one"}})).await;
+                    id += 1;
+                }
+            }
+        }).await.unwrap();
+        operator.close(None).await.unwrap();
+        std::env::remove_var("OPENAB_RUNTIME_TERMINAL_CWD");
+        std::env::remove_var("OPENAB_RUNTIME_TERMINAL_HOME");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn sh_job(script: &str) -> LoginCommand {
