@@ -47,6 +47,7 @@ pub struct SessionCtx {
 /// operator's grant: sources are code-wired by the broker, so unlike
 /// `mcp.json` servers there is no per-source `tool_filter` — do not register
 /// a source whose full tool set you don't intend to expose.
+#[allow(clippy::double_must_use)] // async-trait adds must_use to generated Future returns.
 #[async_trait::async_trait]
 pub trait CapabilitySource: Send + Sync {
     /// Provider label surfaced in discovery entries and audit lines.
