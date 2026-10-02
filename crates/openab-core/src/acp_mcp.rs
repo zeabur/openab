@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 /// capability source (`src/acp_tunnel_source.rs`) — nothing here consumes it, and this module
 /// hosts no proxy. Keeping the trait in core with the impl in root preserves the core/gateway
 /// sibling independence, matching the existing `ChatAdapter` pattern.
+#[allow(clippy::double_must_use)] // async-trait adds must_use to generated Future returns.
 #[async_trait::async_trait]
 pub trait AcpMcpTunnel: Send + Sync {
     /// Forward an inner MCP request (e.g. `tools/call`) to the client MCP server identified by
