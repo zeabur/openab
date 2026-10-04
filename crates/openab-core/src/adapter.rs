@@ -323,6 +323,7 @@ pub struct SenderContext {
 
 // --- ChatAdapter trait ---
 
+#[allow(clippy::double_must_use)] // async-trait adds must_use to generated Future returns.
 #[async_trait]
 pub trait ChatAdapter: Send + Sync + 'static {
     /// Platform name for logging and session key namespacing.

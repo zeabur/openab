@@ -45,6 +45,8 @@ impl OutboundBudget {
 
     /// Reserve `n` bytes, or refuse. Refusal is not an error state: the caller
     /// treats it exactly like a full queue (the peer is disconnected).
+    // Keep compatibility with builder toolchains predating AtomicUsize::try_update.
+    #[allow(deprecated)]
     fn reserve(&self, n: usize) -> bool {
         self.reserved
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {

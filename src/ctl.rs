@@ -59,6 +59,7 @@ pub struct Response {
 /// Handler trait — `openab run` provides the concrete implementation that
 /// can access Discord/Slack adapters.
 #[cfg(unix)]
+#[allow(clippy::double_must_use)] // async-trait adds must_use to generated Future returns.
 #[async_trait::async_trait]
 pub trait CtlHandler: Send + Sync + 'static {
     async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response;

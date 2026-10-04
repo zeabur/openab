@@ -127,6 +127,7 @@ impl ThreadHandle {
 /// spinning up a real `SessionPool` (which forks ACP CLI subprocesses).
 /// `AdapterRouter` is the production implementor; tests use a mock that
 /// records calls.
+#[allow(clippy::double_must_use)] // async-trait adds must_use to generated Future returns.
 #[async_trait]
 pub trait DispatchTarget: Send + Sync + 'static {
     fn reactions_config(&self) -> &ReactionsConfig;
