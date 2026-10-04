@@ -524,7 +524,8 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
             loop {
                 match std::fs::rename(&tmp, path) {
                     Err(err)
-                        if retries > 0 && matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33)) =>
+                        if retries > 0
+                            && matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33)) =>
                     {
                         // A denied replacement can surface as ACCESS_DENIED,
                         // SHARING_VIOLATION, or LOCK_VIOLATION on Windows.
