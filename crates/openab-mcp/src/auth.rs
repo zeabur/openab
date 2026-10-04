@@ -1955,9 +1955,7 @@ mod tests {
 
     #[test]
     fn test_auth_path() {
-        assert!(auth_path()
-            .to_string_lossy()
-            .contains(".openab/agent/auth.json"));
+        assert!(auth_path().ends_with(".openab/agent/auth.json"));
     }
 
     #[test]
