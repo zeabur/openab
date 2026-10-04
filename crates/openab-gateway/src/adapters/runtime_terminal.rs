@@ -419,7 +419,7 @@ mod tests {
             out,
         )
         .unwrap();
-        tx.send(json!({"method":"/input","params":{"data":"stty -echo; test -t 0 && printf '\\nPTY_READY\\n'; stty size\n"}})).await.unwrap();
+        tx.send(json!({"method":"/input","params":{"data":"PS1='PTY_PROMPT>'; stty -echo; test -t 0 && printf '\\nPTY_READY\\n'; stty size\n"}})).await.unwrap();
         let mut text = String::new();
         async fn until(
             frames: &mut mpsc::UnboundedReceiver<String>,
@@ -443,7 +443,8 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("missing {needle:?}, output {text:?}"));
         }
-        until(&mut frames, &tx, &mut text, "\r\n24 80\r\n").await;
+        // Wait for the shell to finish its initial command before resizing.
+        until(&mut frames, &tx, &mut text, "\r\n24 80\r\nPTY_PROMPT>").await;
         assert!(text.contains("\r\nPTY_READY\r\n"));
         tx.send(json!({"method":"/resize","params":{"rows":35,"cols":120}}))
             .await
