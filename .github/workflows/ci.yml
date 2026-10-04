@@ -107,6 +107,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2026-03-12)
       - name: Check MCP runtime on Windows
         run: cargo check -p openab-mcp --locked
+      - name: Test credential locking and writes on Windows
+        run: cargo test -p openab-mcp --locked auth::tests::
 
   operator:
     needs: changes
