@@ -511,7 +511,31 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    let renamed = {
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&tmp, path)
+        }
+        #[cfg(windows)]
+        {
+            // AV scanners can briefly deny delete-sharing on the destination.
+            // Keep the atomic replacement and global lock; retry for at most 500ms.
+            let mut retries = 10;
+            loop {
+                match std::fs::rename(&tmp, path) {
+                    Err(err)
+                        if retries > 0 && matches!(err.raw_os_error(), Some(32) | Some(33)) =>
+                    {
+                        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION only.
+                        retries -= 1;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    result => break result,
+                }
+            }
+        }
+    };
+    if let Err(e) = renamed {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -1573,6 +1597,64 @@ mod tests {
         assert_eq!(token_of(map.get("codex")).expires_at, 49);
         assert_eq!(token_of(map.get(ANTHROPIC_NAMESPACE)).expires_at, 49);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_retries_after_external_handle_is_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut map = HashMap::from([("codex".into(), AuthEntry::Token(make_store(1)))]);
+        write_auth_file(&path, &map).unwrap();
+        // Permit read/write but deny delete-sharing, like an external scanner.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        map.insert("codex".into(), AuthEntry::Token(make_store(2)));
+        write_auth_file(&path, &map).unwrap();
+        release.join().unwrap();
+        assert_eq!(
+            token_of(read_auth_file(&path).unwrap().get("codex")).expires_at,
+            2
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_timeout_preserves_original_and_cleans_temp_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut map = HashMap::from([("codex".into(), AuthEntry::Token(make_store(1)))]);
+        write_auth_file(&path, &map).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        map.insert("codex".into(), AuthEntry::Token(make_store(2)));
+        let started = std::time::Instant::now();
+        assert!(write_auth_file(&path, &map).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(
+            token_of(read_auth_file(&path).unwrap().get("codex")).expires_at,
+            1
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        drop(held);
+        write_auth_file(&path, &map).unwrap();
+        assert_eq!(
+            token_of(read_auth_file(&path).unwrap().get("codex")).expires_at,
+            2
+        );
     }
 
     #[tokio::test]
