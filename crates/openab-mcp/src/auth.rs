@@ -571,8 +571,8 @@ fn lock_path_for(auth: &Path, suffix: &str) -> PathBuf {
 
 /// RAII guard releasing the advisory lock on drop. The kernel also drops it on
 /// fd close / process death, so a crashed holder never wedges the file.
-#[cfg(unix)]
 pub(crate) struct AuthFileLock {
+    #[cfg(unix)]
     file: std::fs::File,
 }
 
