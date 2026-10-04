@@ -108,7 +108,7 @@ jobs:
       - name: Check MCP runtime on Windows
         run: cargo check -p openab-mcp --locked
       - name: Test credential locking and writes on Windows
-        run: cargo test -p openab-mcp --locked auth::tests::
+        run: 'cargo test -p openab-mcp --locked auth::tests::'
 
   operator:
     needs: changes
