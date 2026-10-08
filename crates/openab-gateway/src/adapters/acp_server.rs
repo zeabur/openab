@@ -453,7 +453,9 @@ fn steering_prompt(params: &Value) -> Option<&Vec<Value>> {
                 Some("text") => b["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
                 Some("resource_link") => {
                     b["name"].as_str().is_some()
-                        && b["uri"].as_str().is_some_and(|uri| uri.starts_with("file:///"))
+                        && b["uri"].as_str().and_then(|uri| uri.get(..8)).is_some_and(
+                            |scheme| scheme.eq_ignore_ascii_case("file:///"),
+                        )
                 }
                 _ => false,
             })
@@ -7626,6 +7628,8 @@ mod acp_ws_integration {
         assert!(steering_prompt(&json!({"prompt":[{"type":"resource_link","uri":""}]})).is_none());
         let unnamed = json!({"type":"resource_link","uri":"file:///tmp/shot.png"});
         assert!(steering_prompt(&json!({ "prompt": [unnamed] })).is_none());
+        let upper = json!({"type":"resource_link","uri":"FILE:///tmp/a.png","name":"a.png"});
+        assert!(steering_prompt(&json!({ "prompt": [upper] })).is_some());
         let remote = json!({"type":"resource_link","uri":"https://e/x","name":"x"});
         assert!(steering_prompt(&json!({ "prompt": [remote] })).is_none());
         assert!(steering_prompt(&json!({"prompt":[text, {"type":"audio","data":"x"}]})).is_none());
