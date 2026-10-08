@@ -73,12 +73,18 @@ fn apply_terminal_fields(tool: &mut Value, update: &Value) {
         appended.push_str(delta);
         terminal.insert("output".into(), json!(appended));
     }
-    if let Some(exit) = update.pointer("/_meta/terminal_exit") {
-        terminal.insert("exit".into(), exit.clone());
-        terminal.insert("status".into(), json!("exited"));
-    } else if !terminal.contains_key("status") {
-        terminal.insert("status".into(), json!("running"));
-    }
+    // An exited terminal leaves the snapshot with its tool, so a tracked one is running.
+    terminal.insert("status".into(), json!("running"));
+}
+
+/// A cancelled turn's tools are over: adapters kill them without reporting a
+/// terminal status, so left alone they would show as running forever. Tools an
+/// earlier turn left running in the background are not part of it and stay.
+fn end_cancelled_tools(snapshot: &mut Value) {
+    snapshot["tools"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|_, tool| tool["background"] == true);
 }
 
 pub struct SessionState(Mutex<Value>);
@@ -131,6 +137,9 @@ impl SessionState {
 
     pub fn operation(&self, operation: &str) {
         self.change(|snapshot| {
+            if snapshot["operation"] == "cancelling" && operation != "cancelling" {
+                end_cancelled_tools(snapshot);
+            }
             snapshot["operation"] = json!(operation);
             if operation == "prompt" {
                 // Keep background tools visible across turns, but reset model activity.
@@ -230,13 +239,14 @@ impl SessionState {
                     if let Some(provider) = provider {
                         // Preserve unfamiliar provider states instead of silently hiding them.
                         snapshot["providerState"] = json!(provider);
+                        if provider == "idle" && snapshot["operation"] == "cancelling" {
+                            end_cancelled_tools(snapshot);
+                            snapshot["operation"] = json!("none");
+                        }
                         if provider == "idle" {
                             for tool in snapshot["tools"].as_object_mut().unwrap().values_mut() {
                                 tool["background"] = json!(true);
                             }
-                        }
-                        if provider == "idle" && snapshot["operation"] == "cancelling" {
-                            snapshot["operation"] = json!("none");
                         }
                         snapshot["state"] = json!(match provider {
                             "active" => "active",
@@ -268,10 +278,12 @@ impl SessionState {
                 Some("tool_call" | "tool_call_update") => {
                     if let Some(id) = update["toolCallId"].as_str() {
                         let status = update["status"].as_str();
+                        // A terminal exit ends the tool even when no terminal status follows.
                         if matches!(
                             status,
                             Some("completed" | "failed" | "cancelled" | "stopped")
-                        ) {
+                        ) || update.pointer("/_meta/terminal_exit").is_some()
+                        {
                             snapshot["tools"].as_object_mut().unwrap().remove(id);
                         } else {
                             let tools = snapshot["tools"].as_object_mut().unwrap();
@@ -321,6 +333,51 @@ mod tests {
         state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call_update","toolCallId":"bg","status":"completed"}})));
         assert_eq!(state.snapshot()["state"], "idle");
         assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn a_tool_call_that_already_exited_is_never_tracked() {
+        let state = SessionState::default();
+        state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"in_progress","content":[{"type":"terminal","terminalId":"term"}],"_meta":{"terminal_exit":{"exitCode":0}}}})));
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn cancelling_a_turn_keeps_an_earlier_turns_background_tool() {
+        let state = SessionState::default();
+        state.operation("prompt");
+        state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call","toolCallId":"bg","status":"in_progress"}})));
+        state.operation("none");
+        state.set("idle");
+        state.observe(Some(&json!({"update":{"sessionUpdate":"session_info_update","_meta":{"ai.nuphos/sessionState":{"state":"idle"}}}})));
+        state.operation("prompt");
+        state.observe(Some(
+            &json!({"update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"pending"}}),
+        ));
+        state.operation("cancelling");
+        state.operation("none");
+        let tools = state.snapshot()["tools"].clone();
+        assert_eq!(
+            tools.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["bg"]
+        );
+    }
+    #[test]
+    fn cancelling_a_turn_ends_its_tools_whichever_signal_comes_first() {
+        let running = json!({"update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"pending","content":[{"type":"terminal","terminalId":"term"}]}});
+
+        let state = SessionState::default();
+        state.operation("prompt");
+        state.observe(Some(&running));
+        state.operation("cancelling");
+        state.operation("none");
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+
+        let state = SessionState::default();
+        state.operation("prompt");
+        state.observe(Some(&running));
+        state.operation("cancelling");
+        state.observe(Some(&json!({"update":{"sessionUpdate":"session_info_update","_meta":{"ai.nuphos/sessionState":{"state":"idle"}}}})));
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+        assert_eq!(state.snapshot()["operation"], "none");
     }
     #[test]
     fn provider_idle_does_not_hide_a_pending_prompt_or_permission() {
@@ -445,9 +502,6 @@ mod tests {
             "status": "in_progress",
             "_meta": {"terminal_exit": {"exitCode": 0}}
         }})));
-        let snapshot = state.snapshot();
-        let terminal = &snapshot["tools"]["t1"]["terminal"];
-        assert_eq!(terminal["status"], "exited");
-        assert_eq!(terminal["exit"]["exitCode"], 0);
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
     }
 }
