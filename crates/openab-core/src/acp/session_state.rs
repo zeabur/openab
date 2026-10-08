@@ -78,9 +78,13 @@ fn apply_terminal_fields(tool: &mut Value, update: &Value) {
 }
 
 /// A cancelled turn's tools are over: adapters kill them without reporting a
-/// terminal status, so left alone they would show as running forever.
+/// terminal status, so left alone they would show as running forever. Tools an
+/// earlier turn left running in the background are not part of it and stay.
 fn end_cancelled_tools(snapshot: &mut Value) {
-    snapshot["tools"] = json!({});
+    snapshot["tools"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|_, tool| tool["background"] == true);
 }
 
 pub struct SessionState(Mutex<Value>);
@@ -235,14 +239,14 @@ impl SessionState {
                     if let Some(provider) = provider {
                         // Preserve unfamiliar provider states instead of silently hiding them.
                         snapshot["providerState"] = json!(provider);
+                        if provider == "idle" && snapshot["operation"] == "cancelling" {
+                            end_cancelled_tools(snapshot);
+                            snapshot["operation"] = json!("none");
+                        }
                         if provider == "idle" {
                             for tool in snapshot["tools"].as_object_mut().unwrap().values_mut() {
                                 tool["background"] = json!(true);
                             }
-                        }
-                        if provider == "idle" && snapshot["operation"] == "cancelling" {
-                            end_cancelled_tools(snapshot);
-                            snapshot["operation"] = json!("none");
                         }
                         snapshot["state"] = json!(match provider {
                             "active" => "active",
@@ -329,6 +333,32 @@ mod tests {
         state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call_update","toolCallId":"bg","status":"completed"}})));
         assert_eq!(state.snapshot()["state"], "idle");
         assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn a_tool_call_that_already_exited_is_never_tracked() {
+        let state = SessionState::default();
+        state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"in_progress","content":[{"type":"terminal","terminalId":"term"}],"_meta":{"terminal_exit":{"exitCode":0}}}})));
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn cancelling_a_turn_keeps_an_earlier_turns_background_tool() {
+        let state = SessionState::default();
+        state.operation("prompt");
+        state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call","toolCallId":"bg","status":"in_progress"}})));
+        state.operation("none");
+        state.set("idle");
+        state.observe(Some(&json!({"update":{"sessionUpdate":"session_info_update","_meta":{"ai.nuphos/sessionState":{"state":"idle"}}}})));
+        state.operation("prompt");
+        state.observe(Some(
+            &json!({"update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"pending"}}),
+        ));
+        state.operation("cancelling");
+        state.operation("none");
+        let tools = state.snapshot()["tools"].clone();
+        assert_eq!(
+            tools.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["bg"]
+        );
     }
     #[test]
     fn cancelling_a_turn_ends_its_tools_whichever_signal_comes_first() {
