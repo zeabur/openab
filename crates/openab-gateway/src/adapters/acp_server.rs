@@ -442,23 +442,28 @@ fn trace_frame(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}…(+{} chars)", &s[..end], total - CAP))
 }
 
-/// Validate a request's `params` against a generated ACP request type `T`, returning a
-/// JSON-RPC `-32602` message when a required field is missing or malformed. This checks
-/// shape only — the base validates `cwd`/`mcpServers` for conformance but does not yet
-/// propagate them (see the base ADR §5); missing `params` is itself invalid.
-/// A steer carries the same blocks a host prompt does for user input: text, plus
-/// native file references (`resource_link`) the runtime already placed on disk.
+/// A steer carries text plus references to files the host already placed on the
+/// runtime. A `resource_link` needs both `name` and `uri`, as `session/prompt`
+/// requires (R17-F3b), and must be a local `file:` URI: steering forwards local
+/// attachments only, never a remote reference.
 fn steering_prompt(params: &Value) -> Option<&Vec<Value>> {
     params["prompt"].as_array().filter(|blocks| {
         !blocks.is_empty()
             && blocks.iter().all(|b| match b["type"].as_str() {
                 Some("text") => b["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
-                Some("resource_link") => b["uri"].as_str().is_some_and(|uri| !uri.is_empty()),
+                Some("resource_link") => {
+                    b["name"].as_str().is_some()
+                        && b["uri"].as_str().is_some_and(|uri| uri.starts_with("file:///"))
+                }
                 _ => false,
             })
     })
 }
 
+/// Validate a request's `params` against a generated ACP request type `T`, returning a
+/// JSON-RPC `-32602` message when a required field is missing or malformed. This checks
+/// shape only — the base validates `cwd`/`mcpServers` for conformance but does not yet
+/// propagate them (see the base ADR §5); missing `params` is itself invalid.
 fn validate_params<T: serde::de::DeserializeOwned>(params: Option<&Value>) -> Result<(), String> {
     let value = params.cloned().unwrap_or(Value::Null);
     serde_json::from_value::<T>(value)
@@ -7619,6 +7624,10 @@ mod acp_ws_integration {
         assert!(steering_prompt(&json!({"prompt":[]})).is_none());
         assert!(steering_prompt(&json!({"prompt":[{"type":"text","text":"  "}]})).is_none());
         assert!(steering_prompt(&json!({"prompt":[{"type":"resource_link","uri":""}]})).is_none());
+        let unnamed = json!({"type":"resource_link","uri":"file:///tmp/shot.png"});
+        assert!(steering_prompt(&json!({ "prompt": [unnamed] })).is_none());
+        let remote = json!({"type":"resource_link","uri":"https://e/x","name":"x"});
+        assert!(steering_prompt(&json!({ "prompt": [remote] })).is_none());
         assert!(steering_prompt(&json!({"prompt":[text, {"type":"audio","data":"x"}]})).is_none());
     }
 
