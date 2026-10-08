@@ -442,6 +442,26 @@ fn trace_frame(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}…(+{} chars)", &s[..end], total - CAP))
 }
 
+/// A steer carries text plus references to files the host already placed on the
+/// runtime. A `resource_link` needs both `name` and `uri`, as `session/prompt`
+/// requires (R17-F3b), and must be a local `file:` URI: steering forwards local
+/// attachments only, never a remote reference.
+fn steering_prompt(params: &Value) -> Option<&Vec<Value>> {
+    params["prompt"].as_array().filter(|blocks| {
+        !blocks.is_empty()
+            && blocks.iter().all(|b| match b["type"].as_str() {
+                Some("text") => b["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                Some("resource_link") => {
+                    b["name"].as_str().is_some()
+                        && b["uri"].as_str().and_then(|uri| uri.get(..8)).is_some_and(
+                            |scheme| scheme.eq_ignore_ascii_case("file:///"),
+                        )
+                }
+                _ => false,
+            })
+    })
+}
+
 /// Validate a request's `params` against a generated ACP request type `T`, returning a
 /// JSON-RPC `-32602` message when a required field is missing or malformed. This checks
 /// shape only — the base validates `cwd`/`mcpServers` for conformance but does not yet
@@ -2756,13 +2776,7 @@ async fn handle_acp_connection(
                             .as_str()
                             .filter(|id| Uuid::parse_str(id).is_ok());
                         let channel = params["sessionId"].as_str().and_then(derive_channel_id);
-                        let prompt = params["prompt"].as_array().filter(|blocks| {
-                            !blocks.is_empty()
-                                && blocks.iter().all(|b| {
-                                    b["type"] == "text"
-                                        && b["text"].as_str().is_some_and(|s| !s.trim().is_empty())
-                                })
-                        });
+                        let prompt = steering_prompt(params);
                         if let (Some(channel), Some(prompt), Some(steer), Some(message_id)) = (
                             channel,
                             prompt,
@@ -7601,6 +7615,24 @@ mod acp_ws_integration {
             let _ = axum::serve(listener, app).await;
         });
         (format!("ws://{addr}/acp"), registry, reply_registry, rx)
+    }
+
+    #[test]
+    fn steering_accepts_text_and_native_file_references_only() {
+        let link = json!({"type":"resource_link","uri":"file:///tmp/shot.png","name":"shot.png"});
+        let text = json!({"type":"text","text":"Look at this"});
+        assert!(steering_prompt(&json!({"prompt":[text.clone(), link.clone()]})).is_some());
+        assert!(steering_prompt(&json!({"prompt":[link]})).is_some());
+        assert!(steering_prompt(&json!({"prompt":[]})).is_none());
+        assert!(steering_prompt(&json!({"prompt":[{"type":"text","text":"  "}]})).is_none());
+        assert!(steering_prompt(&json!({"prompt":[{"type":"resource_link","uri":""}]})).is_none());
+        let unnamed = json!({"type":"resource_link","uri":"file:///tmp/shot.png"});
+        assert!(steering_prompt(&json!({ "prompt": [unnamed] })).is_none());
+        let upper = json!({"type":"resource_link","uri":"FILE:///tmp/a.png","name":"a.png"});
+        assert!(steering_prompt(&json!({ "prompt": [upper] })).is_some());
+        let remote = json!({"type":"resource_link","uri":"https://e/x","name":"x"});
+        assert!(steering_prompt(&json!({ "prompt": [remote] })).is_none());
+        assert!(steering_prompt(&json!({"prompt":[text, {"type":"audio","data":"x"}]})).is_none());
     }
 
     #[tokio::test]
