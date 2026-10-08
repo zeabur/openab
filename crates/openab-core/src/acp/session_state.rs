@@ -77,6 +77,12 @@ fn apply_terminal_fields(tool: &mut Value, update: &Value) {
     terminal.insert("status".into(), json!("running"));
 }
 
+/// A cancelled turn's tools are over: adapters kill them without reporting a
+/// terminal status, so left alone they would show as running forever.
+fn end_cancelled_tools(snapshot: &mut Value) {
+    snapshot["tools"] = json!({});
+}
+
 pub struct SessionState(Mutex<Value>);
 
 impl Default for SessionState {
@@ -127,6 +133,9 @@ impl SessionState {
 
     pub fn operation(&self, operation: &str) {
         self.change(|snapshot| {
+            if snapshot["operation"] == "cancelling" && operation != "cancelling" {
+                end_cancelled_tools(snapshot);
+            }
             snapshot["operation"] = json!(operation);
             if operation == "prompt" {
                 // Keep background tools visible across turns, but reset model activity.
@@ -232,6 +241,7 @@ impl SessionState {
                             }
                         }
                         if provider == "idle" && snapshot["operation"] == "cancelling" {
+                            end_cancelled_tools(snapshot);
                             snapshot["operation"] = json!("none");
                         }
                         snapshot["state"] = json!(match provider {
@@ -319,6 +329,25 @@ mod tests {
         state.observe(Some(&json!({"update":{"sessionUpdate":"tool_call_update","toolCallId":"bg","status":"completed"}})));
         assert_eq!(state.snapshot()["state"], "idle");
         assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn cancelling_a_turn_ends_its_tools_whichever_signal_comes_first() {
+        let running = json!({"update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"pending","content":[{"type":"terminal","terminalId":"term"}]}});
+
+        let state = SessionState::default();
+        state.operation("prompt");
+        state.observe(Some(&running));
+        state.operation("cancelling");
+        state.operation("none");
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+
+        let state = SessionState::default();
+        state.operation("prompt");
+        state.observe(Some(&running));
+        state.operation("cancelling");
+        state.observe(Some(&json!({"update":{"sessionUpdate":"session_info_update","_meta":{"ai.nuphos/sessionState":{"state":"idle"}}}})));
+        assert!(state.snapshot()["tools"].as_object().unwrap().is_empty());
+        assert_eq!(state.snapshot()["operation"], "none");
     }
     #[test]
     fn provider_idle_does_not_hide_a_pending_prompt_or_permission() {
